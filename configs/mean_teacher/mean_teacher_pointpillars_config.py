@@ -5,9 +5,14 @@ ann_file_source = 'nuscenes_infos_train.pkl'
 data_prefix_source = dict(pts='samples/LIDAR_TOP', img='', sweeps='sweeps/LIDAR_TOP')
 
 target_dataset_type = 'KittiDataset'
-target_data_root = '/DATA/kitti-mmdet3d/'
+target_data_root = '/DATA/kitti_mmdet3d/'
 ann_file_target = 'kitti_infos_train.pkl'
 data_prefix_target = dict(pts='training/velodyne_reduced')
+
+# Load the hard instance bank
+import pickle
+with open('hard_instance_bank.pkl', 'rb') as f:
+    hard_instance_bank = pickle.load(f)
 
 point_cloud_range = [-50, -50, -5, 50, 50, 3]   # nuScenes point cloud range
 class_names = ['Car', 'Pedestrian', 'Cyclist']
@@ -74,12 +79,14 @@ target_weak_pipeline = [       # KITTI      # sent to teacher model for predicti
         use_dim=4),
     dict(
         type='KittiToNuscenes'),                    # convert kitti coordinates to nuscenes format
+
         ### the augmentations below makes the pseudo-labels in a different coordinate system, either delete them or take into account the conversion back to previous coords
     # dict(type='RandomFlip3D', flip_ratio_bev_horizontal=0.5),
     # dict(
     #     type='GlobalRotScaleTrans',
     #     rot_range=[-0.087, 0.087],      # ±5 degrees (WEAK)
     #     scale_ratio_range=[0.98, 1.02]),
+    
     dict(type='PointsRangeFilter', point_cloud_range=point_cloud_range),
     dict(type='ObjectRangeFilter', point_cloud_range=point_cloud_range),
     dict(type='PointShuffle'),
@@ -95,14 +102,29 @@ target_strong_pipeline = [       # KITTI      # sent to student model for unsupe
         load_dim=4,
         use_dim=4),
     dict(
-        type='KittiToNuscenes'),                    # convert kitti coordinates to nuscenes format
+        type='KittiToNuscenes'),                    # transform coordinates to nuscenes style
     dict(type='ObjectSample', db_sampler=db_sampler_kitti),
+
+    dict(
+        type='HardInstanceSampling',
+        hard_instance_bank=hard_instance_bank,
+        sample_groups=dict(
+            Car=5, Pedestrian=3, Cyclist=3),        # number of hard instances to sample per class
+        use_pred_boxes_for_collision=True,          # Use predictions for collision
+        iou_thresh=0.3,                             # Collision detection threshold
+        points_loader=dict(
+            type='LoadPointsFromFile',
+            coord_type='LIDAR',
+            load_dim=5,         # Source is nuScenes (5D)
+            use_dim=4)),
+
     dict(
         type='ObjectNoise',
         num_try=100,
         translation_std=[1.0, 1.0, 0.5],
         global_rot_range=[0.0, 0.0],
-        rot_range=[-0.78539816, 0.78539816]),
+        rot_range=[-0.78539816, 0.78539816]
+        ),
     dict(type='RandomFlip3D', flip_ratio_bev_horizontal=0.5),
     dict(
         type='GlobalRotScaleTrans',

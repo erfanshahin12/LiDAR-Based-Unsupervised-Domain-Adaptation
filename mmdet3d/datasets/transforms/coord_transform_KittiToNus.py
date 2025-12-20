@@ -32,14 +32,17 @@ class KittiToNuscenes(BaseTransform):
 
         # --- Transform 3D boxes ---
         if 'gt_bboxes_3d' in results:
-            boxes = results['gt_bboxes_3d'].tensor.clone()
+            boxes = results['gt_bboxes_3d'].tensor.numpy()
 
             # Coordinate transform
             x, y, z, l, w, h, yaw = [boxes[:, i] for i in range(7)]
-            boxes[:, 0], boxes[:, 1], boxes[:, 2] = -y, x, z
+            boxes[:, 0], boxes[:, 1] = -y, x
+            boxes[:, 2] = z + h / 2.0        # Adjust z center
             boxes[:, 3], boxes[:, 4], boxes[:, 5] = w, l, h
             boxes[:, 6] = torch.atan2(torch.sin(yaw + np.pi / 2), torch.cos(yaw + np.pi / 2))
 
-            results['gt_bboxes_3d'] = LiDARInstance3DBoxes(boxes, box_dim=7, origin=(0.5, 0.5, 0))
+            results['gt_bboxes_3d'] = LiDARInstance3DBoxes(torch.from_numpy(boxes),
+                                                           box_dim=7,
+                                                           origin=(0.5, 0.5, 0.5))    # Nuscenes boxes' origin
 
         return results

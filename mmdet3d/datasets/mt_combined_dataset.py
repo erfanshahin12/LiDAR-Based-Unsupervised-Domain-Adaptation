@@ -135,7 +135,10 @@ def mean_teacher_collate_fn(data_batch):
     
     batch_data_samples = {
         'labeled': labeled_data_samples,
-        'unlabeled': weak_data_samples  # Use weak data_samples (same for both) ### DOUBLE CHECK
+        'unlabeled': {
+            'weak': weak_data_samples,
+            'strong': strong_data_samples
+        }
     }
     
     return batch_inputs_dict, batch_data_samples

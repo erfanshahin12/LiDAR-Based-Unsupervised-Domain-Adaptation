@@ -21,9 +21,10 @@ from .transforms_3d import (AffineResize, BackgroundPointsFilter,
 
 from .load_empty_ann3d import LoadEmptyAnnotations3D
 from .multi_branch_3d import MultiBranch3D
-from .transfrom_KittiToNus import KittiToNuscenes
-from .transfrom_NusToKitti import NuscenesToKitti
+from .coord_transform_KittiToNus import KittiToNuscenes
+from .coord_transform_NusToKitti import NuscenesToKitti
 from .class_remap import (ClassRemap, ClassRemapWithLabel)
+from .hard_instance_mining import (HardInstanceBank, HardInstanceSampling, build_hard_instance_bank)
 
 __all__ = [
     'ObjectSample', 'RandomFlip3D', 'ObjectNoise', 'GlobalRotScaleTrans',
@@ -40,5 +41,6 @@ __all__ = [
     'LidarDet3DInferencerLoader', 'PolarMix', 'LaserMix',
     'MultiModalityDet3DInferencerLoader',
     'LoadEmptyAnnotations3D', 'MultiBranch3D',                                      # custom made
-    'KittiToNuscenes', 'NuscenesToKitti', 'ClassRemap', 'ClassRemapWithLabel'       # custom made
+    'KittiToNuscenes', 'NuscenesToKitti', 'ClassRemap', 'ClassRemapWithLabel',      # custom made
+    'HardInstanceBank', 'HardInstanceSampling', 'build_hard_instance_bank',         # custom made
 ]

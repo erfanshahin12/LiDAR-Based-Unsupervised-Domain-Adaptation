@@ -3,7 +3,7 @@ import torch
 import torch.nn.functional as F
 from mmdet3d.registry import MODELS
 from mmdet3d.models.detectors.base import Base3DDetector
-
+from mmdet3d.structures import LiDARInstance3DBoxes
 
 @MODELS.register_module()
 class MeanTeacher3DDetector(Base3DDetector):
@@ -66,17 +66,11 @@ class MeanTeacher3DDetector(Base3DDetector):
                                     self.student.parameters()):
             t_param.data = alpha * t_param.data + (1 - alpha) * s_param.data
 
-    def extract_feat(self, model, inputs, data_samples):
+    def extract_feat(self, model, inputs):
         """
-        Extract BEV features from the model.
-        This is a placeholder - you need to implement this based on your detector.
-        
-        Different detectors have different ways to access BEV features:
-        - BEVFormer: model.pts_bbox_head.transformer outputs BEV features
-        - CenterPoint: model.pts_bbox_head.shared_conv outputs features
-        - You may need to modify your base detector to expose these
+        Implemented in the detector to extract features (including BEV features).
         """
-        pass
+        return model.extract_feat(inputs, return_bev=True)
 
     def filter_teacher_predictions(self, teacher_pred):
         """
@@ -92,7 +86,9 @@ class MeanTeacher3DDetector(Base3DDetector):
         Returns:
             Filtered prediction dict with only high-confidence detections
         """
-        scores = teacher_pred.get('scores_3d', None)
+        scores = teacher_pred.pred_instances_3d.scores_3d
+        labels = teacher_pred.pred_instances_3d.labels_3d
+        bboxes = teacher_pred.pred_instances_3d.bboxes_3d
         
         if scores is None:
             # No scores available, return all predictions
@@ -107,7 +103,6 @@ class MeanTeacher3DDetector(Base3DDetector):
         if use_class_specific:
             # Apply different thresholds per class
             class_thresholds = self.mean_teacher_cfg.get('class_thresholds', {})
-            labels = teacher_pred['labels_3d']
             
             for class_id, thresh in class_thresholds.items():
                 class_mask = (labels == class_id) & (scores >= thresh)
@@ -127,11 +122,11 @@ class MeanTeacher3DDetector(Base3DDetector):
         filtered_pred = copy.deepcopy(teacher_pred)
         
         # Filter pred_instances_3d
-        filtered_pred.pred_instances_3d.bboxes_3d = teacher_pred.pred_instances_3d.bboxes_3d[mask]
-        filtered_pred.pred_instances_3d.scores_3d = teacher_pred.pred_instances_3d.scores_3d[mask]
-        filtered_pred.pred_instances_3d.labels_3d = teacher_pred.pred_instances_3d.labels_3d[mask]
+        filtered_pred.pred_instances_3d.bboxes_3d = bboxes[mask]
+        filtered_pred.pred_instances_3d.scores_3d = scores[mask]
+        filtered_pred.pred_instances_3d.labels_3d = labels[mask]
         
-        # Preserve BEV features (they are not filtered, it's a spatial feature map)
+        # Preserve BEV features (not filtered, it's a spatial feature map)
         if hasattr(teacher_pred, 'bev_features'):
             filtered_pred.bev_features = teacher_pred.bev_features
         
@@ -191,30 +186,122 @@ class MeanTeacher3DDetector(Base3DDetector):
 
         return lambda_weight * loss.mean()
 
-    def _create_pseudo_labels(self, teacher_predictions, target_samples):
+    def _transform_boxes(self, boxes, metainfo_strong):
+        """
+        Transform boxes from weak to strong augmentation space.
+        Assumption: NO geometric augmentations on the weak pipeline
+        
+        Args:
+            boxes: Boxes from teacher (in weak augmentation space)
+            metainfo_strong: Metadata from strong sample (heavy transforms)
+        
+        Returns:
+            Transformed boxes for strong augmentation space
+        """        
+        # Convert to tensor
+        if isinstance(boxes, LiDARInstance3DBoxes):
+            boxes_tensor = boxes.tensor.clone()
+            origin = boxes.origin
+        else:
+            boxes_tensor = boxes.clone()
+            origin = (0.5, 0.5, 0.5)
+        
+        device = boxes_tensor.device
+        
+        # Extract strong augmentation parameters
+        # These are stored by GlobalRotScaleTrans and RandomFlip3D
+        pcd_rotation = metainfo_strong.get('pcd_rotation', 0.0)
+        pcd_scale_factor = metainfo_strong.get('pcd_scale_factor', 1.0)
+        pcd_trans = metainfo_strong.get('pcd_trans', torch.zeros(3, device=device))
+        flip_horizontal = metainfo_strong.get('pcd_horizontal_flip', False)
+        
+        # Apply transformations in the same order as the pipeline
+        # 1. Random horizontal flip
+        if flip_horizontal:
+            boxes_tensor[:, 1] = -boxes_tensor[:, 1]  # Flip y coordinate
+            boxes_tensor[:, 6] = -boxes_tensor[:, 6]  # Flip yaw angle
+        
+        # 2. Global rotation
+        if abs(pcd_rotation) > 1e-6:
+            cos_r = torch.cos(torch.tensor(pcd_rotation, device=device))
+            sin_r = torch.sin(torch.tensor(pcd_rotation, device=device))
+            
+            # Rotate centers
+            x_rot = cos_r * boxes_tensor[:, 0] - sin_r * boxes_tensor[:, 1]
+            y_rot = sin_r * boxes_tensor[:, 0] + cos_r * boxes_tensor[:, 1]
+            
+            boxes_tensor[:, 0] = x_rot
+            boxes_tensor[:, 1] = y_rot
+            
+            # Rotate yaw
+            boxes_tensor[:, 6] += pcd_rotation
+        
+        # 3. Global scaling
+        if abs(pcd_scale_factor - 1.0) > 1e-6:
+            # Scale positions
+            boxes_tensor[:, :3] *= pcd_scale_factor
+            # Scale dimensions
+            boxes_tensor[:, 3:6] *= pcd_scale_factor
+        
+        # 4. Global translation
+        if isinstance(pcd_trans, (list, tuple)):
+            pcd_trans = torch.tensor(pcd_trans, device=device)
+        if torch.abs(pcd_trans).sum() > 1e-6:
+            boxes_tensor[:, :3] += pcd_trans
+        
+        # Normalize yaw to [-π, π]
+        boxes_tensor[:, 6] = torch.atan2(
+            torch.sin(boxes_tensor[:, 6]),
+            torch.cos(boxes_tensor[:, 6])
+        )
+        
+        # Create transformed box object
+        transformed_boxes = LiDARInstance3DBoxes(
+            boxes_tensor,
+            box_dim=boxes_tensor.shape[-1],
+            origin=origin
+        )
+        
+        return transformed_boxes
+    
+    def _create_pseudo_labels(self, teacher_predictions, target_samples_weak, target_samples_strong):
         """
         Create pseudo-labeled data samples from teacher predictions.
         
         Args:
             teacher_predictions: List of filtered teacher predictions
-            target_samples: Original target data samples
-        
+            target_samples_weak: Weak augmentation samples (where teacher predicted)
+            target_samples_strong: Strong augmentation samples (where student learns)
+            
         Returns:
-            pseudo_labeled_samples: Data samples with teacher's predictions as ground truth
+            pseudo_labeled_samples: Strong aug samples with transformed pseudo-labels as ground truth
         """
         
         # Deep copy to avoid modifying original samples
-        pseudo_labeled_samples = copy.deepcopy(target_samples)
+        pseudo_labeled_samples = copy.deepcopy(target_samples_strong)
         
         # Replace ground truth with teacher's pseudo-labels
-        for i, (pred, sample) in enumerate(zip(teacher_predictions, pseudo_labeled_samples)):
-            # Replace bboxes with teacher predictions
-            sample.gt_instances_3d.bboxes_3d = pred['bboxes_3d']
-            sample.gt_instances_3d.labels_3d = pred['labels_3d']
-
-            # Optional: add confidence scores as weights
-            if 'scores_3d' in pred:
-                sample.gt_instances_3d.scores = pred['scores_3d']
+        for i, (pred, sample_weak, sample_strong) in enumerate(
+            zip(teacher_predictions, target_samples_weak, pseudo_labeled_samples)):
+            
+            # Teacher predictions are in weakly augmented space, while student trains on strongly augmented space
+            # Get boxes from teacher prediction (in weakly augmented space)
+            boxes = pred.pred_instances_3d.bboxes_3d
+            labels = pred.pred_instances_3d.labels_3d
+            
+            # Transform boxes to strong augmentation space
+            boxes_transformed = self._transform_boxes(
+                boxes,
+                sample_weak.metainfo,
+                sample_strong.metainfo)
+            
+            # Assign transformed pseudo-labels
+            sample_strong.gt_instances_3d.bboxes_3d = boxes_transformed
+            sample_strong.gt_instances_3d.labels_3d = labels
+            
+            # Optional: Add confidence scores as instance weights
+            if hasattr(pred.pred_instances_3d, 'scores_3d'):
+                sample_strong.gt_instances_3d.scores = pred.pred_instances_3d.scores_3d
         
         return pseudo_labeled_samples
     
@@ -225,19 +312,13 @@ class MeanTeacher3DDetector(Base3DDetector):
         1. Supervised loss on source/labeled data (regression + classification)
         2. Pseudo-label loss on target/unlabeled data (regression + classification)
         3. Contrastive consistency loss on target data (BEV features)
-        
-        Expected input format:
-        batch_inputs_dict = {
-            "labeled": {...},
-            "unlabeled": {
-                "weak": {...},
-                "strong": {...}}} """
-
+        """
         # Load weights from config
         w_source = self.mean_teacher_cfg.get('source_loss_weight', 1.0)
         w_target = self.mean_teacher_cfg.get('target_loss_weight', 1.0)
         w_cont = self.mean_teacher_cfg.get('contrastive_weight', 0.1)
 
+        device = next(self.student.parameters()).device
         losses = {}
 
         # TERM 1: Supervised Loss on Source Data
@@ -255,13 +336,15 @@ class MeanTeacher3DDetector(Base3DDetector):
         # Use weak augmentation for teacher, strong for student
         target_weak = batch_inputs_dict["unlabeled"]["weak"]
         target_strong = batch_inputs_dict["unlabeled"]["strong"]
-        target_samples = batch_data_samples["unlabeled"]
+        target_samples_weak = batch_data_samples["unlabeled"]["weak"]
+        target_samples_strong = batch_data_samples["unlabeled"]["strong"]
 
         # Teacher forward on weakly augmented data (no grad)
         with torch.no_grad():
-            teacher_pred = self.teacher.predict(
+            teacher_pred = self.predict(
                 target_weak,
-                target_samples,
+                target_samples_weak,
+                use_teacher=True,
                 return_bev_features=True)
 
         # Filter by confidence and prepare pseudo-labels
@@ -273,8 +356,9 @@ class MeanTeacher3DDetector(Base3DDetector):
         # TERM 2: Pseudo-Label Loss (Regression + Classification)
         # Create pseudo-labeled data samples from teacher predictions
         pseudo_labeled_samples = self._create_pseudo_labels(
-                                        filtered_teacher_preds, 
-                                        target_samples)
+                                        filtered_teacher_preds,
+                                        target_samples_weak, 
+                                        target_samples_strong)
         
         # Compute student loss on pseudo-labeled target data
         if w_target > 0:
@@ -284,30 +368,31 @@ class MeanTeacher3DDetector(Base3DDetector):
                 losses[f'{key}_target'] = value * w_target
 
         # TERM 3: Contrastive Consistency Loss
-
         # Student forward on strongly augmented data
-        student_pred = self.student.predict(
+        student_pred = self.predict(
             target_strong,
-            target_samples,
+            target_samples_strong,
+            use_teacher=False,
             return_bev_features=True)
 
         # consistency loss (batch sum)
-        loss_contrastive_total = torch.tensor(0., device=losses['loss_source'].device)
+        loss_contrastive_total = torch.tensor(0., device=device)
         num_valid_samples = 0
 
         if self.mean_teacher_cfg.get("use_bev_consistency", False) and w_cont > 0:
             for i in range(len(student_pred)):
                 try:
                     # Extract BEV features
-                    bev_s = student_pred[i].get("bev_features")
-                    bev_t = filtered_teacher_preds[i].get("bev_features")
+                    bev_s = student_pred[i].bev_features
+                    bev_t = filtered_teacher_preds[i].bev_features
                     
                     if bev_s is None or bev_t is None:
                         continue
                     
-                    boxes = filtered_teacher_preds[i]["bboxes_3d"].tensor
-                    labels = filtered_teacher_preds[i]["labels_3d"]
-                    scores = filtered_teacher_preds[i].get("scores_3d", None)
+                    boxes = filtered_teacher_preds[i].pred_instances_3d.bboxes_3d.tensor
+                    labels = filtered_teacher_preds[i].pred_instances_3d.labels_3d
+                    scores = filtered_teacher_preds[i].pred_instances_3d.scores_3d if hasattr(
+                        filtered_teacher_preds[i].pred_instances_3d, 'scores_3d') else None
                     
                     # Skip if no high-confidence predictions
                     if len(boxes) == 0:
@@ -331,7 +416,7 @@ class MeanTeacher3DDetector(Base3DDetector):
         if num_valid_samples > 0:
             losses['loss_contrastive'] = (loss_contrastive_total / num_valid_samples) * w_cont
         else:
-            losses['loss_contrastive'] = torch.tensor(0., device=losses['loss_source'].device)
+            losses['loss_contrastive'] = torch.tensor(0., device=device)
         
         # Add aggregated losses for easier monitoring and debugging
         # These won't affect training (prefixed with underscore so MMDet ignores them)
@@ -340,14 +425,17 @@ class MeanTeacher3DDetector(Base3DDetector):
         
         losses['_source_total'] = source_total      # For logging only
         losses['_target_total'] = target_total      # For logging only
-        losses['_num_pseudo_labels'] = torch.tensor(num_valid_samples, 
-                                                     device=losses['source_loss_cls'].device)
+        losses['_num_pseudo_labels'] = torch.tensor(num_valid_samples, device=device)
         
         return losses
 
     # PREDICTION — use student model for inference
-    def predict(self, batch_inputs, batch_data_samples, **kwargs):
-        return self.student.predict(batch_inputs, batch_data_samples, **kwargs)
+    def predict(self, batch_inputs, batch_data_samples,
+                use_teacher=False, **kwargs):
+        if use_teacher:
+            return self.teacher.predict(batch_inputs, batch_data_samples, **kwargs)
+        else:
+            return self.student.predict(batch_inputs, batch_data_samples, **kwargs)
 
     def forward(self, *args, mode='tensor', **kwargs):
 
