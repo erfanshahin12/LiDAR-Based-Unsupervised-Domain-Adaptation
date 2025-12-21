@@ -423,7 +423,8 @@ class HardInstanceSampling(BaseTransform):
 def build_hard_instance_bank(source_db_path: str,
                              target_db_path: Optional[str] = None,
                              quantile_threshold: float = 50.0,
-                             classes: List[str] = None) -> HardInstanceBank:
+                             classes: List[str] = None,
+                             source_class_mapping: Optional[Dict[str, str]] = None) -> HardInstanceBank:
     """
     Build a hard instance bank from database files.
     Args:
@@ -431,6 +432,7 @@ def build_hard_instance_bank(source_db_path: str,
         target_db_path: Optional path to target domain dbinfos pkl file
         quantile_threshold: Percentile threshold (0-100)
         classes: List of class names
+        source_class_mapping: Dict mapping target names to source names
 
     Returns:    HardInstanceBank object
     """
@@ -443,6 +445,28 @@ def build_hard_instance_bank(source_db_path: str,
     if target_db_path:
         with open(target_db_path, 'rb') as f:
             target_db_infos = pickle.load(f)
+
+    # Remap source database classes if mapping provided
+    if source_class_mapping:
+        print("Remapping source database classes:")
+        remapped_db = {}
+    
+        for target_name, source_names in source_class_mapping.items():
+            remapped_db[target_name] = []
+
+             # Handle both single string and list of strings
+            if isinstance(source_names, str):
+                source_names = [source_names]
+
+            for src_name in source_names:
+                if src_name in source_db_infos:
+                    samples = source_db_infos[src_name]
+                    remapped_db[target_name].extend(samples)
+                    print(f"  Mapped '{src_name}' → '{target_name}': {len(samples)} samples")
+                else:
+                    print(f"  Warning: Source class '{src_name}' not found in database")
+
+        source_db_infos = remapped_db
     
     # Build bank
     bank = HardInstanceBank(
