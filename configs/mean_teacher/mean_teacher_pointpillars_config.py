@@ -3,20 +3,19 @@ source_dataset_type = 'NuScenesDataset'
 source_data_root = '/DATA/nuscenes/'
 ann_file_source = 'nuscenes_infos_train.pkl'
 data_prefix_source = dict(pts='samples/LIDAR_TOP', img='', sweeps='sweeps/LIDAR_TOP')
+box_origin = (0.5, 0.5, 0.5)        # nuScenes box origin
 
 target_dataset_type = 'KittiDataset'
 target_data_root = '/DATA/kitti_mmdet3d/'
 ann_file_target = 'kitti_infos_train.pkl'
 data_prefix_target = dict(pts='training/velodyne_reduced')
 
-# Load the hard instance bank
-import pickle
-with open('hard_instance_bank.pkl', 'rb') as f:
-    hard_instance_bank = pickle.load(f)
+hard_instance_bank_path = './configs/mean_teacher/hard_instance_bank/hard_instance_bank_nuscenes_quantile_kitti_50.pkl'
 
-point_cloud_range = [-50, -50, -5, 50, 50, 3]   # nuScenes point cloud range
+point_cloud_range = [-50.40, -50.40, -5, 50.40, 50.40, 3]   # nuScenes point cloud range
 class_names = ['Car', 'Pedestrian', 'Cyclist']
-metainfo = dict(classes=class_names)
+metainfo = dict(classes=class_names,
+                origin=box_origin)
 input_modality = dict(use_lidar=True, use_camera=False)
 backend_args = None
 
@@ -107,7 +106,7 @@ target_strong_pipeline = [       # KITTI      # sent to student model for unsupe
 
     dict(
         type='HardInstanceSampling',
-        hard_instance_bank=hard_instance_bank,
+        hard_instance_bank_path=hard_instance_bank_path,
         sample_groups=dict(
             Car=5, Pedestrian=3, Cyclist=3),        # number of hard instances to sample per class
         use_pred_boxes_for_collision=True,          # Use predictions for collision
@@ -193,7 +192,7 @@ train_dataloader = dict(
             unlabeled_strong_dataset=unlabeled_strong_dataset))
 
 
-voxel_size = [0.16, 0.16, 4]
+voxel_size = [0.2, 0.2, 8]      # nuscenes/kitti intermediate voxel size
 
 model = dict(
     type='MeanTeacher3DDetector',
@@ -216,64 +215,64 @@ model = dict(
     # The architecture for Student and Teacher
     detector = dict(
         type='VoxelNetWithBEV',
-    data_preprocessor=dict(
-        type='Det3DDataPreprocessor',
-        voxel=True,
-        voxel_layer=dict(
-            max_num_points=32,  # max_points_per_voxel
-            point_cloud_range=point_cloud_range,
+        data_preprocessor=dict(
+            type='Det3DDataPreprocessor',
+            voxel=True,
+            voxel_layer=dict(
+                max_num_points=32,  # max_points_per_voxel
+                point_cloud_range=point_cloud_range,
+                voxel_size=voxel_size,
+                max_voxels=(30000, 40000))),
+        voxel_encoder=dict(
+            type='PillarFeatureNet',
+            in_channels=4,
+            feat_channels=[64],
+            with_distance=False,
             voxel_size=voxel_size,
-            max_voxels=(30000, 50000))),
-    voxel_encoder=dict(
-        type='PillarFeatureNet',
-        in_channels=4,
-        feat_channels=[64],
-        with_distance=False,
-        voxel_size=voxel_size,
-        point_cloud_range=point_cloud_range),
-    middle_encoder=dict(
-        type='PointPillarsScatter', in_channels=64, output_shape=[625, 625]),
-    backbone=dict(
-        type='SECOND',
-        in_channels=64,
-        layer_nums=[3, 5, 5],
-        layer_strides=[2, 2, 2],
-        out_channels=[64, 128, 256]),
-    neck=dict(
-        type='SECONDFPN',
-        in_channels=[64, 128, 256],
-        upsample_strides=[1, 2, 4],
-        out_channels=[128, 128, 128]),
-    bbox_head=dict(
-        type='Anchor3DHead',
-        num_classes=3,
-        in_channels=384,
-        feat_channels=384,
-        use_direction_classifier=True,
-        assign_per_class=True,
-        anchor_generator=dict(
-            type='AlignedAnchor3DRangeGenerator',
-            ranges=[
-                [-50, -50, -0.6, 50, 50, -0.6],    # Car
-                [-50, -50, -0.6, 50, 50, -0.6],    # Pedestrian
-                [-50, -50, -1.78, 50, 50, -1.78],  # Cyclist
-            ],
-            sizes=[[0.8, 0.6, 1.73], [1.76, 0.6, 1.73], [3.9, 1.6, 1.56]],
-            rotations=[0, 1.57],
-            reshape_out=False),
-        diff_rad_by_sin=True,
-        bbox_coder=dict(type='DeltaXYZWLHRBBoxCoder'),
-        loss_cls=dict(
-            type='mmdet.FocalLoss',
-            use_sigmoid=True,
-            gamma=2.0,
-            alpha=0.25,
-            loss_weight=1.0),
-        loss_bbox=dict(
-            type='mmdet.SmoothL1Loss', beta=1.0 / 9.0, loss_weight=2.0),
-        loss_dir=dict(
-            type='mmdet.CrossEntropyLoss', use_sigmoid=False,
-            loss_weight=0.2)),
+            point_cloud_range=point_cloud_range),
+        middle_encoder=dict(
+            type='PointPillarsScatter', in_channels=64, output_shape=[504, 504]),       # output_shape = range / voxel_size (x and y)
+        backbone=dict(
+            type='SECOND',
+            in_channels=64,
+            layer_nums=[3, 5, 5],
+            layer_strides=[2, 2, 2],
+            out_channels=[64, 128, 256]),
+        neck=dict(
+            type='SECONDFPN',
+            in_channels=[64, 128, 256],
+            upsample_strides=[1, 2, 4],
+            out_channels=[128, 128, 128]),
+        bbox_head=dict(
+            type='Anchor3DHead',
+            num_classes=3,
+            in_channels=384,
+            feat_channels=384,
+            use_direction_classifier=True,
+            assign_per_class=True,
+            anchor_generator=dict(
+                type='AlignedAnchor3DRangeGenerator',
+                ranges=[
+                    [-49.92, -49.92, -0.6, 49.92, 49.92, -0.6],    # Car
+                    [-49.92, -49.92, -0.6, 49.92, 49.92, -0.6],    # Pedestrian
+                    [-49.92, -49.92, -1.78, 49.92, 49.92, -1.78],  # Cyclist
+                ],
+                sizes=[[0.8, 0.6, 1.73], [1.76, 0.6, 1.73], [3.9, 1.6, 1.56]],
+                rotations=[0, 1.57],
+                reshape_out=False),
+            diff_rad_by_sin=True,
+            bbox_coder=dict(type='DeltaXYZWLHRBBoxCoder'),
+            loss_cls=dict(
+                type='mmdet.FocalLoss',
+                use_sigmoid=True,
+                gamma=2.0,
+                alpha=0.25,
+                loss_weight=1.0),
+            loss_bbox=dict(
+                type='mmdet.SmoothL1Loss', beta=1.0 / 9.0, loss_weight=2.0),
+            loss_dir=dict(
+                type='mmdet.CrossEntropyLoss', use_sigmoid=False,
+                loss_weight=0.2)),
     # model training and testing settings
     train_cfg=dict(
         assigner=[

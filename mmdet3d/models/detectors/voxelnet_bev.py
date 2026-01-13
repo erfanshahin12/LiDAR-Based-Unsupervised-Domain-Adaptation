@@ -76,7 +76,7 @@ class VoxelNetWithBEV(VoxelNet):
             return_bev_features: If True, add BEV features to results
         
         Returns:
-            List of Det3DDataSample with predictions (and optionally BEV features)
+            List of Det3DDataSample containing pred_instances_3d and optionally bev_features.
         """
         # Extract features
         if return_bev_features or self.return_bev_features:
@@ -86,18 +86,18 @@ class VoxelNetWithBEV(VoxelNet):
             bev_features = None
         
         # Get predictions from bbox_head
-        results_list = self.bbox_head.predict(
-            x, batch_data_samples, **kwargs)
+        results_list = self.bbox_head.predict(x, batch_data_samples, **kwargs)
+
+        # Use superclass helper to wrap predictions into Det3DDataSample
+        predictions = self.add_pred_to_datasample(batch_data_samples, results_list)
         
-        # Add BEV features to results if requested
+        # Add BEV features to each sample (sample-level)
         if return_bev_features or self.return_bev_features:
-            batch_size = len(results_list)
-            for i in range(batch_size):
-                # Add BEV features to the prediction result
-                # bev_features shape: [B, C, H, W]
-                results_list[i].bev_features = bev_features[i]  # [C, H, W]
+            # bev_features shape: [B, C, H, W]
+            for i, data_sample in enumerate(predictions):
+                data_sample.bev_features = bev_features[i]  # [C, H, W]
         
-        return results_list
+        return predictions
     
 def extract_bev_features_from_predictions(predictions: List[Det3DDataSample]) -> List[Tensor]:
     """

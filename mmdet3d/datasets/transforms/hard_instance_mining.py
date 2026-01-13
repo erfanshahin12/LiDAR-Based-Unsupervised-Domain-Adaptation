@@ -136,17 +136,19 @@ class HardInstanceSampling(BaseTransform):
     """
     
     def __init__(self,
-                 hard_instance_bank: HardInstanceBank,
-                 sample_groups: Dict[str, int],
+                 hard_instance_bank=None,
+                 hard_instance_bank_path: Optional[str] = None,
+                 sample_groups: Dict[str, int] = None,
                  use_pred_boxes_for_collision: bool = True,
                  iou_thresh: float = 0.3,
                  points_loader: Optional[Dict] = None,
                  class_names: List[str] = ['Car', 'Pedestrian', 'Cyclist']):
         """
-        Initialize hard instance sampling.
+        Initialize hard instance sampling, either with a pre-built bank object or loading from file.
         
         Args:
-            hard_instance_bank: Pre-built hard instance bank
+            hard_instance_bank: Pre-built hard instance bank object
+            hard_instance_bank_path: Optional path to load bank from pickle
             sample_groups: Dict mapping class names to num samples
                 Example: {'Car': 5, 'Pedestrian': 3, 'Cyclist': 3}
             use_pred_boxes_for_collision: Use predictions for collision detection
@@ -154,12 +156,23 @@ class HardInstanceSampling(BaseTransform):
             iou_thresh: IoU threshold for collision detection
             points_loader: Config for loading points from database
         """
-        self.hard_instance_bank = hard_instance_bank
         self.sample_groups = sample_groups
         self.use_pred_boxes_for_collision = use_pred_boxes_for_collision
         self.iou_thresh = iou_thresh
         self.points_loader = points_loader
         self.class_names = class_names
+
+        # Load bank from path or use provided object
+        if hard_instance_bank is not None:
+            self.hard_instance_bank = hard_instance_bank
+            
+        elif hard_instance_bank_path is not None:
+            print(f"Loading hard instance bank from: {hard_instance_bank_path}")
+            with open(hard_instance_bank_path, 'rb') as f:
+                self.hard_instance_bank = pickle.load(f)
+            print(f"✅ Loaded bank with classes: {list(self.hard_instance_bank.hard_instances.keys())}")
+        else:
+            raise ValueError("Must provide either hard_instance_bank or hard_instance_bank_path")
 
         #  Build the actual loader transform
         if points_loader:
