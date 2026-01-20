@@ -214,7 +214,7 @@ model = dict(
 
     # The architecture for Student and Teacher
     detector = dict(
-        type='VoxelNetWithBEV',
+        type='VoxelNetBEVRoI',
         data_preprocessor=dict(
             type='Det3DDataPreprocessor',
             voxel=True,
