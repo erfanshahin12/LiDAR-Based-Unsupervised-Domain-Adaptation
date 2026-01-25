@@ -1,4 +1,5 @@
 import numpy as np
+import cv2
 import matplotlib.pyplot as plt
 from mpl_toolkits.mplot3d import Axes3D 
 import math
@@ -56,7 +57,7 @@ def get_box_corners(line):
     
     return corners_3d.T, obj_class
 
-def visualize_occluded_object(bin_path, label_path, target_obj_idx):
+def visualize_occluded_object(bin_path, label_path, image_path, calib_path, target_obj_idx):
     # 1. Load Point Cloud
     points = np.fromfile(bin_path, dtype=np.float32).reshape(-1, 4)
     # points = points[::3] # Downsample
@@ -66,7 +67,21 @@ def visualize_occluded_object(bin_path, label_path, target_obj_idx):
         lines = f.readlines()
         target_line = lines[target_obj_idx]
         
-    corners = get_box_corners(target_line)
+    corners, cls = get_box_corners(target_line)
+
+    # Load calibration
+    calib = load_kitti_calib(calib_path)
+
+    # Load camera image
+    img = cv2.imread(image_path)
+
+    # Draw bounding box
+    img = draw_2d_bbox_from_3d(img, corners, calib)
+
+    # Show result
+    output_path = "occluded_object_cam_view.png"
+    cv2.imwrite(output_path, img)
+    print("✅ Saved visualization to occluded_object_cam_view.png")
     
     # 3. Setup Plot
     fig = plt.figure(figsize=(20, 15), dpi=300)
@@ -129,8 +144,8 @@ def visualize_occluded_object(bin_path, label_path, target_obj_idx):
     ax.set_ylim(mid_y - max_range, mid_y + max_range)
     ax.set_zlim(mid_z - max_range, mid_z + max_range)
     
-    plt.savefig("occluded_object_viz.png", facecolor='black', bbox_inches='tight')
-    print("✅ Saved visualization to occluded_object_viz.png")
+    plt.savefig("occluded_object_new.png", facecolor='black', bbox_inches='tight')
+    print("✅ Saved visualization to occluded_object_new.png")
 
 def visaulize_objects(bin_path, label_path):
     # 1. Load Point Cloud
@@ -232,11 +247,70 @@ def visaulize_objects(bin_path, label_path):
     plt.savefig("scene_bboxes.png", facecolor='black', bbox_inches='tight')
     print("✅ Saved visualization to scene_bboxes.png")
 
+def load_kitti_calib(calib_path):
+    calib = {}
+    with open(calib_path, 'r') as f:
+        for line in f.readlines():
+            if ':' not in line:
+                continue
+            key, value = line.split(':', 1)
+            calib[key] = np.array([float(x) for x in value.split()])
+    calib['P2'] = calib['P2'].reshape(3, 4)
+    calib['R0_rect'] = calib['R0_rect'].reshape(3, 3)
+    calib['Tr_velo_to_cam'] = calib['Tr_velo_to_cam'].reshape(3, 4)
+    return calib
+
+def project_lidar_to_image(pts_lidar, calib):
+    """
+    pts_lidar: (N, 3)
+    returns: (N, 2), valid_mask
+    """
+    # Homogeneous coordinates
+    pts_hom = np.hstack([pts_lidar, np.ones((pts_lidar.shape[0], 1))])
+
+    # LiDAR → Camera
+    pts_cam = (calib['Tr_velo_to_cam'] @ pts_hom.T).T
+    pts_cam = (calib['R0_rect'] @ pts_cam[:, :3].T).T
+
+    # Keep points in front of camera
+    valid = pts_cam[:, 2] > 0
+
+    # Camera → Image
+    pts_cam_hom = np.hstack([pts_cam, np.ones((pts_cam.shape[0], 1))])
+    pts_img = (calib['P2'] @ pts_cam_hom.T).T
+
+    pts_img = pts_img[:, :2] / pts_img[:, 2:3]
+
+    return pts_img, valid
+
+def draw_2d_bbox_from_3d(image, corners_lidar, calib, color=(0, 255, 0)):
+    """
+    image: BGR image (OpenCV)
+    corners_lidar: (8, 3)
+    """
+    pts_img, valid = project_lidar_to_image(corners_lidar, calib)
+
+    pts_img = pts_img[valid]
+    if len(pts_img) == 0:
+        return image
+
+    x_min = int(np.min(pts_img[:, 0]))
+    y_min = int(np.min(pts_img[:, 1]))
+    x_max = int(np.max(pts_img[:, 0]))
+    y_max = int(np.max(pts_img[:, 1]))
+
+    cv2.rectangle(image, (x_min, y_min), (x_max, y_max), color, 2)
+    return image
+
+
 # Usage Example
 # Replace 000000 with the file ID found in Script 1
-bin_file = "/DATA/kitti_mmdet3d/training/velodyne/000412.bin" 
-label_file = "/DATA/kitti_mmdet3d/training/label_2/000412.txt"
-obj_index = 6 # The line number from Script 1
+bin_file = "/DATA/kitti_mmdet3d/training/velodyne/000032.bin" 
+label_file = "/DATA/kitti_mmdet3d/training/label_2/000032.txt"
+image_file = "/DATA/kitti_mmdet3d/training/image_2/000032.png"
+calib_file = "/DATA/kitti_mmdet3d/training/calib/000032.txt"
+obj_index = 4 # The line number from Script 1
 
 # visualize_occluded_object(bin_file, label_file, obj_index)
-visaulize_objects(bin_file, label_file)
+# visaulize_objects(bin_file, label_file)
+visualize_occluded_object(bin_file, label_file, image_file, calib_file, obj_index)

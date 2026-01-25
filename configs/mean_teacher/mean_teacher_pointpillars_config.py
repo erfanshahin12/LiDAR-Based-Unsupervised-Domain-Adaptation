@@ -1,3 +1,5 @@
+_base_ = ['../_base_/schedules/schedule-2x.py',
+    '../_base_/default_runtime.py']
 
 source_dataset_type = 'NuScenesDataset'
 source_data_root = '/DATA/nuscenes/'
@@ -181,8 +183,8 @@ unlabeled_strong_dataset = dict(        # KITTI
 
 train_dataloader = dict(
     batch_size=2,
-    num_workers=4,
-    persistent_workers=True,
+    num_workers=0,
+    persistent_workers=False,
     sampler=dict(type='DefaultSampler', shuffle=True),
     collate_fn=dict(type='mean_teacher_collate_fn'),
     dataset=dict(
@@ -191,12 +193,16 @@ train_dataloader = dict(
             unlabeled_weak_dataset=unlabeled_weak_dataset,
             unlabeled_strong_dataset=unlabeled_strong_dataset))
 
+val_dataloader = dict()
+test_dataloader = dict()
+
 
 voxel_size = [0.2, 0.2, 8]      # nuscenes/kitti intermediate voxel size
 
 model = dict(
     type='MeanTeacher3DDetector',
     mean_teacher_cfg=dict(
+                     point_cloud_range=point_cloud_range,
                      ema_momentum=0.999,
                      use_bev_consistency=True,
                      tau=0.07,
@@ -207,9 +213,9 @@ model = dict(
                      use_class_specific_thresh=False,
                      class_thresholds=None,  # dict: {class_id: threshold}
                      # loss weights
-                     source_loss_weight=1.0,      # Weight for labeled data loss
-                     target_loss_weight=0.5,      # Weight for pseudo-label loss on unlabeled data
-                     contrastive_weight=1.0,      # Weight for BEV contrastive loss (prev. lambda_weight)
+                     source_loss_weight=1.0,
+                     target_loss_weight=0.5,
+                    contrastive_weight=1.0,
                  ),
 
     # The architecture for Student and Teacher
@@ -223,6 +229,7 @@ model = dict(
                 point_cloud_range=point_cloud_range,
                 voxel_size=voxel_size,
                 max_voxels=(30000, 40000))),
+        
         voxel_encoder=dict(
             type='PillarFeatureNet',
             in_channels=4,
@@ -230,19 +237,23 @@ model = dict(
             with_distance=False,
             voxel_size=voxel_size,
             point_cloud_range=point_cloud_range),
+        
         middle_encoder=dict(
             type='PointPillarsScatter', in_channels=64, output_shape=[504, 504]),       # output_shape = range / voxel_size (x and y)
+        
         backbone=dict(
             type='SECOND',
             in_channels=64,
             layer_nums=[3, 5, 5],
             layer_strides=[2, 2, 2],
             out_channels=[64, 128, 256]),
+        
         neck=dict(
             type='SECONDFPN',
             in_channels=[64, 128, 256],
             upsample_strides=[1, 2, 4],
             out_channels=[128, 128, 128]),
+        
         bbox_head=dict(
             type='Anchor3DHead',
             num_classes=3,
@@ -273,6 +284,7 @@ model = dict(
             loss_dir=dict(
                 type='mmdet.CrossEntropyLoss', use_sigmoid=False,
                 loss_weight=0.2)),
+    
     # model training and testing settings
     train_cfg=dict(
         assigner=[
@@ -301,6 +313,7 @@ model = dict(
         allowed_border=0,
         pos_weight=-1,
         debug=False),
+
     test_cfg=dict(
         use_rotate_nms=True,
         nms_across_levels=False,
@@ -310,14 +323,19 @@ model = dict(
         nms_pre=100,
         max_num=50)))
 
+# Runtime configs
 # Hooks
 default_hooks = dict(
     checkpoint=dict(type='CheckpointHook', interval=5),
-    logger=dict(type='LoggerHook', interval=50))
+    logger=dict(type='LoggerHook', interval=1))
 
-custom_hooks = [dict(type='MeanTeacherHook', momentum=0.999, interval=1, skip_buffer=False)]
+custom_hooks = [dict(type='MeanTeacherHook', interval=1)]
 
-# Runtime config
 log_level = 'INFO'
 load_from = None        # load pretrained pretrained checkpoint without head
 resume = False
+
+# Scheduler and optimizer config
+train_cfg = dict(type='EpochBasedTrainLoop', max_epochs=1, val_interval=1)
+val_cfg = dict(type='ValLoop')
+test_cfg = dict(type='TestLoop')

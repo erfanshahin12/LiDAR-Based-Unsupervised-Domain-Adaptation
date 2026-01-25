@@ -88,13 +88,11 @@
 
 
 # mmdet3d/engine/hooks/mean_teacher_hook.py
-# Copyright (c) OpenMMLab. All rights reserved.
 
 import torch.nn as nn
 from mmengine.hooks import Hook
 from mmengine.model import is_model_wrapper
 from mmengine.runner import Runner
-
 from mmdet.registry import HOOKS
 
 @HOOKS.register_module()
@@ -104,6 +102,9 @@ class MeanTeacherHook(Hook):
         self.interval = interval
 
     def after_train_iter(self, runner: Runner, _batch_idx, _data_batch=None, _outputs=None):
+        print("[DEBUG] EMA hook called")
         if hasattr(runner.model, "ema_update"):
             if (runner.iter + 1) % self.interval == 0:
                 runner.model.ema_update()
+            else:
+                return

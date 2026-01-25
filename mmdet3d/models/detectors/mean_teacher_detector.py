@@ -5,6 +5,7 @@ from mmdet3d.registry import MODELS
 from mmdet3d.models.detectors.base import Base3DDetector
 from mmdet3d.structures import LiDARInstance3DBoxes
 from mmengine.structures import InstanceData
+from torch import nn
 
 
 @MODELS.register_module()
@@ -23,19 +24,20 @@ class MeanTeacher3DDetector(Base3DDetector):
     def __init__(self,
                  detector,          # base detector config (student/teacher)
                  mean_teacher_cfg=dict(
+                     point_cloud_range=None,
                      ema_momentum=0.999,
                      use_bev_consistency=True,
                      tau=0.07,
                      lambda_weight=0.05,
-                     voxel_size=0.16,
+                     voxel_size=0.2,
                      # Confidence thresholding params
                      conf_threshold=0.6,
                      use_class_specific_thresh=False,
                      class_thresholds=None,  # dict: {class_id: threshold}
                      # loss weights
-                     source_loss_weight=1.0,      # Weight for labeled data loss
-                     target_loss_weight=0.5,      # Weight for pseudo-label loss on unlabeled data
-                     contrastive_weight=1.0,      # Weight for BEV contrastive loss (prev. lambda_weight)
+                     source_loss_weight=1.0,
+                     target_loss_weight=0.5,
+                     contrastive_weight=1.0,
                  ),
                  train_cfg=None,
                  test_cfg=None,
@@ -43,21 +45,22 @@ class MeanTeacher3DDetector(Base3DDetector):
 
         super().__init__(init_cfg=init_cfg)
 
-        print("\n" + "="*70)
-        print("INITIALIZING MEAN-TEACHER 3D DETECTOR")
-        print("="*70)
-
         # Build Student and Teacher Detectors
-        self.student = MODELS.build(detector)        
-        self.teacher = MODELS.build(detector)
+        self.student = MODELS.build(copy.deepcopy(detector))
+        self.teacher = MODELS.build(copy.deepcopy(detector))
 
         # Teacher never receives gradients
         for p in self.teacher.parameters():
             p.requires_grad_(False)
-                
-        # Lock the teacher in eval mode
-        self.teacher.eval()
-
+        
+        for p in self.student.parameters():
+            p.requires_grad_(True)
+        
+        # Set teacher to train mode for BN params update
+        self.student.train()
+        self.teacher.train()
+        
+        # Store configs
         self.mean_teacher_cfg = mean_teacher_cfg
         self.train_cfg = train_cfg
         self.test_cfg = test_cfg
@@ -94,7 +97,6 @@ class MeanTeacher3DDetector(Base3DDetector):
         print(f"  Voxel Size: {self.mean_teacher_cfg.get('voxel_size', 0.16)}")
         print(f"  Temperature (tau): {self.mean_teacher_cfg.get('tau', 0.07)}")
 
-
     # EMA Update — called by training hook every iter
     @torch.no_grad()
     def ema_update(self):
@@ -124,21 +126,13 @@ class MeanTeacher3DDetector(Base3DDetector):
             
             # EMA update
             t_param.data.mul_(alpha).add_(s_param.data, alpha=1 - alpha)
-            
+            diff = (s_param - t_param).abs().mean()
+            print(diff)
+
             param_updated += 1
             total_param_norm += t_param.data.norm().item()
-        
-        # Update buffers (BatchNorm stats)
-        buffer_updated = 0
-        for (t_name, t_buf), (s_name, s_buf) in zip(
-                self.teacher.named_buffers(),
-                self.student.named_buffers()):
-            assert t_name == s_name, f"Buffer mismatch: {t_name} vs {s_name}"
-            t_buf.copy_(s_buf)
-            buffer_updated += 1
-        
-        avg_param_norm = None
 
+        avg_param_norm = None
         # Print every 50 updates
         if self._ema_update_count % 50 == 0:
             avg_param_norm = total_param_norm / max(param_updated, 1)
@@ -148,23 +142,10 @@ class MeanTeacher3DDetector(Base3DDetector):
                 change = avg_param_norm - self._last_param_norm
                 change_indicator = f" (Δ: {change:+.2e})"
             
-            print(f"[EMA Update #{self._ema_update_count}] "
-                f"Updated {param_updated} params, {buffer_updated} buffers | "
+            print(f"[EMA Update #{self._ema_update_count}] | "
                 f"Avg param norm: {avg_param_norm:.4f}{change_indicator}")
             
             self._last_param_norm = avg_param_norm
-        
-        # Print first update for verification
-        if self._ema_update_count == 1:
-            print("\n" + "="*70)
-            print("FIRST EMA UPDATE")
-            print("="*70)
-            print(f"✅ Updated {param_updated} parameters with α={alpha}")
-            print(f"✅ Updated {buffer_updated} buffers")
-            # Only print if avg_param_norm was calculated
-            if avg_param_norm is not None:
-                print(f"   Average parameter norm: {avg_param_norm:.4f}")
-            print("="*70 + "\n")
 
     def extract_feat(self, model, inputs):
         """
@@ -282,7 +263,7 @@ class MeanTeacher3DDetector(Base3DDetector):
         # boxes[:, :2] = (x,y) center in meters
         # Convert to pixel indices
         bev_resolution = self.mean_teacher_cfg["voxel_size"]                    # assume square voxels in x,y
-        pc_range = self.student.data_preprocessor.voxel_layer.get('point_cloud_range', None)
+        pc_range = self.mean_teacher_cfg["point_cloud_range"]
         min_x = pc_range[0]
         min_y = pc_range[1]
         xs = (boxes[:, 0] - min_x / bev_resolution).long().clamp(0, bev_s.shape[2]-1)
@@ -412,7 +393,6 @@ class MeanTeacher3DDetector(Base3DDetector):
         pseudo_labeled_samples = copy.deepcopy(target_samples_strong)
         
         total_boxes = 0
-        total_transformed = 0
 
         # Replace ground truth with teacher's pseudo-labels
         for i, (pred, sample_weak, sample_strong) in enumerate(
@@ -423,7 +403,7 @@ class MeanTeacher3DDetector(Base3DDetector):
             pred_instances = pred.pred_instances_3d
             boxes = pred_instances.bboxes_3d
             labels = pred_instances.labels_3d
-
+            scores = pred_instances.scores_3d if hasattr(pred_instances, 'scores_3d') else None
             total_boxes += len(boxes)
             
             # Initialize empty ground truth
@@ -433,9 +413,7 @@ class MeanTeacher3DDetector(Base3DDetector):
                 # Set empty but valid ground truth container
                 gt_instances.bboxes_3d = boxes
                 gt_instances.labels_3d = labels
-
-                if hasattr(pred_instances, 'scores_3d'):
-                    gt_instances.scores_3d = pred_instances.scores_3d
+                gt_instances.scores_3d = scores if scores is not None else None
                 
                 # Assign all three at once
                 sample_strong.gt_instances_3d = gt_instances
@@ -449,12 +427,8 @@ class MeanTeacher3DDetector(Base3DDetector):
             # Assign transformed pseudo-labels
             gt_instances.bboxes_3d = boxes_transformed
             gt_instances.labels_3d = labels
-
-            if hasattr(pred_instances, 'scores_3d'):
-                scores = pred_instances.scores_3d
-                gt_instances.scores_3d = scores
+            gt_instances.scores_3d = scores if scores is not None else None
             
-            # Assign all at once
             sample_strong.gt_instances_3d = gt_instances
         
         if total_boxes == 0:
@@ -508,29 +482,17 @@ class MeanTeacher3DDetector(Base3DDetector):
         target_strong = batch_inputs_dict["unlabeled"]["strong"]
         target_samples_weak = batch_data_samples["unlabeled"]["weak"]
         target_samples_strong = batch_data_samples["unlabeled"]["strong"]
-        
-        # Preprocess weak augmentation data
-        print(f"  Preprocessing weak augmentation data...")
-        result = self.student.data_preprocessor({
-            'inputs': target_weak,
-            'data_samples': target_samples_weak
-        })
-        if isinstance(result, dict):
-            target_weak_processed = result.get('inputs', result)
-            target_samples_weak_processed = result.get('data_samples', target_samples_weak)
-        elif isinstance(result, tuple):
-            target_weak_processed, target_samples_weak_processed = result
-        else:
-            target_weak_processed = result
-            target_samples_weak_processed = target_samples_weak
-        
+               
         # Teacher forward pass (no grad)
+        print("[DEBUG] Teacher forward START")
+        self.teacher.train()
         with torch.no_grad():
             teacher_pred = self.teacher.predict(
-                target_weak_processed,
-                target_samples_weak_processed,
+                target_weak,
+                target_samples_weak,
                 return_bev_features=True
             )
+        print("[DEBUG] Teacher forward END")
         
         # Filter teacher predictions
         filtered_teacher_preds = []
@@ -539,27 +501,14 @@ class MeanTeacher3DDetector(Base3DDetector):
             filtered_teacher_preds.append(filtered_pred)
         
         # ========== TERM 2: Pseudo-Label Loss ==========
-        # Preprocess strong augmentation data
-        result = self.student.data_preprocessor({
-            'inputs': target_strong,
-            'data_samples': target_samples_strong
-        })
-        if isinstance(result, dict):
-            target_strong_processed = result.get('inputs', result)
-            target_samples_strong_processed = result.get('data_samples', target_samples_strong)
-        elif isinstance(result, tuple):
-            target_strong_processed, target_samples_strong_processed = result
-        else:
-            target_strong_processed = result
-            target_samples_strong_processed = target_samples_strong
-
+        # Add psuedo-labels to strong augmentation samples
         pseudo_labeled_samples = self._create_pseudo_labels(
             filtered_teacher_preds,
-            target_samples_weak_processed,  # Use processed samples
-            target_samples_strong_processed)
+            target_samples_weak,
+            target_samples_strong)
         
         if w_target > 0:
-            loss_target = self.student.loss(target_strong_processed, pseudo_labeled_samples)
+            loss_target = self.student.loss(target_strong, pseudo_labeled_samples)
 
             for key, value in loss_target.items():
                 # Handle both tensor and list/tuple values
@@ -575,8 +524,8 @@ class MeanTeacher3DDetector(Base3DDetector):
         if use_bev and w_cont > 0:
             # Student forward pass on strong augmentation
             student_pred = self.student.predict(
-                target_strong_processed,
-                target_samples_strong_processed,
+                target_strong,
+                target_samples_strong,
                 return_bev_features=True
             )
             
@@ -646,12 +595,15 @@ class MeanTeacher3DDetector(Base3DDetector):
         
         # Add metadata for logging
         losses['_source_total'] = source_total
+        print(f"source_total: {source_total.item():.4f}")
         losses['_target_total'] = target_total
+        print(f"target_total: {target_total.item():.4f}")
+        print(f"contrastive_total: {contrastive_total.item():.4f}")
         losses['_num_pseudo_labels'] = torch.tensor(num_valid_samples, device=device)
         losses['_total_loss'] = total_loss
-        
+        print(f"TOTAL LOSS: {total_loss.item():.4f}\n")    
+    
         return losses
-
 
     def predict(self, batch_inputs, batch_data_samples,
                 use_teacher=False, **kwargs):
