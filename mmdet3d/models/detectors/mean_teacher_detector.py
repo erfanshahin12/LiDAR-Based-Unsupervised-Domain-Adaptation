@@ -220,12 +220,6 @@ class MeanTeacher3DDetector(Base3DDetector):
         if kept_count == 0:
             print("⚠️  [FILTER WARNING] No predictions passed threshold!")
         
-        # Show score statistics
-        if kept_count > 0:
-            kept_scores = scores[mask]
-            print(f"  Score range: [{kept_scores.min():.3f}, {kept_scores.max():.3f}] "
-                f"(mean: {kept_scores.mean():.3f})")
-        
         # Create filtered prediction (deep copy to avoid modifying original)
         filtered_pred = copy.deepcopy(teacher_pred)
         
@@ -237,54 +231,66 @@ class MeanTeacher3DDetector(Base3DDetector):
         # Preserve BEV features (not filtered, it's a spatial feature map)
         if hasattr(teacher_pred, 'bev_features'):
             filtered_pred.bev_features = teacher_pred.bev_features
-            print(f"  BEV features preserved: {filtered_pred.bev_features.shape}")
             
         return filtered_pred
 
-    def class_aware_contrastive_loss(self,
+    def contrastive_loss(self,
         bev_s, bev_t,           # BEV feature maps: C x H x W
-        boxes, labels,          # teacher bboxes + labels (N_i objects per image)
-        scores=None,            # confidence scores (optional, for weighting)
+        boxes_t_s, boxes_t,       # teacher predicted boxes in strong (student) and weak (teacher) aug space
         tau=0.07,               # temperature
         lambda_weight=0.05):    # balancing weight
         
-        """ bev_s,t: student and teacher BEV map  [C,H,W]
-            boxes: teacher 3D boxes  (N,7 or N,...)   used to compute BEV centers
-            labels: predicted classes for each box (N,)
+        """
+        Contrastive loss for object-level feature consistency between student and teacher
+        in BEV feature space (InfoNCE objective).
 
-            Returns:
-            Contrastive loss between student and teacher BEV features at object locations.
+        Args:
+            bev_s: BEV feature map from student (strong aug) [C x H x W]
+            bev_t: BEV feature map from teacher (weak aug) [C x H x W]
+            boxes_t_s: Boxes from teacher (in strong aug space) [N x 7]
+            boxes_t: Boxes from teacher (in weak aug space) [N x 7]
+            tau: Temperature for contrastive loss
+            lambda_weight: Weight for the contrastive loss term
+
+        Returns:
+            Contrastive loss value
+
         """
         
-        if len(boxes) == 0:
-            return torch.tensor(0., device=bev_s.device)
+        device = bev_s.device
+        if boxes_t is None or boxes_t.shape[0] == 0:
+            return torch.tensor(0., device=device)
         
         # Compute BEV centers of boxes (x,y in BEV pixel coords)
-        # boxes[:, :2] = (x,y) center in meters
         # Convert to pixel indices
         bev_resolution = self.mean_teacher_cfg["voxel_size"]                    # assume square voxels in x,y
         pc_range = self.mean_teacher_cfg["point_cloud_range"]
-        min_x = pc_range[0]
-        min_y = pc_range[1]
-        xs = (boxes[:, 0] - min_x / bev_resolution).long().clamp(0, bev_s.shape[2]-1)
-        ys = (boxes[:, 1] - min_y / bev_resolution).long().clamp(0, bev_s.shape[1]-1)
+        min_x, min_y= pc_range[0], pc_range[1]
 
-        # Check for out-of-bounds (before clamping)
-        xs_raw = (boxes[:, 0] - min_x / bev_resolution).long()
-        ys_raw = (boxes[:, 1] - min_y / bev_resolution).long()
-        out_of_bounds = ((xs_raw < 0) | (xs_raw >= bev_s.shape[2]) | 
-                        (ys_raw < 0) | (ys_raw >= bev_s.shape[1])).sum()
-        if out_of_bounds > 0:
-            print(f"⚠️  [CONTRASTIVE WARNING] {out_of_bounds} boxes out of BEV bounds (clamped)")
+        def sample_bev(bev, boxes):
+                xs = ((boxes[:, 0] - min_x) / bev_resolution).long()
+                ys = ((boxes[:, 1] - min_y) / bev_resolution).long()
 
+                valid = (
+                    (xs >= 0) & (xs < bev.shape[2]) &
+                    (ys >= 0) & (ys < bev.shape[1])
+                )
+                return bev[:, ys[valid], xs[valid]].T, valid
+        
         # Extract BEV features at object centers
-        F_s = bev_s[:, ys, xs].T    # shape N x C
-        F_t = bev_t[:, ys, xs].T    # shape N x C
+        # Filter out-of-bounds boxes
+        F_t, valid_t = sample_bev(bev_t, boxes_t)
+        F_s, valid_s = sample_bev(bev_s, boxes_t_s)
 
-        # Normalize features (optional but recommended)
-        F_s = F.normalize(F_s, dim=1)
-        F_t = F.normalize(F_t, dim=1)
-        device = F_s.device
+        valid = valid_t & valid_s
+        if valid.sum() == 0:
+            return torch.tensor(0., device=device)
+        
+        # Normalize features 
+        F_t = F.normalize(F_t[valid], dim=1)
+        F_s = F.normalize(F_s[valid], dim=1)
+
+        N = F_s.shape[0]
 
         # Compute similarity matrix: N x N
         sim_matrix = torch.mm(F_s, F_t.T) / tau
@@ -292,15 +298,14 @@ class MeanTeacher3DDetector(Base3DDetector):
         # Build positive sets
         # pos_mask[i][j] = 1 if class_j == class_i
         labels = labels.view(-1, 1)
-        pos_mask = (labels == labels.T).float().to(device)
-        pos_count = pos_mask.sum(dim=1)  # N
+        pos_mask = torch.eye(N, device=device)
 
         # Compute contrastive loss
         # log_softmax over j dimension
         log_prob = F.log_softmax(sim_matrix, dim=1)
 
         # For each i: average only over positive j’s
-        loss = -(pos_mask * log_prob).sum(dim=1) / (pos_count + 1e-6)
+        loss = -(pos_mask * log_prob).sum(dim=1)
         return lambda_weight * loss.mean()
 
     def _transform_boxes(self, boxes, metainfo_strong):
@@ -377,13 +382,12 @@ class MeanTeacher3DDetector(Base3DDetector):
             origin=origin
         )
 
-    def _create_pseudo_labels(self, teacher_predictions, target_samples_weak, target_samples_strong):
+    def _create_pseudo_labels(self, teacher_predictions, target_samples_strong):
         """
         Create pseudo-labeled data samples from teacher predictions.
         
         Args:
             teacher_predictions: List of filtered teacher predictions
-            target_samples_weak: Weak augmentation samples (where teacher predicted)
             target_samples_strong: Strong augmentation samples (where student learns)
             
         Returns:
@@ -395,8 +399,8 @@ class MeanTeacher3DDetector(Base3DDetector):
         total_boxes = 0
 
         # Replace ground truth with teacher's pseudo-labels
-        for i, (pred, sample_weak, sample_strong) in enumerate(
-            zip(teacher_predictions, target_samples_weak, pseudo_labeled_samples)):
+        for i, (pred, sample_strong) in enumerate(
+            zip(teacher_predictions, pseudo_labeled_samples)):
             
            # Teacher predictions are in weakly augmented space, while student trains on strongly augmented space
             # Get boxes from teacher prediction (in weakly augmented space)
@@ -418,14 +422,9 @@ class MeanTeacher3DDetector(Base3DDetector):
                 # Assign all three at once
                 sample_strong.gt_instances_3d = gt_instances
                 continue
-
-            # Transform boxes to strong augmentation space
-            boxes_transformed = self._transform_boxes(
-                boxes,
-                sample_strong.metainfo)
-
+                
             # Assign transformed pseudo-labels
-            gt_instances.bboxes_3d = boxes_transformed
+            gt_instances.bboxes_3d = boxes      # boxes already transformed to strong space
             gt_instances.labels_3d = labels
             gt_instances.scores_3d = scores if scores is not None else None
             
@@ -496,15 +495,23 @@ class MeanTeacher3DDetector(Base3DDetector):
         
         # Filter teacher predictions
         filtered_teacher_preds = []
-        for i in range(len(teacher_pred)):
-            filtered_pred = self.filter_teacher_predictions(teacher_pred[i])
+        for pred in teacher_pred:
+            filtered_pred = self.filter_teacher_predictions(pred)
             filtered_teacher_preds.append(filtered_pred)
         
+        # Transform boxes to strong augmentation space
+        transformed_teacher_preds = copy.deepcopy(filtered_teacher_preds)
+        for pred, sample_strong in zip(transformed_teacher_preds, target_samples_strong):
+            
+            transformed_boxes = self._transform_boxes(
+                pred.pred_instances_3d.bboxes_3d,
+                sample_strong.metainfo)
+            pred.pred_instances_3d.bboxes_3d = transformed_boxes
+            
         # ========== TERM 2: Pseudo-Label Loss ==========
         # Add psuedo-labels to strong augmentation samples
         pseudo_labeled_samples = self._create_pseudo_labels(
-            filtered_teacher_preds,
-            target_samples_weak,
+            transformed_boxes,
             target_samples_strong)
         
         if w_target > 0:
@@ -532,7 +539,7 @@ class MeanTeacher3DDetector(Base3DDetector):
             loss_contrastive_total = torch.tensor(0., device=device)
             num_valid_samples = 0
             
-            for i in range(len(student_pred)):
+            for i in range(len(filtered_teacher_preds)):
                 try:
                     # Extract BEV features
                     bev_s = student_pred[i].bev_features
@@ -542,20 +549,15 @@ class MeanTeacher3DDetector(Base3DDetector):
                         print("⚠️  [CONTRASTIVE] BEV features not available, skipping")
                         continue
                     
-                    boxes = filtered_teacher_preds[i].pred_instances_3d.bboxes_3d.tensor
-                    labels = filtered_teacher_preds[i].pred_instances_3d.labels_3d
+                    # teacher predictions boxes in weak and strong aug space + labels and scores
+                    boxes_t = filtered_teacher_preds[i].pred_instances_3d.bboxes_3d.tensor      # in weak aug space
+                    boxes_t_s = transformed_teacher_preds[i].pred_instances_3d.bboxes_3d.tensor   # in strong aug space
                     
-                    if hasattr(filtered_teacher_preds[i].pred_instances_3d, 'scores_3d'):
-
-                        scores = filtered_teacher_preds[i].pred_instances_3d.scores_3d
-                    else: None
-                    
-                    if len(boxes) == 0:
+                    if len(boxes_t) == 0 or boxes_t is None:
                         continue
                     
-                    loss_i = self.class_aware_contrastive_loss(
-                        bev_s, bev_t, boxes, labels,
-                        scores=scores,
+                    loss_i = self.contrastive_loss(
+                        bev_s, bev_t, boxes_t_s, boxes_t,
                         tau=self.mean_teacher_cfg.get("tau", 0.07),
                         lambda_weight=self.mean_teacher_cfg.get("lambda_weight", 0.05)
                     )
