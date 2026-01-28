@@ -183,6 +183,8 @@ class HardInstanceSampling(BaseTransform):
     def transform(self, results: Dict) -> Dict:
         """
         Apply hard instance sampling to the input data.
+        Skips samples with missing or invalid point files.
+
         Args:
             results: Dict containing:
                 - 'points': Point cloud
@@ -210,6 +212,8 @@ class HardInstanceSampling(BaseTransform):
         sampled_boxes = []
         sampled_labels = []
         sampled_points_list = []
+
+        skipped_count = 0
         
         for cls_name, num_samples in self.sample_groups.items():
             # Sample from hard instance bank
@@ -217,9 +221,15 @@ class HardInstanceSampling(BaseTransform):
             
             for sample in samples:
                 # Load points for this instance
+                instance_points = self._load_instance_points(sample)
+                # validate path existence
+                if instance_points is None:
+                    skipped_count += 1
+                    continue  # Skip this instance
+
+                # Get box and label
                 instance_box = self._get_instance_box(sample)
                 instance_label = self._get_instance_label(sample, cls_name)
-                instance_points = self._load_instance_points(sample)
                 
                 # Check collision with existing boxes
                 if existing_boxes is not None:
@@ -232,42 +242,62 @@ class HardInstanceSampling(BaseTransform):
                 sampled_labels.append(instance_label)
                 sampled_points_list.append(instance_points)
         
+        # Log skipped instances
+        if skipped_count > 0:
+            print(f"⚠️  [HARD_INSTANCE] Skipped {skipped_count} instances (missing/invalid paths)")
+
         # Merge sampled instances into the scene
         if len(sampled_instances) > 0:
             results = self._merge_instances(
                 results, sampled_boxes, sampled_labels, sampled_points_list
             )
+
+            print(f"✅ Injected {len(sampled_instances)} hard instances into the scene.")
         
         return results
     
     def _load_instance_points(self, sample: Dict) -> np.ndarray:
         """Load point cloud for an instance from database using the configured loader."""
 
-        if self.points_loader_transform:        # Use the configured loader
-        # Create a minimal results dict for the transform
-            results = {
-            'lidar_path': sample['path'],
-            'num_pts_feats': self.points_loader['use_dim']}
-        
-        # Apply the LoadPointsFromFile transform
-            results = self.points_loader_transform(results)
-            return results['points']
-        
-        else:
-            # Fallback: direct loading from file
-            db_path = Path(sample['path'])
-            points = np.fromfile(db_path, dtype=np.float32)
+        pts_path = sample['path']
+    
+        # Verify path exists
+        if not Path(pts_path).exists():
+            print(f"Point cloud file not found: {pts_path}")
+            return None
+    
+        try:
+            if self.points_loader_transform:        # Use the configured loader
+            # Create results dict for LoadPointsFromFile
+                results = {
+                'lidar_points': {
+                    'lidar_path': pts_path
+                }
+            }
+                results = self.points_loader_transform(results)
+                return results['points']
             
-            # Reshape based on point dimension
-            if 'num_points_in_gt' in sample:
-                num_points = sample['num_points_in_gt']
-                point_dim = len(points) // num_points
-                points = points.reshape(-1, point_dim)
             else:
-                # Assume 4D points (x, y, z, intensity)
-                points = points.reshape(-1, 4)
-            
-            return points
+                # Fallback: direct loading from file
+                points = np.fromfile(pts_path, dtype=np.float32)
+
+                if points.size == 0:
+                    print(f"⚠️  [HARD_INSTANCE] Empty point file: {pts_path}")
+                    return None
+                
+                # Reshape based on point dimension
+                if 'num_points_in_gt' in sample:
+                    num_points = sample['num_points_in_gt']
+                    point_dim = len(points) // num_points
+                    points = points.reshape(-1, point_dim)
+                else:
+                    # Assume 4D points (x, y, z, intensity)
+                    points = points.reshape(-1, 4)
+                
+                return points
+        except Exception as e:
+            print(f"Error loading points from {pts_path}: {e}")
+            return None
     
     def _transform_points_to_global(self, instance_points, box):
         """

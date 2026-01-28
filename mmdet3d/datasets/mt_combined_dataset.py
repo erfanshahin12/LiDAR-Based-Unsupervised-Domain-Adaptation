@@ -1,10 +1,11 @@
 from mmengine.dataset import BaseDataset
 from mmdet3d.registry import DATASETS
 from mmengine.registry import FUNCTIONS
+from mmcv.transforms import Compose
 from torch.utils.data.dataloader import default_collate
 
 @DATASETS.register_module()
-class MTCombinedDataset(BaseDataset):
+class MTCombinedDataset:
     """
     Mean-Teacher Combined Dataset for semi-supervised 3D detection.
     
@@ -23,8 +24,6 @@ class MTCombinedDataset(BaseDataset):
                  unlabeled_weak_dataset,
                  unlabeled_strong_dataset,
                  **kwargs):
-        
-        super().__init__(**kwargs)
 
         # Build sub-datasets
         self.labeled_dataset = DATASETS.build(labeled_dataset)
@@ -45,15 +44,8 @@ class MTCombinedDataset(BaseDataset):
     def __getitem__(self, idx):
         """
         Returns a dict with labeled and unlabeled data.
-        
-        Note: MMDetection3D will batch these using the default collate_fn,
-        which expects each sample to return inputs and data_samples.
         """
-        # Get labeled sample (wrap around if unlabeled is longer)
         labeled = self.labeled_dataset[idx % self.labeled_len]
-        
-        # Get unlabeled samples with same index but different augmentations
-        # Ensuring that each epoch contains one target and one source sample
         unlabeled_weak = self.unlabeled_weak_dataset[idx % self.unlabeled_len]
         unlabeled_strong = self.unlabeled_strong_dataset[idx % self.unlabeled_len]
 
@@ -100,31 +92,26 @@ def mean_teacher_collate_fn(data_batch):
     # Helper function to collate inputs and data_samples
     def collate_samples(samples):
         """
-        Collate a list of samples into batched inputs and list of data_samples.
-        
-        Each sample has structure:
-        {
-            'inputs': dict with point cloud data,
-            'data_samples': Det3DDataSample object
-        }
+        Collate samples with variable-sized point clouds.
+        Keep points as a list, but batch other tensor data.
         """
-        # Extract inputs and data_samples
+        # Separate inputs and data_samples
         inputs_list = [s['inputs'] for s in samples]
         data_samples_list = [s['data_samples'] for s in samples]
         
-        # Batch the inputs (point clouds)
-        # This uses PyTorch's default collate for dict of tensors
-        batched_inputs = default_collate(inputs_list)
+        # Keep points as list (not stacked) to avoid size mismatch
+        batch_inputs = {
+            'points': [inp['points'] for inp in inputs_list]
+        }
         
-        # data_samples stay as a list (MMDet3D convention)
-        return batched_inputs, data_samples_list
+        return batch_inputs, data_samples_list
     
     # Collate each component
     labeled_inputs, labeled_data_samples = collate_samples(labeled_samples)
     weak_inputs, weak_data_samples = collate_samples(unlabeled_weak_samples)
     strong_inputs, strong_data_samples = collate_samples(unlabeled_strong_samples)
     
-    # Structure output as expected by MeanTeacher3DDetector.loss()
+    # Structure output as expected by MeanTeacher3DDetector
     batch_inputs_dict = {
         'labeled': labeled_inputs,
         'unlabeled': {

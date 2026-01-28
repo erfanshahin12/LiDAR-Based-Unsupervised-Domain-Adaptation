@@ -2,23 +2,29 @@ _base_ = ['../_base_/schedules/schedule-2x.py',
     '../_base_/default_runtime.py']
 
 source_dataset_type = 'NuScenesDataset'
-source_data_root = '/DATA/nuscenes/'
+source_data_root = '/DATA/nuScenes/'
 ann_file_source = 'nuscenes_infos_train.pkl'
 data_prefix_source = dict(pts='samples/LIDAR_TOP', img='', sweeps='sweeps/LIDAR_TOP')
-box_origin = (0.5, 0.5, 0.5)        # nuScenes box origin
+classes_nuscenes = ['car', 'truck', 'construction_vehicle', 'bus', 'trailer',
+                  'barrier', 'motorcycle', 'bicycle', 'pedestrian', 'traffic_cone']
+box_origin_source = (0.5, 0.5, 0.5)        # nuScenes box origin
+metainfo_source = dict(classes=classes_nuscenes, origin=box_origin_source)
 
 target_dataset_type = 'KittiDataset'
 target_data_root = '/DATA/kitti_mmdet3d/'
 ann_file_target = 'kitti_infos_train.pkl'
 data_prefix_target = dict(pts='training/velodyne_reduced')
+classes_kitti = ['Car', 'Pedestrian', 'Cyclist']
+box_origin_target = (0.5, 0.5, 0)        # KITTI box origin
+metainfo_target = dict(classes=classes_kitti, box_origin=box_origin_target)
 
-hard_instance_bank_path = './configs/mean_teacher/hard_instance_bank/hard_instance_bank_nuscenes_quantile_kitti_50.pkl'
+hard_instance_bank_path = './configs/mean_teacher/hard_instance_bank/hard_instance_bank_nuscenes_quantile_kitti_20.pkl'
 
 point_cloud_range = [-50.40, -50.40, -5, 50.40, 50.40, 3]   # nuScenes point cloud range
-class_names = ['Car', 'Pedestrian', 'Cyclist']
-metainfo = dict(classes=class_names,
-                origin=box_origin)
 input_modality = dict(use_lidar=True, use_camera=False)
+metainfo = dict(
+        classes=['Car', 'Pedestrian', 'Cyclist'],
+        box_origin=(0.5, 0.5, 0.5))
 backend_args = None
 
 # Dataset
@@ -29,7 +35,7 @@ db_sampler_kitti= dict(
     prepare=dict(
         filter_by_difficulty=[-1],
         filter_by_min_points=dict(Car=5, Pedestrian=10, Cyclist=10)),
-    classes=class_names,
+    classes=classes_kitti,
     sample_groups=dict(Car=12, Pedestrian=6, Cyclist=6),
     points_loader=dict(
         type='LoadPointsFromFile',
@@ -55,7 +61,7 @@ source_pipeline = [     # nuScenes         # supervised training on source data
                 'motorcycle': 'Cyclist',
                 'pedestrian': 'Pedestrian',
             },
-            class_names=['Car', 'Pedestrian', 'Cyclist'],
+            class_names=classes_kitti,
             keep_unmapped=False),  # Drop unmapped classes like 'trailer', 'barrier'
    dict(
         type='GlobalRotScaleTrans',
@@ -65,7 +71,7 @@ source_pipeline = [     # nuScenes         # supervised training on source data
     dict(type='RandomFlip3D', flip_ratio_bev_horizontal=0.5),
     dict(type='PointsRangeFilter', point_cloud_range=point_cloud_range),
     dict(type='ObjectRangeFilter', point_cloud_range=point_cloud_range),
-    dict(type='ObjectNameFilter', classes=class_names),
+    dict(type='ObjectNameFilter', classes=classes_kitti),
     dict(type='PointShuffle'),
     dict(
         type='Pack3DDetInputs',
@@ -89,7 +95,7 @@ target_weak_pipeline = [       # KITTI      # sent to teacher model for predicti
     #     scale_ratio_range=[0.98, 1.02]),
     
     dict(type='PointsRangeFilter', point_cloud_range=point_cloud_range),
-    dict(type='ObjectRangeFilter', point_cloud_range=point_cloud_range),
+    # dict(type='ObjectRangeFilter', point_cloud_range=point_cloud_range),
     dict(type='PointShuffle'),
     dict(
         type='Pack3DDetInputs',
@@ -104,7 +110,7 @@ target_strong_pipeline = [       # KITTI      # sent to student model for unsupe
         use_dim=4),
     dict(
         type='KittiToNuscenes'),                    # transform coordinates to nuscenes style
-    dict(type='ObjectSample', db_sampler=db_sampler_kitti),
+    # dict(type='ObjectSample', db_sampler=db_sampler_kitti),
 
     dict(
         type='HardInstanceSampling',
@@ -119,20 +125,20 @@ target_strong_pipeline = [       # KITTI      # sent to student model for unsupe
             load_dim=5,         # Source is nuScenes (5D)
             use_dim=4)),
 
-    dict(
-        type='ObjectNoise',
-        num_try=100,
-        translation_std=[1.0, 1.0, 0.5],
-        global_rot_range=[0.0, 0.0],
-        rot_range=[-0.78539816, 0.78539816]
-        ),
+    # dict(
+    #     type='ObjectNoise',
+    #     num_try=100,
+    #     translation_std=[1.0, 1.0, 0.5],
+    #     global_rot_range=[0.0, 0.0],
+    #     rot_range=[-0.78539816, 0.78539816]
+    #     ),
     dict(type='RandomFlip3D', flip_ratio_bev_horizontal=0.5),
     dict(
         type='GlobalRotScaleTrans',
         rot_range=[-0.78539816, 0.78539816],                # +/- 45 degrees
         scale_ratio_range=[0.95, 1.05]),
     dict(type='PointsRangeFilter', point_cloud_range=point_cloud_range),
-    dict(type='ObjectRangeFilter', point_cloud_range=point_cloud_range),
+    # dict(type='ObjectRangeFilter', point_cloud_range=point_cloud_range),
     dict(type='PointShuffle'),
     dict(
         type='Pack3DDetInputs',
@@ -140,18 +146,18 @@ target_strong_pipeline = [       # KITTI      # sent to student model for unsupe
 ]
 
 labeled_dataset = dict(          # nuScenes
-    type='CBGSDataset', # Or just 'NuScenesDataset'
-    dataset=dict(
         type=source_dataset_type,
         data_root=source_data_root,
         ann_file=ann_file_source,
         data_prefix=data_prefix_source,
         pipeline=source_pipeline,
-        metainfo=metainfo,
+        metainfo=metainfo_source,
         modality=input_modality,
         box_type_3d='LiDAR',
         test_mode=False,
-        backend_args=backend_args))
+        with_velocity=False,
+        backend_args=backend_args
+        )
 
 unlabeled_weak_dataset = dict(        # KITTI
     type=target_dataset_type,
@@ -159,13 +165,14 @@ unlabeled_weak_dataset = dict(        # KITTI
     ann_file=ann_file_target,
     data_prefix=data_prefix_target,
     pipeline=target_weak_pipeline,
-    metainfo=metainfo,
+    metainfo=metainfo_target,
     modality=input_modality,
     box_type_3d='LiDAR',
     test_mode=False,
-    load_eval_ann=False,             # not to load annotations, even though an ann_file is provided
+    load_eval_anns=False,           # not to load annotations, even though an ann_file is provided
+    filter_empty_gt=False,          # skip GT check in prepare_data          
     backend_args=backend_args
-)
+    )
 
 unlabeled_strong_dataset = dict(        # KITTI
     type=target_dataset_type,
@@ -173,13 +180,14 @@ unlabeled_strong_dataset = dict(        # KITTI
     ann_file=ann_file_target,
     data_prefix=data_prefix_target,
     pipeline=target_strong_pipeline,
-    metainfo=metainfo,
+    metainfo=metainfo_target,
     modality=input_modality,
     box_type_3d='LiDAR',
     test_mode=False,
-    load_eval_ann=False,             # not to load annotations, even though an ann_file is provided
+    load_eval_anns=False,           # not to load annotations, even though an ann_file is provided
+    filter_empty_gt=False,          # skip GT check in prepare_data
     backend_args=backend_args
-)
+    )
 
 train_dataloader = dict(
     batch_size=2,
@@ -191,10 +199,11 @@ train_dataloader = dict(
             type='MTCombinedDataset',
             labeled_dataset=labeled_dataset,
             unlabeled_weak_dataset=unlabeled_weak_dataset,
-            unlabeled_strong_dataset=unlabeled_strong_dataset))
+            unlabeled_strong_dataset=unlabeled_strong_dataset)
+    )
 
-val_dataloader = dict()
-test_dataloader = dict()
+# val_dataloader = dict()
+# test_dataloader = dict()
 
 
 voxel_size = [0.2, 0.2, 8]      # nuscenes/kitti intermediate voxel size
@@ -209,7 +218,7 @@ model = dict(
                      lambda_weight=0.05,
                      voxel_size=voxel_size[0],
                      # Confidence thresholding params
-                     conf_threshold=0.6,
+                     conf_threshold=0.3,
                      use_class_specific_thresh=False,
                      class_thresholds=None,  # dict: {class_id: threshold}
                      # loss weights
@@ -329,6 +338,10 @@ default_hooks = dict(
     checkpoint=dict(type='CheckpointHook', interval=5),
     logger=dict(type='LoggerHook', interval=1))
 
+# custom_imports = dict(
+#     imports=['mmdet3d.engine.hooks.mean_teacher_hook'],
+#     allow_failed_imports=False
+# )
 custom_hooks = [dict(type='MeanTeacherHook', interval=1)]
 
 log_level = 'INFO'
@@ -337,5 +350,5 @@ resume = False
 
 # Scheduler and optimizer config
 train_cfg = dict(type='EpochBasedTrainLoop', max_epochs=1, val_interval=1)
-val_cfg = dict(type='ValLoop')
-test_cfg = dict(type='TestLoop')
+val_cfg = None
+test_cfg = None
