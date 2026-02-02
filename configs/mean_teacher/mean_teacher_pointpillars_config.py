@@ -19,8 +19,10 @@ box_origin_target = (0.5, 0.5, 0)        # KITTI box origin
 metainfo_target = dict(classes=classes_kitti, box_origin=box_origin_target)
 
 hard_instance_bank_path = './configs/mean_teacher/hard_instance_bank/hard_instance_bank_nuscenes_quantile_kitti_20.pkl'
+pretrained_ckpt = 'checkpoints/pointpillars_hv_secfpn_6x8_160e_nuscenes_20220301_214652-23b4f5f3.pth',
 
-point_cloud_range = [-50.40, -50.40, -5, 50.40, 50.40, 3]   # nuScenes point cloud range
+# point_cloud_range = [-50.40, -50.40, -5, 50.40, 50.40, 3]   # nuScenes point cloud range
+point_cloud_range = [0, -50.40, -5, 68.80, 50.40, 3]
 input_modality = dict(use_lidar=True, use_camera=False)
 metainfo = dict(
         classes=['Car', 'Pedestrian', 'Cyclist'],
@@ -191,7 +193,7 @@ unlabeled_strong_dataset = dict(        # KITTI
 
 train_dataloader = dict(
     batch_size=2,
-    num_workers=0,
+    num_workers=2,
     persistent_workers=False,
     sampler=dict(type='DefaultSampler', shuffle=True),
     collate_fn=dict(type='mean_teacher_collate_fn'),
@@ -227,6 +229,8 @@ model = dict(
                     contrastive_weight=1.0,
                  ),
 
+    pretrained_ckpt=pretrained_ckpt,
+
     # The architecture for Student and Teacher
     detector = dict(
         type='VoxelNetBEVRoI',
@@ -234,7 +238,7 @@ model = dict(
             type='Det3DDataPreprocessor',
             voxel=True,
             voxel_layer=dict(
-                max_num_points=32,  # max_points_per_voxel
+                max_num_points=64,  # max_points_per_voxel
                 point_cloud_range=point_cloud_range,
                 voxel_size=voxel_size,
                 max_voxels=(30000, 40000))),
@@ -248,36 +252,44 @@ model = dict(
             point_cloud_range=point_cloud_range),
         
         middle_encoder=dict(
-            type='PointPillarsScatter', in_channels=64, output_shape=[504, 504]),       # output_shape = range / voxel_size (x and y)
+            type='PointPillarsScatter', in_channels=64, output_shape=[344, 504]),       # output_shape = range / voxel_size (x and y)
         
         backbone=dict(
             type='SECOND',
             in_channels=64,
+            norm_cfg=dict(type='naiveSyncBN2d', eps=1e-3, momentum=0.01),
             layer_nums=[3, 5, 5],
             layer_strides=[2, 2, 2],
             out_channels=[64, 128, 256]),
         
         neck=dict(
-            type='SECONDFPN',
+            type='mmdet.FPN',
+            norm_cfg=dict(type='naiveSyncBN2d', eps=1e-3, momentum=0.01),
+            act_cfg=dict(type='ReLU'),
             in_channels=[64, 128, 256],
-            upsample_strides=[1, 2, 4],
-            out_channels=[128, 128, 128]),
+            out_channels=256,
+            start_level=0,
+            num_outs=3),
         
         bbox_head=dict(
             type='Anchor3DHead',
             num_classes=3,
-            in_channels=384,
-            feat_channels=384,
+            in_channels=256,
+            feat_channels=256,
             use_direction_classifier=True,
             assign_per_class=True,
-            anchor_generator=dict(
+            anchor_generator=dict(                      
                 type='AlignedAnchor3DRangeGenerator',
-                ranges=[
-                    [-49.92, -49.92, -0.6, 49.92, 49.92, -0.6],    # Car
-                    [-49.92, -49.92, -0.6, 49.92, 49.92, -0.6],    # Pedestrian
-                    [-49.92, -49.92, -1.78, 49.92, 49.92, -1.78],  # Cyclist
+                ranges=[                                        # use source dataset anchor ranges
+                    [0, -50.40, -1.62, 68.80, 50.40, -1.62],    # Pedestrian
+                    [0, -50.40, -1.67, 68.80, 50.40, -1.67],    # Cyclist
+                    [0, -50.40, -1.80, 68.80, 50.40, -1.80]     # Car
                 ],
-                sizes=[[0.8, 0.6, 1.73], [1.76, 0.6, 1.73], [3.9, 1.6, 1.56]],
+                sizes=[
+                    [0.8, 0.6, 1.73],           # Pedestrian    
+                    [1.72, 0.6, 1.73],          # Cyclist
+                    [4.25, 1.78, 1.65]            # Car
+                ],
                 rotations=[0, 1.57],
                 reshape_out=False),
             diff_rad_by_sin=True,
@@ -294,43 +306,43 @@ model = dict(
                 type='mmdet.CrossEntropyLoss', use_sigmoid=False,
                 loss_weight=0.2)),
     
-    # model training and testing settings
-    train_cfg=dict(
-        assigner=[
-            dict(  # for Pedestrian
-                type='Max3DIoUAssigner',
-                iou_calculator=dict(type='mmdet3d.BboxOverlapsNearest3D'),
-                pos_iou_thr=0.5,
-                neg_iou_thr=0.35,
-                min_pos_iou=0.35,
-                ignore_iof_thr=-1),
-            dict(  # for Cyclist
-                type='Max3DIoUAssigner',
-                iou_calculator=dict(type='mmdet3d.BboxOverlapsNearest3D'),
-                pos_iou_thr=0.5,
-                neg_iou_thr=0.35,
-                min_pos_iou=0.35,
-                ignore_iof_thr=-1),
-            dict(  # for Car
-                type='Max3DIoUAssigner',
-                iou_calculator=dict(type='mmdet3d.BboxOverlapsNearest3D'),
-                pos_iou_thr=0.6,
-                neg_iou_thr=0.45,
-                min_pos_iou=0.45,
-                ignore_iof_thr=-1),
-        ],
-        allowed_border=0,
-        pos_weight=-1,
-        debug=False),
+        # model training and testing settings
+        train_cfg=dict(
+            assigner=[
+                dict(  # for Pedestrian
+                    type='Max3DIoUAssigner',
+                    iou_calculator=dict(type='mmdet3d.BboxOverlapsNearest3D'),
+                    pos_iou_thr=0.5,
+                    neg_iou_thr=0.35,
+                    min_pos_iou=0.35,
+                    ignore_iof_thr=-1),
+                dict(  # for Cyclist
+                    type='Max3DIoUAssigner',
+                    iou_calculator=dict(type='mmdet3d.BboxOverlapsNearest3D'),
+                    pos_iou_thr=0.5,
+                    neg_iou_thr=0.35,
+                    min_pos_iou=0.35,
+                    ignore_iof_thr=-1),
+                dict(  # for Car
+                    type='Max3DIoUAssigner',
+                    iou_calculator=dict(type='mmdet3d.BboxOverlapsNearest3D'),
+                    pos_iou_thr=0.6,
+                    neg_iou_thr=0.45,
+                    min_pos_iou=0.45,
+                    ignore_iof_thr=-1),
+            ],
+            allowed_border=0,
+            pos_weight=-1,
+            debug=False),
 
-    test_cfg=dict(
-        use_rotate_nms=True,
-        nms_across_levels=False,
-        nms_thr=0.01,
-        score_thr=0.1,
-        min_bbox_size=0,
-        nms_pre=100,
-        max_num=50)))
+        test_cfg=dict(
+            use_rotate_nms=True,
+            nms_across_levels=False,
+            nms_thr=0.01,
+            score_thr=0.1,
+            min_bbox_size=0,
+            nms_pre=100,
+            max_num=50)))
 
 # Runtime configs
 # Hooks
@@ -343,10 +355,6 @@ default_hooks = dict(
 #     allow_failed_imports=False
 # )
 custom_hooks = [dict(type='MeanTeacherHook', interval=1)]
-
-log_level = 'INFO'
-load_from = None        # load pretrained pretrained checkpoint without head
-resume = False
 
 # Scheduler and optimizer config
 train_cfg = dict(type='EpochBasedTrainLoop', max_epochs=1, val_interval=1)

@@ -263,26 +263,30 @@ class HardInstanceSampling(BaseTransform):
     
         # Verify path exists
         if not Path(pts_path).exists():
-            print(f"Point cloud file not found: {pts_path}")
             return None
     
         try:
             if self.points_loader_transform:        # Use the configured loader
             # Create results dict for LoadPointsFromFile
                 results = {
-                'lidar_points': {
-                    'lidar_path': pts_path
-                }
-            }
+                    'lidar_points': {'lidar_path': pts_path}}
+                
                 results = self.points_loader_transform(results)
-                return results['points']
+                points = results.get('points', None)
+                
+                # Extract tensor if it's a BasePoints/LiDARPoints object
+                if hasattr(points, 'tensor'):
+                    points = points.tensor
+                if isinstance(points, torch.Tensor):
+                    points = points.numpy()
+                
+                return points
             
             else:
                 # Fallback: direct loading from file
                 points = np.fromfile(pts_path, dtype=np.float32)
 
                 if points.size == 0:
-                    print(f"⚠️  [HARD_INSTANCE] Empty point file: {pts_path}")
                     return None
                 
                 # Reshape based on point dimension
@@ -310,19 +314,43 @@ class HardInstanceSampling(BaseTransform):
         Returns:
             global_points: [N, 4] array in global coordinates
         """
-        # Extract box parameters
-        x, y, z, l, w, h, yaw = box
+
+         # Handle both [1, 7] and [7] shapes
+        if isinstance(box, torch.Tensor):
+            box = box.numpy()
         
+        if box.ndim == 2:
+            box = box.squeeze(0)  # Convert [1, x] to [x]
+        
+        # Extract only first 7: [x, y, z, l, w, h, yaw] (ignore velocity, etc)
+        x, y, z, l, w, h, yaw = box[:7]
+
+        # ✅ Handle LiDARPoints or BasePoints objects
+        if hasattr(instance_points, 'tensor'):
+            # It's a LiDARPoints/BasePoints object
+            instance_points = instance_points.tensor
+    
+        # Convert torch tensor to numpy
+        if isinstance(instance_points, torch.Tensor):
+            instance_points = instance_points.numpy()
+
+        # Ensure instance_points is 2D [N, 4]
+        if instance_points.ndim == 1:
+            instance_points = instance_points.reshape(1, -1)
+        
+        if instance_points.shape[0] == 0:
+            return instance_points
+
         # Separate xyz and intensity
         local_xyz = instance_points[:, :3]  # [N, 3]
         intensity = instance_points[:, 3:]   # [N, 1]
-        
+
         # Create rotation matrix around z-axis
         rotation_matrix = np.array([
             [np.cos(yaw), -np.sin(yaw), 0],
             [np.sin(yaw),  np.cos(yaw), 0],
             [   0,              0,      1]
-        ])
+        ], dtype=np.float32)
         
         # Apply rotation
         rotated_xyz = local_xyz @ rotation_matrix.T  # [N, 3]
@@ -401,23 +429,43 @@ class HardInstanceSampling(BaseTransform):
         # Concatenate new boxes
         new_boxes = np.concatenate(new_boxes, axis=0)  # [N, 7]
         new_labels = np.array(new_labels)  # [N]
+
+        # Store original points type and metadata
+        original_points = results['points']
+        original_points_type = type(original_points)
+        
+        # Convert to numpy for processing
+        if hasattr(original_points, 'tensor'):
+            points_np = original_points.tensor.numpy()
+        elif isinstance(original_points, torch.Tensor):
+            points_np = original_points.numpy()
+        else:
+            points_np = original_points
         
         # Merge points
         for i, instance_points in enumerate(new_points_list):
             # Transform from object-local to global coordinates
             box = new_boxes[i]  # [7]
+        
             global_points = self._transform_points_to_global(instance_points, box)
             
-            # Concatenate to scene points, account for tensor/ndarray types
-            if isinstance(results['points'], torch.Tensor):
+            # Concatenate to scene points (as numpy arrays)
+            points_np = np.concatenate([points_np, global_points], axis=0)
 
-                current_points = results['points'].numpy()
-                merged_points = np.concatenate([current_points, global_points], axis=0)
-                results['points'] = torch.from_numpy(merged_points).float()
+        # Convert back to original type
+        if original_points_type.__name__ == 'BasePoints' or hasattr(original_points, 'tensor'):
+            # Preserve BasePoints type and attributes
+            results['points'] = original_points.__class__(
+                torch.from_numpy(points_np).float(),
+                points_dim=points_np.shape[-1],
+                attribute_dims=getattr(original_points, 'attribute_dims', None)
+            )
 
-            else:
-                results['points'] = np.concatenate(
-                    [results['points'], global_points], axis=0)
+        elif isinstance(original_points, torch.Tensor):
+            results['points'] = torch.from_numpy(points_np).float()
+        
+        else:
+            results['points'] = points_np
         
         # Determine origin from existing boxes or use nuScenes default
         if 'gt_bboxes_3d' in results and hasattr(results['gt_bboxes_3d'], 'origin'):

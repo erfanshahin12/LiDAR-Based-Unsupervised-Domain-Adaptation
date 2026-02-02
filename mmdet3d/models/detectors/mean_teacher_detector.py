@@ -1,12 +1,12 @@
 import copy
-import torch
 import numpy as np
+import torch
+from torch import nn
 import torch.nn.functional as F
 from mmdet3d.registry import MODELS
 from mmdet3d.models.detectors.base import Base3DDetector
 from mmdet3d.structures import LiDARInstance3DBoxes
 from mmengine.structures import InstanceData
-from torch import nn
 
 
 @MODELS.register_module()
@@ -40,6 +40,7 @@ class MeanTeacher3DDetector(Base3DDetector):
                      target_loss_weight=0.5,
                      contrastive_weight=1.0,
                  ),
+                 pretrained_ckpt=None,
                  train_cfg=None,
                  test_cfg=None,
                  init_cfg=None):
@@ -66,6 +67,20 @@ class MeanTeacher3DDetector(Base3DDetector):
         self.train_cfg = train_cfg
         self.test_cfg = test_cfg
 
+        # Load pretrained checkpoint weights to student
+        if pretrained_ckpt is not None:
+
+            device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+            checkpoint = torch.load(pretrained_ckpt, map_location=device)
+            state_dict = checkpoint.get('state_dict', checkpoint)
+            
+            # Load to student
+            missing, unexpected = self.student.load_state_dict(state_dict, strict=False)
+            
+            print(f"Pretrained weights loaded:")
+            print(f"  Missing keys: {len(missing)}")
+            print(f"  Unexpected keys: {len(unexpected)}")
+
         # Initialize teacher with student weights
         for (t_name, t_param), (s_name, s_param) in zip(
                 self.teacher.named_parameters(),
@@ -84,20 +99,7 @@ class MeanTeacher3DDetector(Base3DDetector):
             else:
                 print(f"⚠️ WARNING: Buffer name mismatch: {t_name} vs {s_name}")
 
-        # Print configuration
-        print("\n" + "-"*70)
-        print("MEAN-TEACHER CONFIGURATION:")
-        print("-"*70)
-        print(f"  EMA Momentum: {self.mean_teacher_cfg.get('ema_momentum', 0.999)}")
-        print(f"  Use BEV Consistency: {self.mean_teacher_cfg.get('use_bev_consistency', True)}")
-        print(f"  Confidence Threshold: {self.mean_teacher_cfg.get('conf_threshold', 0.6)}")
-        print(f"  Source Loss Weight: {self.mean_teacher_cfg.get('source_loss_weight', 1.0)}")
-        print(f"  Target Loss Weight: {self.mean_teacher_cfg.get('target_loss_weight', 0.5)}")
-        print(f"  Contrastive Weight: {self.mean_teacher_cfg.get('contrastive_weight', 1.0)}")
-        print(f"  Voxel Size: {self.mean_teacher_cfg.get('voxel_size', 0.16)}")
-        print(f"  Temperature (tau): {self.mean_teacher_cfg.get('tau', 0.07)}")
-
-    # EMA Update — called by training hook every iter
+    # EMA Update — called by training hook after every iter
     @torch.no_grad()
     def ema_update(self):
         """
@@ -224,10 +226,10 @@ class MeanTeacher3DDetector(Base3DDetector):
         
         # Create new InstanceData with filtered data (all same length)
         filtered_pred.pred_instances_3d = InstanceData(
-        bboxes_3d=bboxes[mask],
-        scores_3d=scores[mask],
-        labels_3d=labels[mask]
-    )
+                                            bboxes_3d=bboxes[mask],
+                                            scores_3d=scores[mask],
+                                            labels_3d=labels[mask]
+                                            )
         
         # Preserve BEV features (not filtered, it's a spatial feature map)
         if hasattr(teacher_pred, 'bev_features'):
@@ -567,7 +569,6 @@ class MeanTeacher3DDetector(Base3DDetector):
             target_samples_weak_processed = target_samples_weak
                
         # Teacher forward pass (no grad)
-        print("[DEBUG] Teacher forward START")
         self.teacher.train()
         with torch.no_grad():
             teacher_pred = self.teacher.predict(
@@ -575,7 +576,6 @@ class MeanTeacher3DDetector(Base3DDetector):
                 target_samples_weak_processed,
                 return_bev_features=True
             )
-        print("[DEBUG] Teacher forward END")
         
         # Filter teacher predictions
         filtered_teacher_preds = []
