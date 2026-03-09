@@ -9,15 +9,23 @@ data_prefix_source = dict(pts='samples/LIDAR_TOP', img='', sweeps='sweeps/LIDAR_
 classes_nuscenes = ['car', 'truck', 'construction_vehicle', 'bus', 'trailer',
                   'barrier', 'motorcycle', 'bicycle', 'pedestrian', 'traffic_cone']
 box_origin_source = (0.5, 0.5, 0.5)        # nuScenes box origin
-metainfo_source = dict(classes=classes_nuscenes, origin=box_origin_source)
+metainfo_source = dict(classes=classes_nuscenes, origin=box_origin_source, version='v1.0-mini')
 
-target_dataset_type = 'KittiDataset'
-target_data_root = '/DATA/kitti_mmdet3d/'
-ann_file_target = 'kitti_infos_train.pkl'
-data_prefix_target = dict(pts='training/velodyne_reduced')
+# target_dataset_type = 'KittiDataset'
+# target_data_root = '/DATA/kitti_mmdet3d/'
+# ann_file_target = 'kitti_infos_train.pkl'
+# data_prefix_target = dict(pts='training/velodyne_reduced')
+# classes_kitti = ['Car', 'Pedestrian', 'Cyclist']
+# box_origin_target = (0.5, 0.5, 0)        # KITTI box origin
+# metainfo_target = dict(classes=classes_kitti, box_origin=box_origin_target)
+
+target_dataset_type = 'NuScenesDataset'
+target_data_root = '/home/erfans00/nuscenes/'
+ann_file_target = 'nuscenes_infos_train.pkl'
+data_prefix_target = dict(pts='samples/LIDAR_TOP', img='', sweeps='sweeps/LIDAR_TOP')
 classes_kitti = ['Car', 'Pedestrian', 'Cyclist']
-box_origin_target = (0.5, 0.5, 0)        # KITTI box origin
-metainfo_target = dict(classes=classes_kitti, box_origin=box_origin_target)
+box_origin_target = (0.5, 0.5, 0.5)        # KITTI box origin
+metainfo_target = dict(classes=classes_nuscenes, box_origin=box_origin_target, version='v1.0-mini')
 
 hard_instance_bank_path = './configs/mean_teacher/hard_instance_bank/hard_instance_bank_nuscenes_quantile_kitti_20.pkl'
 pretrained_ckpt = './work_dirs/pretrain_16feb/epoch_24.pth'
@@ -85,10 +93,10 @@ target_weak_pipeline = [       # KITTI      # sent to teacher model for predicti
     dict(
         type='LoadPointsFromFile',
         coord_type='LIDAR',
-        load_dim=4,
+        load_dim=5,
         use_dim=4),
-    dict(
-        type='KittiToNuscenes'),                    # convert kitti coordinates to nuscenes format
+    # dict(
+    #     type='KittiToNuscenes'),                    # convert kitti coordinates to nuscenes format
 
         ### the augmentations below makes the pseudo-labels in a different coordinate system, either delete them or take into account the conversion back to previous coords
     # dict(type='RandomFlip3D', flip_ratio_bev_horizontal=0.5),
@@ -109,24 +117,24 @@ target_strong_pipeline = [       # KITTI      # sent to student model for unsupe
     dict(
         type='LoadPointsFromFile',
         coord_type='LIDAR',
-        load_dim=4,
+        load_dim=5,
         use_dim=4),
-    dict(
-        type='KittiToNuscenes'),                    # transform coordinates to nuscenes style
+    # dict(
+    #     type='KittiToNuscenes'),                    # transform coordinates to nuscenes style
     # dict(type='ObjectSample', db_sampler=db_sampler_kitti),
 
-    dict(
-        type='HardInstanceSampling',
-        hard_instance_bank_path=hard_instance_bank_path,
-        sample_groups=dict(
-            Car=5, Pedestrian=3, Cyclist=3),        # number of hard instances to sample per class
-        use_pred_boxes_for_collision=True,          # Use predictions for collision
-        iou_thresh=0.3,                             # Collision detection threshold
-        points_loader=dict(
-            type='LoadPointsFromFile',
-            coord_type='LIDAR',
-            load_dim=5,         # Source is nuScenes (5D)
-            use_dim=4)),
+    # dict(
+    #     type='HardInstanceSampling',
+    #     hard_instance_bank_path=hard_instance_bank_path,
+    #     sample_groups=dict(
+    #         Car=5, Pedestrian=3, Cyclist=3),        # number of hard instances to sample per class
+    #     use_pred_boxes_for_collision=True,          # Use predictions for collision
+    #     iou_thresh=0.3,                             # Collision detection threshold
+    #     points_loader=dict(
+    #         type='LoadPointsFromFile',
+    #         coord_type='LIDAR',
+    #         load_dim=5,         # Source is nuScenes (5D)
+    #         use_dim=4)),
 
     # dict(
     #     type='ObjectNoise',

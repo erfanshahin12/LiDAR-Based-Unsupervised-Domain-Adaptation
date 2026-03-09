@@ -22,14 +22,12 @@ model = dict(
     backbone=dict(
         type='SECOND',
         in_channels=64,
-        norm_cfg=dict(type='naiveSyncBN2d', eps=1e-3, momentum=0.01),
         layer_nums=[3, 5, 5],
         layer_strides=[2, 2, 2],
         out_channels=[64, 128, 256]),
     neck=dict(
         type='SECONDFPN',
         in_channels=[64, 128, 256],
-        norm_cfg=dict(type='naiveSyncBN2d', eps=1e-3, momentum=0.01),
         upsample_strides=[1, 2, 4],
         out_channels=[128, 128, 128]),
     bbox_head=dict(

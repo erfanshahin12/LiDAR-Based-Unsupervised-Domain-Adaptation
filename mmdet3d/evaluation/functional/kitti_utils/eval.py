@@ -115,9 +115,24 @@ def image_box_overlap(boxes, query_boxes, criterion=-1):
 
 
 def bev_box_overlap(boxes, qboxes, criterion=-1):
-    from .rotate_iou import rotate_iou_gpu_eval
-    riou = rotate_iou_gpu_eval(boxes, qboxes, criterion)
-    return riou
+    try:
+        from mmcv.ops import box_iou_rotated
+        import torch
+
+        def _to_mmcv(b):
+            t = torch.from_numpy(b[:, [0, 1, 2, 3, 4]].astype('float32'))
+            t[:, 4] = -t[:, 4]
+            return t
+            
+        mode = 'iof' if criterion == 0 else 'iou'
+        if criterion == 1:
+            return box_iou_rotated(_to_mmcv(qboxes), _to_mmcv(boxes), mode='iof', aligned=False).numpy().T
+        return box_iou_rotated(_to_mmcv(boxes), _to_mmcv(qboxes), mode=mode, aligned=False).numpy()
+    
+    except (ImportError, Exception):
+        from .rotate_iou import rotate_iou_gpu_eval
+        riou = rotate_iou_gpu_eval(boxes, qboxes, criterion)
+        return riou
 
 
 @numba.jit(nopython=True, parallel=True)
@@ -153,11 +168,47 @@ def d3_box_overlap_kernel(boxes, qboxes, rinc, criterion=-1):
 
 
 def d3_box_overlap(boxes, qboxes, criterion=-1):
-    from .rotate_iou import rotate_iou_gpu_eval
-    rinc = rotate_iou_gpu_eval(boxes[:, [0, 2, 3, 5, 6]],
-                               qboxes[:, [0, 2, 3, 5, 6]], 2)
-    d3_box_overlap_kernel(boxes, qboxes, rinc, criterion)
-    return rinc
+    try:
+        from mmcv.ops import box_iou_rotated
+        import torch
+
+        def _bev_inter_area(b, qb):
+            t  = torch.from_numpy(b[:, [0, 2, 3, 5, 6]].astype('float32'))
+            qt = torch.from_numpy(qb[:, [0, 2, 3, 5, 6]].astype('float32'))
+            t[:, 4]  = -t[:, 4]
+            qt[:, 4] = -qt[:, 4]
+            iof = box_iou_rotated(t, qt, mode='iof', aligned=False).numpy()
+            area1 = (b[:, 3] * b[:, 5])[:, None]
+            return iof * area1
+
+        rinc = _bev_inter_area(boxes, qboxes)
+
+        bot1 = boxes[:, 1][:, None]
+        top1 = (boxes[:, 1] - boxes[:, 4])[:, None]
+        bot2 = qboxes[:, 1][None, :]
+        top2 = (qboxes[:, 1] - qboxes[:, 4])[None, :]
+        ih = np.maximum(np.minimum(bot1, bot2) - np.maximum(top1, top2), 0.0)
+        rinc *= ih
+
+        vol1 = (boxes[:, 3]  * boxes[:, 4]  * boxes[:, 5])[:, None]
+        vol2 = (qboxes[:, 3] * qboxes[:, 4] * qboxes[:, 5])[None, :]
+
+        if criterion == -1:
+            union = vol1 + vol2 - rinc
+            rinc = np.where(union > 0, rinc / union, 0.0)
+        elif criterion == 0:
+            rinc = np.where(vol1 > 0, rinc / vol1, 0.0)
+        else:
+            rinc = np.where(vol2 > 0, rinc / vol2, 0.0)
+
+        return rinc.astype(np.float32)
+
+    except (ImportError, Exception):
+        from .rotate_iou import rotate_iou_gpu_eval
+        rinc = rotate_iou_gpu_eval(boxes[:, [0, 2, 3, 5, 6]],
+                                   qboxes[:, [0, 2, 3, 5, 6]], 2)
+        d3_box_overlap_kernel(boxes, qboxes, rinc, criterion)
+        return rinc
 
 
 @numba.jit(nopython=True)

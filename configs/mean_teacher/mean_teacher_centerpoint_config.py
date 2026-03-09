@@ -23,7 +23,7 @@ hard_instance_bank_path = './configs/mean_teacher/hard_instance_bank/hard_instan
 pretrained_ckpt = './work_dirs/pretrain_16feb/epoch_24.pth'
 
 # point_cloud_range = [-50.40, -50.40, -5, 50.40, 50.40, 3]   # nuScenes point cloud range
-point_cloud_range = [0, -50.40, -5, 68.80, 50.40, 3]
+point_cloud_range = [0, -51.2, -5, 68.80, 51.2, 3]
 input_modality = dict(use_lidar=True, use_camera=False)
 metainfo = dict(
         classes=['Car', 'Pedestrian', 'Cyclist'],
@@ -210,14 +210,17 @@ train_dataloader = dict(
 # test_dataloader = dict()
 
 # Model
-voxel_size = [0.2, 0.2, 8]      # nuscenes/kitti intermediate voxel size
+voxel_size = [0.1, 0.1, 0.2]
 x_min, y_min, z_min, x_max, y_max, z_max = point_cloud_range
 vx, vy, vz = voxel_size
 
 import numpy as np
-output_shape = [
+grid_size = [
+    int(np.round((x_max - x_min) / vx)),
     int(np.round((y_max - y_min) / vy)),
-    int(np.round((x_max - x_min) / vx))]
+    int(np.round((z_max - z_min) / vz))]
+
+sparse_shape = [grid_size[2]+1, grid_size[1], grid_size[0]]     # [41, 688, 1024] -> # BEV feature map: [86, 128]
 
 model = dict(
     type='MeanTeacher3DDetector',
@@ -241,113 +244,104 @@ model = dict(
 
     # The architecture for Student and Teacher
     detector = dict(
-        type='VoxelNetBEVRoI',
+        type='CenterPoint',
         data_preprocessor=dict(
             type='Det3DDataPreprocessor',
             voxel=True,
             voxel_layer=dict(
-                max_num_points=64,  # max_points_per_voxel
+                max_num_points=10,
                 point_cloud_range=point_cloud_range,
                 voxel_size=voxel_size,
-                max_voxels=(30000, 40000))),
-        
-        voxel_encoder=dict(
-            type='PillarFeatureNet',
-            in_channels=4,
-            feat_channels=[64],
-            with_distance=False,
-            voxel_size=voxel_size,
-            point_cloud_range=point_cloud_range),
-        
-        middle_encoder=dict(
-            type='PointPillarsScatter', in_channels=64, output_shape=output_shape),
-        
-        backbone=dict(
+                max_voxels=(90000, 120000))),
+
+        pts_voxel_encoder=dict(type='HardSimpleVFE', num_features=4),       # num_features = min(dims of source & target domains)
+
+        pts_middle_encoder=dict(
+            type='SparseEncoder',
+            in_channels=4,                          # same as num_features in voxel encoder
+            sparse_shape=sparse_shape,
+            output_channels=128,                    # final output actually = 256
+            order=('conv', 'norm', 'act'),
+            encoder_channels=((16, 16, 32),
+                              (32, 32, 64),
+                              (64, 64, 128),
+                              (128, 128)),
+            encoder_paddings=((0, 0, 1), (0, 0, 1), (0, 0, [0, 1, 1]), (0, 0)),
+            block_type='basicblock'),
+
+        pts_backbone=dict(
             type='SECOND',
-            in_channels=64,
-            norm_cfg=dict(type='naiveSyncBN2d', eps=1e-3, momentum=0.01),
-            layer_nums=[3, 5, 5],
-            layer_strides=[2, 2, 2],
-            out_channels=[64, 128, 256]),
-        
-        neck=dict(
+            in_channels=256,
+            out_channels=[128, 256],
+            layer_nums=[5, 5],
+            layer_strides=[1, 2],
+            norm_cfg=dict(type='BN', eps=1e-3, momentum=0.01),
+            conv_cfg=dict(type='Conv2d', bias=False)),
+
+        pts_neck=dict(
             type='SECONDFPN',
-            in_channels=[64, 128, 256],
-            upsample_strides=[1, 2, 4],
-            out_channels=[128, 128, 128]),
-        
-        bbox_head=dict(
-            type='Anchor3DHead',
-            num_classes=3,
-            in_channels=384,
-            feat_channels=384,
-            use_direction_classifier=True,
-            assign_per_class=True,
-            anchor_generator=dict(                      
-                type='AlignedAnchor3DRangeGenerator',
-                ranges=[                                        # use source dataset anchor ranges
-                    [0, -50.40, -1.62, 68.80, 50.40, -1.62],    # Pedestrian
-                    [0, -50.40, -1.67, 68.80, 50.40, -1.67],    # Cyclist
-                    [0, -50.40, -1.80, 68.80, 50.40, -1.80]     # Car
-                ],
-                sizes=[
-                    [0.8, 0.6, 1.73],           # Pedestrian    
-                    [1.72, 0.6, 1.73],          # Cyclist
-                    [4.25, 1.78, 1.65]            # Car
-                ],
-                rotations=[0, 1.57],
-                reshape_out=False),
-            diff_rad_by_sin=True,
-            bbox_coder=dict(type='DeltaXYZWLHRBBoxCoder'),
-            loss_cls=dict(
-                type='mmdet.FocalLoss',
-                use_sigmoid=True,
-                gamma=2.0,
-                alpha=0.25,
-                loss_weight=1.0),
+            in_channels=[128, 256],
+            out_channels=[256, 256],
+            upsample_strides=[1, 2],
+            norm_cfg=dict(type='BN', eps=1e-3, momentum=0.01),
+            upsample_cfg=dict(type='deconv', bias=False),
+            use_conv_for_no_stride=True),
+
+        pts_bbox_head=dict(
+            type='CenterHead',
+            in_channels=sum([256, 256]),
+            tasks=[
+                dict(num_class=1, class_names=['Car']),
+                dict(num_class=1, class_names=['Pedestrian']),
+                dict(num_class=1, class_names=['Cyclist']),
+            ],
+            common_heads=dict(
+                reg=(2, 2), height=(1, 2), dim=(3, 2), rot=(2, 2)),      # velocity removed
+            share_conv_channel=64,
+            bbox_coder=dict(
+                type='CenterPointBBoxCoder',
+                post_center_range=point_cloud_range,
+                max_num=500,
+                score_threshold=0.1,
+                out_size_factor=8,
+                voxel_size=voxel_size[:2],
+                code_size=7),                   # velocity removed
+            separate_head=dict(
+                type='SeparateHead', init_bias=-2.19, final_kernel=3),
+            loss_cls=dict(type='mmdet.GaussianFocalLoss', reduction='mean'),
             loss_bbox=dict(
-                type='mmdet.SmoothL1Loss', beta=1.0 / 9.0, loss_weight=2.0),
-            loss_dir=dict(
-                type='mmdet.CrossEntropyLoss', use_sigmoid=False,
-                loss_weight=0.2)),
-    
+                type='mmdet.L1Loss', reduction='mean', loss_weight=0.25),
+            norm_bbox=True),
+
         # model training and testing settings
         train_cfg=dict(
-            assigner=[
-                dict(  # for Pedestrian
-                    type='Max3DIoUAssigner',
-                    iou_calculator=dict(type='mmdet3d.BboxOverlapsNearest3D'),
-                    pos_iou_thr=0.5,
-                    neg_iou_thr=0.35,
-                    min_pos_iou=0.35,
-                    ignore_iof_thr=-1),
-                dict(  # for Cyclist
-                    type='Max3DIoUAssigner',
-                    iou_calculator=dict(type='mmdet3d.BboxOverlapsNearest3D'),
-                    pos_iou_thr=0.5,
-                    neg_iou_thr=0.35,
-                    min_pos_iou=0.35,
-                    ignore_iof_thr=-1),
-                dict(  # for Car
-                    type='Max3DIoUAssigner',
-                    iou_calculator=dict(type='mmdet3d.BboxOverlapsNearest3D'),
-                    pos_iou_thr=0.6,
-                    neg_iou_thr=0.45,
-                    min_pos_iou=0.45,
-                    ignore_iof_thr=-1),
-            ],
-            allowed_border=0,
-            pos_weight=-1,
-            debug=False),
+            pts=dict(
+                grid_size=grid_size,
+                voxel_size=voxel_size,
+                out_size_factor=8,
+                dense_reg=1,
+                gaussian_overlap=0.1,
+                max_objs=500,
+                min_radius=2,
+                code_weights=[1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0])),        # dropped last 2 for velocity
 
         test_cfg=dict(
-            use_rotate_nms=True,
-            nms_across_levels=False,
-            nms_thr=0.01,
-            score_thr=0.1,
-            min_bbox_size=0,
-            nms_pre=100,
-            max_num=50)))
+            pts=dict(
+                post_center_limit_range=point_cloud_range,
+                max_per_img=500,
+                max_pool_nms=False,
+                min_radius=[4,0.85, 0.175],         # kept only three classes
+                score_threshold=0.1,
+                out_size_factor=8,
+                voxel_size=voxel_size[:2],
+                nms_type='rotate',
+                pre_max_size=1000,
+                post_max_size=83,
+                nms_thr=0.2)
+                )
+            )
+)
+
 
 # Runtime configs
 # Hooks

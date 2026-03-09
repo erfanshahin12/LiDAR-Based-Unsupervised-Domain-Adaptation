@@ -2,14 +2,16 @@ _base_ = [  '../_base_/schedules/schedule-2x.py',
             '../_base_/default_runtime.py']
 
 dataset_type = 'NuScenesDataset'
-data_root = '/DATA/nuScenes/'
+# data_root = '/DATA/nuScenes/'
+data_root = '/home/erfans00/nuscenes/'
 ann_file_train = 'nuscenes_infos_train.pkl'
 ann_file_val = 'nuscenes_infos_val.pkl'
 data_prefix = dict(pts='samples/LIDAR_TOP', img='', sweeps='sweeps/LIDAR_TOP')
 classes_nuscenes = ['car', 'truck', 'construction_vehicle', 'bus', 'trailer',
                   'barrier', 'motorcycle', 'bicycle', 'pedestrian', 'traffic_cone']
 box_origin = (0.5, 0.5, 0.5)        # nuScenes box origin
-metainfo_source = dict(classes=classes_nuscenes, origin=box_origin)
+metainfo_source = dict(classes=classes_nuscenes, origin=box_origin,
+                       version='v1.0-mini')
 
 # point_cloud_range = [-50.40, -50.40, -5, 50.40, 50.40, 3]   # nuScenes point cloud range
 point_cloud_range = [0, -50.40, -5, 68.80, 50.40, 3]
@@ -58,18 +60,30 @@ train_pipeline = [       # nuScenes
         keys=['points', 'gt_bboxes_3d', 'gt_labels_3d'])
     ]
 
-test_pipeline = [        # nuScenes
+val_pipeline = [        # nuScenes
     dict(
         type='LoadPointsFromFile',
         coord_type='LIDAR',
         load_dim=5,
-        use_dim=4,
+        use_dim=5,
         backend_args=backend_args),
-    # dict(
-    #     type='LoadPointsFromMultiSweeps',
-    #     sweeps_num=10,
-    #     test_mode=True,
-    #     backend_args=backend_args),
+    dict(
+        type='LoadPointsFromMultiSweeps',
+        sweeps_num=10,
+        test_mode=True,
+        backend_args=backend_args),
+    dict(
+        type='LoadAnnotations3D', with_bbox_3d=True, with_label_3d=True),
+    dict(
+            type='ClassRemapWithLabel',
+            mapping={
+                'car': 'Car',
+                'bicycle': 'Cyclist',
+                'motorcycle': 'Cyclist',
+                'pedestrian': 'Pedestrian',
+            },
+            class_names=metainfo['classes'],
+            keep_unmapped=False),
     dict(
         type='MultiScaleFlipAug3D',
         img_scale=(1333, 800),
@@ -85,8 +99,53 @@ test_pipeline = [        # nuScenes
             dict(
                 type='PointsRangeFilter', point_cloud_range=point_cloud_range)
         ]),
-    dict(type='Pack3DDetInputs', keys=['points'])
+    dict(
+        type='Pack3DDetInputs',
+        keys=['points', 'gt_bboxes_3d', 'gt_labels_3d'])
     ]
+
+# test_pipeline = [        # nuScenes
+#     dict(
+#         type='LoadPointsFromFile',
+#         coord_type='LIDAR',
+#         load_dim=5,
+#         use_dim=4,
+#         backend_args=backend_args),
+#     dict(
+#         type='LoadPointsFromMultiSweeps',
+#         sweeps_num=10,
+#         test_mode=True,
+#         backend_args=backend_args),
+#     dict(
+#         type='LoadAnnotations3D', with_bbox_3d=True, with_label_3d=True),
+#     dict(
+#             type='ClassRemapWithLabel',
+#             mapping={
+#                 'car': 'Car',
+#                 'bicycle': 'Cyclist',
+#                 'motorcycle': 'Cyclist',
+#                 'pedestrian': 'Pedestrian',
+#             },
+#             class_names=metainfo['classes'],
+#             keep_unmapped=False),
+#     dict(
+#         type='MultiScaleFlipAug3D',
+#         img_scale=(1333, 800),
+#         pts_scale_ratio=1,
+#         flip=False,
+#         transforms=[
+#             dict(
+#                 type='GlobalRotScaleTrans',
+#                 rot_range=[0, 0],
+#                 scale_ratio_range=[1., 1.],
+#                 translation_std=[0, 0, 0]),
+#             dict(type='RandomFlip3D'),
+#             dict(
+#                 type='PointsRangeFilter', point_cloud_range=point_cloud_range)
+#         ]),
+#     dict(type='Pack3DDetInputs', keys=['points'])
+#     ]
+
 
 train_dataloader = dict(
     batch_size=2,
@@ -117,42 +176,59 @@ val_dataloader = dict(
         data_root=data_root,
         ann_file=ann_file_val,
         data_prefix=data_prefix,
-        pipeline=test_pipeline,
+        pipeline=val_pipeline,
         metainfo=metainfo_source,
         modality=input_modality,
         box_type_3d='LiDAR',
-        test_mode=True,
+        test_mode=False,
         with_velocity=False,
         backend_args=backend_args))
 
-test_dataloader = dict(
-    batch_size=1,
-    num_workers=1,
-    persistent_workers=True,
-    drop_last=False,
-    sampler=dict(type='DefaultSampler', shuffle=False),
-    dataset=dict(          # nuScenes
-        type=dataset_type,
-        data_root=data_root,
-        ann_file=ann_file_val,
-        data_prefix=data_prefix,
-        pipeline=test_pipeline,
-        metainfo=metainfo_source,
-        modality=input_modality,
-        box_type_3d='LiDAR',
-        test_mode=True,
-        with_velocity=False,
-        backend_args=backend_args))
+# test_dataloader = dict(
+    # batch_size=1,
+    # num_workers=1,
+    # persistent_workers=True,
+    # drop_last=False,
+    # sampler=dict(type='DefaultSampler', shuffle=False),
+    # dataset=dict(          # nuScenes
+    #     type=dataset_type,
+    #     data_root=data_root,
+    #     ann_file=ann_file_val,
+    #     data_prefix=data_prefix,
+    #     pipeline=test_pipeline,
+    #     metainfo=metainfo_source,
+    #     modality=input_modality,
+    #     box_type_3d='LiDAR',
+    #     test_mode=True,
+    #     with_velocity=False,
+    #     backend_args=backend_args))
+
+val_evaluator = dict(
+    type='NuScenesKittiMetric',
+    ann_file=data_root + ann_file_val,
+    metric='bbox',
+    pcd_limit_range=point_cloud_range,
+    default_cam_key='CAM_FRONT',
+    label_mapping={                 # handles GT label mapping by the metric
+        'car': 'Car',
+        'bicycle': 'Cyclist',
+        'motorcycle': 'Cyclist',
+        'pedestrian': 'Pedestrian'}
+)
+
+
+# val_cfg = None
+test_cfg = None
 
 # Model
 voxel_size = [0.2, 0.2, 8]      # nuscenes/kitti intermediate voxel size
 x_min, y_min, z_min, x_max, y_max, z_max = point_cloud_range
 vx, vy, vz = voxel_size
 
+import numpy as np
 output_shape = [
-    int((y_max - y_min) / vy),
-    int((x_max - x_min) / vx),
-]
+    int(np.round((y_max - y_min) / vy)),
+    int(np.round((x_max - x_min) / vx))]
 
 model = dict(
     type='VoxelNetBEVRoI',
@@ -185,33 +261,30 @@ model = dict(
         out_channels=[64, 128, 256]),
     
     neck=dict(
-        type='mmdet.FPN',
-        norm_cfg=dict(type='naiveSyncBN2d', eps=1e-3, momentum=0.01),
-        act_cfg=dict(type='ReLU'),
+        type='SECONDFPN',
         in_channels=[64, 128, 256],
-        out_channels=256,
-        start_level=0,
-        num_outs=3),
+        upsample_strides=[1, 2, 4],
+        out_channels=[128, 128, 128]),
     
     bbox_head=dict(
         type='Anchor3DHead',
         num_classes=3,
-        in_channels=256,
-        feat_channels=256,
+        in_channels=384,
+        feat_channels=384,
         use_direction_classifier=True,
         assign_per_class=True,
         anchor_generator=dict(                      
             type='AlignedAnchor3DRangeGenerator',
-            # ranges=[
-            #     [0, -50.40, -1.62, 68.80, 50.40, -1.62],    # Pedestrian
-            #     [0, -50.40, -1.67, 68.80, 50.40, -1.67],    # Cyclist
-            #     [0, -50.40, -1.80, 68.80, 50.40, -1.80]     # Car
-            # ],
             ranges=[
-                [0, -50.40, -0.6, 68.80, 50.40, -0.6],    # Pedestrian
-                [0, -50.40, -0.6, 68.80, 50.40, -0.6],    # Cyclist
-                [0, -50.40, -1.78, 68.80, 50.40, -1.78]     # Car
+                [0, -50.40, -1.62, 68.80, 50.40, -1.62],    # Pedestrian
+                [0, -50.40, -1.67, 68.80, 50.40, -1.67],    # Cyclist
+                [0, -50.40, -1.80, 68.80, 50.40, -1.80]     # Car
             ],
+            # ranges=[
+            #     [0, -50.40, -0.6, 68.80, 50.40, -0.6],    # Pedestrian
+            #     [0, -50.40, -0.6, 68.80, 50.40, -0.6],    # Cyclist
+            #     [0, -50.40, -1.78, 68.80, 50.40, -1.78]     # Car
+            # ],
             sizes=[
                 [0.8, 0.6, 1.73],           # Pedestrian    
                 [1.72, 0.6, 1.73],          # Cyclist
@@ -270,14 +343,6 @@ model = dict(
         min_bbox_size=0,
         nms_pre=100,
         max_num=50))
-
-val_evaluator = dict(
-    type='KittiMetric',
-    ann_file=data_root + ann_file_val,
-    metric='bbox',
-    backend_args=backend_args)
-    
-test_evaluator = val_evaluator
 
 # less momory usage during training with amp
 # LR adjusted to batch size (batch size=2 vs original total batch size=32)
