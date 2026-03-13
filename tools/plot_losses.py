@@ -41,11 +41,11 @@ def smooth_ema(values: list[float], alpha: float) -> list[float]:
     return out
 
 
-# LOSS_KEYS = ["loss", "loss_cls", "loss_bbox", "loss_dir",
-#              "loss_velo", "loss_iou", "loss_mask", "loss_depth"]  # extend as needed
+LOSS_KEYS = ["loss", "loss_cls", "loss_bbox", "loss_dir",
+             "loss_velo", "loss_iou", "loss_mask", "loss_depth"]  # extend as needed
 
-LOSS_KEYS = ["loss", "loss_cls_source", "loss_bbox_source", "loss_dir_source",
-             "loss_cls_target", "loss_bbox_target", "loss_dir_target", "loss_contrastive"]
+# LOSS_KEYS = ["loss", "loss_cls_source", "loss_bbox_source", "loss_dir_source",
+#              "loss_cls_target", "loss_bbox_target", "loss_dir_target", "loss_contrastive"]
 
 EXTRA_KEYS = ["lr", "grad_norm"]
 

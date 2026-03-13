@@ -182,6 +182,105 @@ class NuScenesKittiMetric(KittiMetric):
             original_classes = self.dataset_meta.get('classes')
             self.dataset_meta['classes'] = self.kitti_classes
             try:
+                # ── DEBUG ──────────────────────────────────────────────
+                from mmengine import load
+                pkl_infos = load(self.ann_file, backend_args=self.backend_args)
+                data_infos = self.convert_annos_to_kitti_annos(pkl_infos)
+
+                # 1. GT sanity check
+                total_gt = {c: 0 for c in self.kitti_classes}
+                empty_gt = 0
+                for info in data_infos:
+                    ann = info.get('kitti_annos', {})
+                    names = ann.get('name', np.array([]))
+                    if len(names) == 0:
+                        empty_gt += 1
+                    for n in names:
+                        if n in total_gt:
+                            total_gt[n] += 1
+                print(f'[DEBUG] GT samples with zero boxes: {empty_gt}/{len(data_infos)}')
+                print(f'[DEBUG] GT box counts per class: {total_gt}')
+
+                # 2. Prediction sanity check — inspect one result
+                r = results[0]
+                pred = r['pred_instances_3d']
+                print(f'[DEBUG] Sample 0 pred boxes: {len(pred["bboxes_3d"])}')
+                print(f'[DEBUG] Sample 0 pred labels: {pred["labels_3d"]}')
+                print(f'[DEBUG] Sample 0 pred scores: {pred["scores_3d"]}')
+
+                # 3. convert_valid_bboxes output for sample 0
+                sample_idx = r['sample_idx']
+                info = data_infos[sample_idx]
+                box_dict = self.convert_valid_bboxes(pred, info)
+                print(f'[DEBUG] Sample 0 boxes after convert_valid_bboxes: {len(box_dict["bbox"])}')
+                if len(box_dict["bbox"]) > 0:
+                    print(f'[DEBUG] Sample 0 cam boxes (first 2):\\n{box_dict["box3d_camera"][:2]}')
+                
+                # 4. Check predictions across all samples
+                total_preds = 0
+                empty_pred_samples = 0
+                max_score_overall = 0.0
+                for r in results:
+                    pred = r['pred_instances_3d']
+                    n = len(pred['bboxes_3d'])
+                    total_preds += n
+                    if n == 0:
+                        empty_pred_samples += 1
+                    else:
+                        max_score = pred['scores_3d'].max().item()
+                        max_score_overall = max(max_score_overall, max_score)
+
+                print(f'[DEBUG] Total pred boxes across all samples: {total_preds}')
+                print(f'[DEBUG] Samples with zero preds: {empty_pred_samples}/{len(results)}')
+                print(f'[DEBUG] Max score seen across all samples: {max_score_overall:.4f}')
+
+                # 5. If there are any predictions, check convert_valid_bboxes survival rate
+                survived = 0
+                filtered = 0
+                for r in results:
+                    pred = r['pred_instances_3d']
+                    if len(pred['bboxes_3d']) == 0:
+                        continue
+                    sample_idx = r['sample_idx']
+                    info = data_infos[sample_idx]
+                    box_dict = self.convert_valid_bboxes(pred, info)
+                    survived += len(box_dict['bbox'])
+                    filtered += len(pred['bboxes_3d']) - len(box_dict['bbox'])
+
+                print(f'[DEBUG] Boxes surviving convert_valid_bboxes: {survived}')
+                print(f'[DEBUG] Boxes filtered by convert_valid_bboxes: {filtered}')
+
+                # 6. Spatial sanity check — find first sample with both GT and predictions
+                for r in results:
+                    pred = r['pred_instances_3d']
+                    if len(pred['bboxes_3d']) == 0:
+                        continue
+                    sample_idx = r['sample_idx']
+                    info = data_infos[sample_idx]
+                    box_dict = self.convert_valid_bboxes(pred, info)
+                    if len(box_dict['bbox']) == 0:
+                        continue
+
+                    gt_anno = info['kitti_annos']
+                    print(f'\\n[DEBUG] === Sample idx {sample_idx} ===')
+                    print(f'[DEBUG] GT names:      {gt_anno["name"]}')
+                    print(f'[DEBUG] GT location (cam):   \\n{gt_anno["location"][:3]}')
+                    print(f'[DEBUG] GT dimensions (hwl): \\n{gt_anno["dimensions"][:3]}')
+                    print(f'[DEBUG] GT rotation_y:       {gt_anno["rotation_y"][:3]}')
+                    print(f'[DEBUG] Pred cam boxes (x,y,z,l,w,h,ry):\\n{box_dict["box3d_camera"][:3]}')
+                    print(f'[DEBUG] Pred lidar boxes:\\n{box_dict["box3d_lidar"][:3]}')
+                    print(f'[DEBUG] Pred labels: {box_dict["label_preds"][:3]}')
+                    print(f'[DEBUG] Pred scores: {box_dict["scores"][:3]}')
+
+                    # Check if GT and pred centres are in the same ballpark
+                    gt_locs = gt_anno['location']  # (N, 3) in camera frame
+                    pred_locs = box_dict['box3d_camera'][:, :3]  # (M, 3)
+                    print(f'[DEBUG] GT  location range: x=[{gt_locs[:,0].min():.1f}, {gt_locs[:,0].max():.1f}]  '
+                        f'z=[{gt_locs[:,2].min():.1f}, {gt_locs[:,2].max():.1f}]')
+                    print(f'[DEBUG] Pred location range: x=[{pred_locs[:,0].min():.1f}, {pred_locs[:,0].max():.1f}]  '
+                        f'z=[{pred_locs[:,2].min():.1f}, {pred_locs[:,2].max():.1f}]')
+                    break
+                # ── END DEBUG ──────────────────────────────────────────
                 return super().compute_metrics(results)
             finally:
                 self.dataset_meta['classes'] = original_classes

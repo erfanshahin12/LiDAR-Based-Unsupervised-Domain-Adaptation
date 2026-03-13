@@ -218,7 +218,10 @@ val_evaluator = dict(
 
 
 # val_cfg = None
-test_cfg = None
+# test_cfg = None
+train_cfg = dict(type='EpochBasedTrainLoop', max_epochs=36, val_interval=18)
+test_dataloader = val_dataloader
+test_evaluator = val_evaluator
 
 # Model
 voxel_size = [0.2, 0.2, 8]      # nuscenes/kitti intermediate voxel size
@@ -312,23 +315,23 @@ model = dict(
             dict(  # for Pedestrian
                 type='Max3DIoUAssigner',
                 iou_calculator=dict(type='mmdet3d.BboxOverlapsNearest3D'),
-                pos_iou_thr=0.5,
-                neg_iou_thr=0.35,
-                min_pos_iou=0.35,
+                pos_iou_thr=0.6,
+                neg_iou_thr=0.3,
+                min_pos_iou=0.3,
                 ignore_iof_thr=-1),
             dict(  # for Cyclist
                 type='Max3DIoUAssigner',
                 iou_calculator=dict(type='mmdet3d.BboxOverlapsNearest3D'),
-                pos_iou_thr=0.5,
-                neg_iou_thr=0.35,
-                min_pos_iou=0.35,
+                pos_iou_thr=0.6,
+                neg_iou_thr=0.3,
+                min_pos_iou=0.3,
                 ignore_iof_thr=-1),
             dict(  # for Car
                 type='Max3DIoUAssigner',
                 iou_calculator=dict(type='mmdet3d.BboxOverlapsNearest3D'),
                 pos_iou_thr=0.6,
-                neg_iou_thr=0.45,
-                min_pos_iou=0.45,
+                neg_iou_thr=0.3,
+                min_pos_iou=0.3,
                 ignore_iof_thr=-1),
         ],
         allowed_border=0,
@@ -338,11 +341,11 @@ model = dict(
     test_cfg=dict(
         use_rotate_nms=True,
         nms_across_levels=False,
-        nms_thr=0.01,
-        score_thr=0.1,
+        nms_thr=0.2,
+        score_thr=0.05,
         min_bbox_size=0,
-        nms_pre=100,
-        max_num=50))
+        nms_pre=1000,
+        max_num=500))
 
 # less momory usage during training with amp
 # LR adjusted to batch size (batch size=2 vs original total batch size=32)
