@@ -1,3 +1,16 @@
 python tools/train.py configs/mean_teacher/mean_teacher_pointpillars_config.py --work-dir work_dirs/train_one_epoch_26jan
 
 python tools/train.py configs/mean_teacher/mt_ckpt_config_pp.py --work-dir work_dirs/train_mt_pretrained_1feb
+
+python tools/train.py configs/mean_teacher/mt_pretrain_pointpillars_config.py --work-dir work_dirs/pretrain_05may_full_pcl_range
+
+python tools/train.py configs/mean_teacher/mt_pretrain_centerpoint_config.py --work-dir work_dirs/pretrain_centerpoint_05may
+
+python tools/test.py \
+    work_dirs/pretrain_03may/mt_pretrain_pointpillars_config.py \
+    work_dirs/pretrain_03may/epoch_24.pth \
+    --work-dir work_dirs/pretrain_03may \
+    --score-thr 0.05\
+    --task lidar_det
+
+python tools/plot_losses.py work_dirs/pretrain_03may/20260503_092027/vis_data/20260503_092027.json --out work_dirs/pretrain_03may/losses.png

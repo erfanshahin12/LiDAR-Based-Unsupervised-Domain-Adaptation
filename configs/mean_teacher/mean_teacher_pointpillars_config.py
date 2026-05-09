@@ -2,8 +2,7 @@ _base_ = ['../_base_/schedules/schedule-2x.py',
     '../_base_/default_runtime.py']
 
 source_dataset_type = 'NuScenesDataset'
-# source_data_root = '/DATA/nuScenes/'
-source_data_root = '/home/erfans00/nuscenes/'
+source_data_root = 'data/nuscenes/'
 ann_file_source = 'nuscenes_infos_train.pkl'
 data_prefix_source = dict(pts='samples/LIDAR_TOP', img='', sweeps='sweeps/LIDAR_TOP')
 classes_nuscenes = ['car', 'truck', 'construction_vehicle', 'bus', 'trailer',
@@ -12,12 +11,12 @@ box_origin_source = (0.5, 0.5, 0.5)        # nuScenes box origin
 metainfo_source = dict(classes=classes_nuscenes, origin=box_origin_source)
 
 target_dataset_type = 'KittiDataset'
-target_data_root = '/DATA/kitti_mmdet3d/'
+target_data_root = 'data/kitti/'
 ann_file_target = 'kitti_infos_train.pkl'
 data_prefix_target = dict(pts='training/velodyne_reduced')
 classes_kitti = ['Car', 'Pedestrian', 'Cyclist']
 box_origin_target = (0.5, 0.5, 0)        # KITTI box origin
-metainfo_target = dict(classes=classes_kitti, box_origin=box_origin_target)
+metainfo_target = dict(classes=classes_kitti, origin=box_origin_target)
 
 hard_instance_bank_path = './configs/mean_teacher/hard_instance_bank/hard_instance_bank_nuscenes_quantile_kitti_20.pkl'
 pretrained_ckpt = './work_dirs/pretrain_16feb/epoch_24.pth'
@@ -27,7 +26,7 @@ point_cloud_range = [0, -50.40, -5, 68.80, 50.40, 3]
 input_modality = dict(use_lidar=True, use_camera=False)
 metainfo = dict(
         classes=['Car', 'Pedestrian', 'Cyclist'],
-        box_origin=(0.5, 0.5, 0.5))
+        origin=(0.5, 0.5, 0.5))
 backend_args = None
 
 # Dataset
@@ -115,18 +114,18 @@ target_strong_pipeline = [       # KITTI      # sent to student model for unsupe
         type='KittiToNuscenes'),                    # transform coordinates to nuscenes style
     # dict(type='ObjectSample', db_sampler=db_sampler_kitti),
 
-    dict(
-        type='HardInstanceSampling',
-        hard_instance_bank_path=hard_instance_bank_path,
-        sample_groups=dict(
-            Car=5, Pedestrian=3, Cyclist=3),        # number of hard instances to sample per class
-        use_pred_boxes_for_collision=True,          # Use predictions for collision
-        iou_thresh=0.3,                             # Collision detection threshold
-        points_loader=dict(
-            type='LoadPointsFromFile',
-            coord_type='LIDAR',
-            load_dim=5,         # Source is nuScenes (5D)
-            use_dim=4)),
+    # dict(
+    #     type='HardInstanceSampling',
+    #     hard_instance_bank_path=hard_instance_bank_path,
+    #     sample_groups=dict(
+    #         Car=5, Pedestrian=3, Cyclist=3),        # number of hard instances to sample per class
+    #     use_pred_boxes_for_collision=True,          # Use predictions for collision
+    #     iou_thresh=0.3,                             # Collision detection threshold
+    #     points_loader=dict(
+    #         type='LoadPointsFromFile',
+    #         coord_type='LIDAR',
+    #         load_dim=5,         # Source is nuScenes (5D)
+    #         use_dim=4)),
 
     # dict(
     #     type='ObjectNoise',
@@ -135,11 +134,11 @@ target_strong_pipeline = [       # KITTI      # sent to student model for unsupe
     #     global_rot_range=[0.0, 0.0],
     #     rot_range=[-0.78539816, 0.78539816]
     #     ),
-    dict(type='RandomFlip3D', flip_ratio_bev_horizontal=0.5),
     dict(
         type='GlobalRotScaleTrans',
         rot_range=[-0.78539816, 0.78539816],                # +/- 45 degrees
         scale_ratio_range=[0.95, 1.05]),
+    dict(type='RandomFlip3D', flip_ratio_bev_horizontal=0.5),
     dict(type='PointsRangeFilter', point_cloud_range=point_cloud_range),
     # dict(type='ObjectRangeFilter', point_cloud_range=point_cloud_range),
     dict(type='PointShuffle'),
@@ -224,18 +223,21 @@ model = dict(
     mean_teacher_cfg=dict(
                      point_cloud_range=point_cloud_range,
                      ema_momentum=0.999,
+                     update_teacher_buffers=False,      # BAN: teacher BN tracks target stats via .train()
                      use_bev_consistency=True,
                      tau=0.07,
-                     lambda_weight=0.05,
-                     voxel_size=voxel_size[0],
+                     symmetric_contrastive=True,
                      # Confidence thresholding params
                      conf_threshold=0.3,
                      use_class_specific_thresh=False,
-                     class_thresholds=None,  # dict: {class_id: threshold}
+                     class_thresholds=None,
                      # loss weights
                      source_loss_weight=1.0,
                      target_loss_weight=0.5,
-                    contrastive_weight=1.0,
+                     contrastive_weight=1.0,
+                     burn_in_iters=500,
+                     min_pseudo_per_sample=0,
+                     verbose=False,
                  ),
     pretrained_ckpt=pretrained_ckpt,
 
@@ -286,14 +288,14 @@ model = dict(
             anchor_generator=dict(                      
                 type='AlignedAnchor3DRangeGenerator',
                 ranges=[                                        # use source dataset anchor ranges
+                    [0, -50.40, -1.80, 68.80, 50.40, -1.80],    # Car
                     [0, -50.40, -1.62, 68.80, 50.40, -1.62],    # Pedestrian
-                    [0, -50.40, -1.67, 68.80, 50.40, -1.67],    # Cyclist
-                    [0, -50.40, -1.80, 68.80, 50.40, -1.80]     # Car
+                    [0, -50.40, -1.67, 68.80, 50.40, -1.67]     # Cyclist
                 ],
                 sizes=[
+                    [4.25, 1.78, 1.65],         # Car
                     [0.8, 0.6, 1.73],           # Pedestrian    
-                    [1.72, 0.6, 1.73],          # Cyclist
-                    [4.25, 1.78, 1.65]            # Car
+                    [1.72, 0.6, 1.73]           # Cyclist
                 ],
                 rotations=[0, 1.57],
                 reshape_out=False),
@@ -314,6 +316,13 @@ model = dict(
         # model training and testing settings
         train_cfg=dict(
             assigner=[
+                dict(  # for Car
+                    type='Max3DIoUAssigner',
+                    iou_calculator=dict(type='mmdet3d.BboxOverlapsNearest3D'),
+                    pos_iou_thr=0.6,
+                    neg_iou_thr=0.45,
+                    min_pos_iou=0.45,
+                    ignore_iof_thr=-1),
                 dict(  # for Pedestrian
                     type='Max3DIoUAssigner',
                     iou_calculator=dict(type='mmdet3d.BboxOverlapsNearest3D'),
@@ -327,13 +336,6 @@ model = dict(
                     pos_iou_thr=0.5,
                     neg_iou_thr=0.35,
                     min_pos_iou=0.35,
-                    ignore_iof_thr=-1),
-                dict(  # for Car
-                    type='Max3DIoUAssigner',
-                    iou_calculator=dict(type='mmdet3d.BboxOverlapsNearest3D'),
-                    pos_iou_thr=0.6,
-                    neg_iou_thr=0.45,
-                    min_pos_iou=0.45,
                     ignore_iof_thr=-1),
             ],
             allowed_border=0,

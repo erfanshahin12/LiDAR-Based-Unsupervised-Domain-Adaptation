@@ -8,9 +8,14 @@ from .panoptic_seg_metric import PanopticSegMetric  # noqa: F401,F403
 from .seg_metric import SegMetric  # noqa: F401,F403
 from .waymo_metric import WaymoMetric  # noqa: F401,F403
 from .nuscenes_kitti_metric import NuScenesKittiMetric
+from .nuscenes_spoof_metric import NuScenesSpoofVelocityMetric
+from .nuscenes_remapped_metric import NuScenesRemappedMetric
+from .kitti_distance_map_metric import KittiDistanceMAPMetric
+from .nus_on_kitti_metric import NusOnKittiMetric
 
 __all__ = [
     'KittiMetric', 'NuScenesMetric', 'IndoorMetric', 'LyftMetric', 'SegMetric',
     'InstanceSegMetric', 'WaymoMetric', 'PanopticSegMetric',
-    'NuScenesKittiMetric'
+    'NuScenesKittiMetric', 'NuScenesSpoofVelocityMetric', 'NuScenesRemappedMetric',
+    'KittiDistanceMAPMetric', 'NusOnKittiMetric',
 ]

@@ -238,6 +238,7 @@ class DataBaseSampler(object):
 
         sampled = []
         sampled_gt_bboxes = []
+        gt_box_dim = gt_bboxes.shape[1]
         avoid_coll_boxes = gt_bboxes
 
         for class_name, sampled_num in zip(self.sample_classes,
@@ -257,11 +258,12 @@ class DataBaseSampler(object):
 
                     sampled_gt_bboxes += [sampled_gt_box]
                     avoid_coll_boxes = np.concatenate(
-                        [avoid_coll_boxes, sampled_gt_box], axis=0)
+                        [avoid_coll_boxes, sampled_gt_box[:, :gt_box_dim]], axis=0)
 
         ret = None
         if len(sampled) > 0:
             sampled_gt_bboxes = np.concatenate(sampled_gt_bboxes, axis=0)
+            sampled_gt_bboxes = sampled_gt_bboxes[:, :gt_box_dim]
             # center = sampled_gt_bboxes[:, 0:3]
 
             # num_sampled = len(sampled)
@@ -324,6 +326,8 @@ class DataBaseSampler(object):
             gt_bboxes[:, 0:2], gt_bboxes[:, 3:5], gt_bboxes[:, 6])
 
         sp_boxes = np.stack([i['box3d_lidar'] for i in sampled], axis=0)
+        # nuScenes db stores 9-DoF boxes (with velocity); trim to match GT dim
+        sp_boxes = sp_boxes[:, :gt_bboxes.shape[1]]
         boxes = np.concatenate([gt_bboxes, sp_boxes], axis=0).copy()
 
         sp_boxes_new = boxes[gt_bboxes.shape[0]:]

@@ -8,7 +8,6 @@ from mmdet3d.registry import METRICS
 from mmdet3d.structures import (Box3DMode, CameraInstance3DBoxes,
                                 LiDARInstance3DBoxes, points_cam2img)
 
-# Import the original KittiMetric.  Adjust the path to match your project.
 from mmdet3d.evaluation.metrics.kitti_metric import KittiMetric
 
 
@@ -149,8 +148,7 @@ class NuScenesKittiMetric(KittiMetric):
         cam2ego = np.array(
             info['images'][self.default_cam_key]['cam2ego'],
             dtype=np.float32)                                      # (4,4)
-        lidar2cam = np.linalg.inv(cam2ego) @ lidar2ego
-        return lidar2cam
+        return np.linalg.inv(cam2ego) @ lidar2ego
 
     def _build_nuscenes_label_remap(
             self,
@@ -175,112 +173,13 @@ class NuScenesKittiMetric(KittiMetric):
     # ------------------------------------------------------------------
 
     def compute_metrics(self, results: List[dict]) -> Dict[str, float]:
-        # Override to swap dataset_meta['classes'] for KITTI-style names
-        # before calling the parent.  kitti_eval() has a hardcoded
-        # name_to_class dict that KeyErrors on NuScenes lowercase names.
+        # Swap dataset_meta['classes'] to KITTI-style names before calling the
+        # parent. kitti_eval() has a hardcoded name_to_class dict that KeyErrors
+        # on NuScenes lowercase names (e.g. 'car' vs 'Car').
         if self.kitti_classes is not None:
             original_classes = self.dataset_meta.get('classes')
             self.dataset_meta['classes'] = self.kitti_classes
             try:
-                # ── DEBUG ──────────────────────────────────────────────
-                from mmengine import load
-                pkl_infos = load(self.ann_file, backend_args=self.backend_args)
-                data_infos = self.convert_annos_to_kitti_annos(pkl_infos)
-
-                # 1. GT sanity check
-                total_gt = {c: 0 for c in self.kitti_classes}
-                empty_gt = 0
-                for info in data_infos:
-                    ann = info.get('kitti_annos', {})
-                    names = ann.get('name', np.array([]))
-                    if len(names) == 0:
-                        empty_gt += 1
-                    for n in names:
-                        if n in total_gt:
-                            total_gt[n] += 1
-                print(f'[DEBUG] GT samples with zero boxes: {empty_gt}/{len(data_infos)}')
-                print(f'[DEBUG] GT box counts per class: {total_gt}')
-
-                # 2. Prediction sanity check — inspect one result
-                r = results[0]
-                pred = r['pred_instances_3d']
-                print(f'[DEBUG] Sample 0 pred boxes: {len(pred["bboxes_3d"])}')
-                print(f'[DEBUG] Sample 0 pred labels: {pred["labels_3d"]}')
-                print(f'[DEBUG] Sample 0 pred scores: {pred["scores_3d"]}')
-
-                # 3. convert_valid_bboxes output for sample 0
-                sample_idx = r['sample_idx']
-                info = data_infos[sample_idx]
-                box_dict = self.convert_valid_bboxes(pred, info)
-                print(f'[DEBUG] Sample 0 boxes after convert_valid_bboxes: {len(box_dict["bbox"])}')
-                if len(box_dict["bbox"]) > 0:
-                    print(f'[DEBUG] Sample 0 cam boxes (first 2):\\n{box_dict["box3d_camera"][:2]}')
-                
-                # 4. Check predictions across all samples
-                total_preds = 0
-                empty_pred_samples = 0
-                max_score_overall = 0.0
-                for r in results:
-                    pred = r['pred_instances_3d']
-                    n = len(pred['bboxes_3d'])
-                    total_preds += n
-                    if n == 0:
-                        empty_pred_samples += 1
-                    else:
-                        max_score = pred['scores_3d'].max().item()
-                        max_score_overall = max(max_score_overall, max_score)
-
-                print(f'[DEBUG] Total pred boxes across all samples: {total_preds}')
-                print(f'[DEBUG] Samples with zero preds: {empty_pred_samples}/{len(results)}')
-                print(f'[DEBUG] Max score seen across all samples: {max_score_overall:.4f}')
-
-                # 5. If there are any predictions, check convert_valid_bboxes survival rate
-                survived = 0
-                filtered = 0
-                for r in results:
-                    pred = r['pred_instances_3d']
-                    if len(pred['bboxes_3d']) == 0:
-                        continue
-                    sample_idx = r['sample_idx']
-                    info = data_infos[sample_idx]
-                    box_dict = self.convert_valid_bboxes(pred, info)
-                    survived += len(box_dict['bbox'])
-                    filtered += len(pred['bboxes_3d']) - len(box_dict['bbox'])
-
-                print(f'[DEBUG] Boxes surviving convert_valid_bboxes: {survived}')
-                print(f'[DEBUG] Boxes filtered by convert_valid_bboxes: {filtered}')
-
-                # 6. Spatial sanity check — find first sample with both GT and predictions
-                for r in results:
-                    pred = r['pred_instances_3d']
-                    if len(pred['bboxes_3d']) == 0:
-                        continue
-                    sample_idx = r['sample_idx']
-                    info = data_infos[sample_idx]
-                    box_dict = self.convert_valid_bboxes(pred, info)
-                    if len(box_dict['bbox']) == 0:
-                        continue
-
-                    gt_anno = info['kitti_annos']
-                    print(f'\\n[DEBUG] === Sample idx {sample_idx} ===')
-                    print(f'[DEBUG] GT names:      {gt_anno["name"]}')
-                    print(f'[DEBUG] GT location (cam):   \\n{gt_anno["location"][:3]}')
-                    print(f'[DEBUG] GT dimensions (hwl): \\n{gt_anno["dimensions"][:3]}')
-                    print(f'[DEBUG] GT rotation_y:       {gt_anno["rotation_y"][:3]}')
-                    print(f'[DEBUG] Pred cam boxes (x,y,z,l,w,h,ry):\\n{box_dict["box3d_camera"][:3]}')
-                    print(f'[DEBUG] Pred lidar boxes:\\n{box_dict["box3d_lidar"][:3]}')
-                    print(f'[DEBUG] Pred labels: {box_dict["label_preds"][:3]}')
-                    print(f'[DEBUG] Pred scores: {box_dict["scores"][:3]}')
-
-                    # Check if GT and pred centres are in the same ballpark
-                    gt_locs = gt_anno['location']  # (N, 3) in camera frame
-                    pred_locs = box_dict['box3d_camera'][:, :3]  # (M, 3)
-                    print(f'[DEBUG] GT  location range: x=[{gt_locs[:,0].min():.1f}, {gt_locs[:,0].max():.1f}]  '
-                        f'z=[{gt_locs[:,2].min():.1f}, {gt_locs[:,2].max():.1f}]')
-                    print(f'[DEBUG] Pred location range: x=[{pred_locs[:,0].min():.1f}, {pred_locs[:,0].max():.1f}]  '
-                        f'z=[{pred_locs[:,2].min():.1f}, {pred_locs[:,2].max():.1f}]')
-                    break
-                # ── END DEBUG ──────────────────────────────────────────
                 return super().compute_metrics(results)
             finally:
                 self.dataset_meta['classes'] = original_classes
@@ -367,7 +266,7 @@ class NuScenesKittiMetric(KittiMetric):
             }
 
             for instance in annos['instances']:
-                nus_label: int = instance['bbox_label']
+                nus_label: int = instance['bbox_label_3d']
 
                 # ---- label resolution --------------------------------
                 if idx_remap is not None:
@@ -387,17 +286,33 @@ class NuScenesKittiMetric(KittiMetric):
                 bbox_3d_lidar = np.array(
                     instance['bbox_3d'], dtype=np.float32)   # (7,)
 
+                # Explicitly define the gravity-centered origin
                 lidar_box = LiDARInstance3DBoxes(
-                    torch.tensor(bbox_3d_lidar[None], dtype=torch.float32))
+                    torch.tensor(bbox_3d_lidar[None], dtype=torch.float32),
+                    box_dim=7, origin=(0.5, 0.5, 0.5))
+
+                # Convert to camera. CAM mode natively outputs bottom-centered (0.5, 1.0, 0.5)
                 cam_box = lidar_box.convert_to(
                     Box3DMode.CAM, lidar2cam, correct_yaw=True)
 
-                # cam_box.tensor layout: [x, y, z, l, w, h, ry]
-                # (camera frame, bottom-centre origin)
+                # cam_box.tensor: [x, y, z, l, w, h, ry] in camera frame.
                 cam_t = cam_box.tensor[0].numpy()   # (7,)
-                loc = cam_t[:3]                      # x, y, z  (cam)
-                # KITTI dimension order: h (up), w (lateral), l (forward)
-                dims_hwl = cam_t[[5, 4, 3]]          # h=cam_t[5], w=[4], l=[3]
+
+                # loc[1] is now natively the bottom Y. No manual shifting required!
+                loc = cam_t[:3].copy()              # x, y, z
+
+                # ---- z > 0 filter: skip boxes behind the camera ------
+                # KITTI evaluation is front-camera only. Objects with
+                # z <= 0 are behind CAM_FRONT and will never match any
+                # prediction that survived convert_valid_bboxes.
+                if loc[2] <= 0:
+                    continue
+
+                # Dimension order must match bbox2result_kitti which
+                # stores box[3:6] from CameraInstance3DBoxes tensor
+                # = [l, w, h].  Storing GT as [l, w, h] keeps both
+                # GT and pred consistent inside kitti_eval.
+                dims_lwh = cam_t[3:6]                # [l, w, h]
                 ry = cam_t[6]                        # yaw in camera frame
 
                 # ---- derived KITTI fields ----------------------------
@@ -414,7 +329,7 @@ class NuScenesKittiMetric(KittiMetric):
                 kitti_annos['alpha'].append(alpha)
                 kitti_annos['bbox'].append(dummy_bbox)
                 kitti_annos['location'].append(loc.astype(np.float32))
-                kitti_annos['dimensions'].append(dims_hwl.astype(np.float32))
+                kitti_annos['dimensions'].append(dims_lwh.astype(np.float32))
                 kitti_annos['rotation_y'].append(float(ry))
                 # GT has no confidence score; -1 is ignored by kitti_eval.
                 kitti_annos['score'].append(-1.0)
@@ -499,6 +414,18 @@ class NuScenesKittiMetric(KittiMetric):
                 f'Unsupported box type for NuScenesKittiMetric: '
                 f'{type(box_preds)}.  Expected LiDARInstance3DBoxes or '
                 f'CameraInstance3DBoxes.')
+
+        # ---- z > 0 filter: remove boxes behind the camera ----------
+        # Projecting boxes with z <= 0 through the camera matrix
+        # sign-flips homogeneous coordinates, producing 2-D corners
+        # that can accidentally pass the image-plane validity check.
+        valid_depth = box_preds_camera.tensor[:, 2] > 0
+        if valid_depth.sum() == 0:
+            return _empty
+        box_preds_camera = box_preds_camera[valid_depth]
+        box_preds_lidar  = box_preds_lidar[valid_depth]
+        scores  = scores[valid_depth]
+        labels  = labels[valid_depth]
 
         # ---- Image-plane validity check -----------------------------
         box_corners = box_preds_camera.corners            # (N, 8, 3)

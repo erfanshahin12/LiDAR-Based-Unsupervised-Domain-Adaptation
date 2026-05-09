@@ -63,7 +63,7 @@ def parse_args():
                    help="EMA smoothing factor 0–1 (0 = off, 0.9 = heavy). Default: 0.6.")
     p.add_argument("--out", default="losses.png",
                    help="Output image path. Default: losses.png.")
-    p.add_argument("--dpi", type=int, default=150)
+    p.add_argument("--dpi", type=int, default=300)
     p.add_argument("--no-extras", action="store_true",
                    help="Skip LR and grad_norm subplots.")
     return p.parse_args()

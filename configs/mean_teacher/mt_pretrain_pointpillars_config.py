@@ -2,24 +2,40 @@ _base_ = [  '../_base_/schedules/schedule-2x.py',
             '../_base_/default_runtime.py']
 
 dataset_type = 'NuScenesDataset'
-# data_root = '/DATA/nuScenes/'
-data_root = '/home/erfans00/nuscenes/'
+data_root = 'data/nuscenes/'
 ann_file_train = 'nuscenes_infos_train.pkl'
 ann_file_val = 'nuscenes_infos_val.pkl'
 data_prefix = dict(pts='samples/LIDAR_TOP', img='', sweeps='sweeps/LIDAR_TOP')
+
+box_origin = (0.5, 0.5, 0.5)        # nuScenes box origin
+
 classes_nuscenes = ['car', 'truck', 'construction_vehicle', 'bus', 'trailer',
                   'barrier', 'motorcycle', 'bicycle', 'pedestrian', 'traffic_cone']
-box_origin = (0.5, 0.5, 0.5)        # nuScenes box origin
-metainfo_source = dict(classes=classes_nuscenes, origin=box_origin,
-                       version='v1.0-mini')
+metainfo_source = dict(classes=classes_nuscenes, origin=box_origin)
+metainfo = dict(classes=['Car'], origin=box_origin)
 
 # point_cloud_range = [-50.40, -50.40, -5, 50.40, 50.40, 3]   # nuScenes point cloud range
-point_cloud_range = [0, -50.40, -5, 68.80, 50.40, 3]
+# point_cloud_range = [0, -50.40, -5, 68.80, 50.40, 3]        # front face point cloud range (x_min=0 to avoid training on rear points that won't be seen during inference)
+point_cloud_range = [-50.40, -50.40, -5, 50.40, 50.40, 3]
 input_modality = dict(use_lidar=True, use_camera=False)
-metainfo = dict(
-        classes=['Car', 'Pedestrian', 'Cyclist'],
-        box_origin=(0.5, 0.5, 0.5))
 backend_args = None
+
+db_sampler = dict(
+    type='DataBaseSampler',
+    data_root=data_root,
+    info_path=data_root + 'nuscenes_dbinfos_train.pkl',
+    rate=1.0,
+    prepare=dict(
+        filter_by_difficulty=[-1],
+        filter_by_min_points=dict(car=5)),
+    classes=['car'],
+    sample_groups=dict(car=2),
+    points_loader=dict(
+        type='LoadPointsFromFile',
+        coord_type='LIDAR',
+        load_dim=5,
+        use_dim=[0, 1, 2, 3],   # match 4-ch scene points produced by LoadPointsFromMultiSweeps
+        backend_args=backend_args))
 
 # Dataset
 train_pipeline = [       # nuScenes
@@ -27,24 +43,25 @@ train_pipeline = [       # nuScenes
         type='LoadPointsFromFile',
         coord_type='LIDAR',
         load_dim=5,
-        use_dim=5,
+        use_dim=5,                          # keep all 5 cols so MultiSweeps can set col-4 time
         backend_args=backend_args),
     dict(
         type='LoadPointsFromMultiSweeps',
-        sweeps_num=10,
+        sweeps_num=5,
+        use_dim=[0, 1, 2, 3],              # drop time; final output: x,y,z,intensity (4-ch, KITTI-compatible)
         backend_args=backend_args),
-    dict(
-        type='LoadAnnotations3D', with_bbox_3d=True, with_label_3d=True),
+    dict(type='LoadAnnotations3D', with_bbox_3d=True, with_label_3d=True),
+    dict(type='ObjectSample', db_sampler=db_sampler, use_ground_plane=False),
     dict(
             type='ClassRemapWithLabel',
             mapping={
                 'car': 'Car',
-                'bicycle': 'Cyclist',
-                'motorcycle': 'Cyclist',
-                'pedestrian': 'Pedestrian',
+                # 'bicycle': 'Cyclist',
+                # 'motorcycle': 'Cyclist',
+                # 'pedestrian': 'Pedestrian',
             },
             class_names=metainfo['classes'],
-            keep_unmapped=False),  # Drop unmapped classes like 'trailer', 'barrier'
+            keep_unmapped=False),  # Keep or Drop unmapped classes like 'trailer', 'barrier'
    dict(
         type='GlobalRotScaleTrans',
         rot_range=[-0.3925, 0.3925],        # +/- 22.5 degrees
@@ -69,18 +86,18 @@ val_pipeline = [        # nuScenes
         backend_args=backend_args),
     dict(
         type='LoadPointsFromMultiSweeps',
-        sweeps_num=10,
+        sweeps_num=5,
+        use_dim=[0, 1, 2, 3],
         test_mode=True,
         backend_args=backend_args),
-    dict(
-        type='LoadAnnotations3D', with_bbox_3d=True, with_label_3d=True),
+    dict(type='LoadAnnotations3D', with_bbox_3d=True, with_label_3d=True),
     dict(
             type='ClassRemapWithLabel',
             mapping={
                 'car': 'Car',
-                'bicycle': 'Cyclist',
-                'motorcycle': 'Cyclist',
-                'pedestrian': 'Pedestrian',
+                # 'bicycle': 'Cyclist',
+                # 'motorcycle': 'Cyclist',
+                # 'pedestrian': 'Pedestrian',
             },
             class_names=metainfo['classes'],
             keep_unmapped=False),
@@ -96,8 +113,8 @@ val_pipeline = [        # nuScenes
                 scale_ratio_range=[1., 1.],
                 translation_std=[0, 0, 0]),
             dict(type='RandomFlip3D'),
-            dict(
-                type='PointsRangeFilter', point_cloud_range=point_cloud_range)
+            dict(type='PointsRangeFilter', point_cloud_range=point_cloud_range),
+            dict(type='ObjectRangeFilter', point_cloud_range=point_cloud_range),
         ]),
     dict(
         type='Pack3DDetInputs',
@@ -146,10 +163,26 @@ val_pipeline = [        # nuScenes
 #     dict(type='Pack3DDetInputs', keys=['points'])
 #     ]
 
+eval_pipeline = [
+    dict(
+        type='LoadPointsFromFile',
+        coord_type='LIDAR',
+        load_dim=5,
+        use_dim=5,
+        backend_args=backend_args),
+    dict(
+        type='LoadPointsFromMultiSweeps',
+        sweeps_num=5,
+        use_dim=[0, 1, 2, 3],
+        test_mode=True,
+        backend_args=backend_args),
+    dict(type='Pack3DDetInputs', keys=['points'])
+]
 
 train_dataloader = dict(
-    batch_size=2,
-    num_workers=2,
+    batch_size=8,
+    num_workers=6,
+    prefetch_factor=4,      # each worker pre-fetches 4 batches
     persistent_workers=True,
     sampler=dict(type='DefaultSampler', shuffle=True),
     dataset=dict(          # nuScenes
@@ -181,6 +214,7 @@ val_dataloader = dict(
         modality=input_modality,
         box_type_3d='LiDAR',
         test_mode=False,
+        filter_empty_gt=False,
         with_velocity=False,
         backend_args=backend_args))
 
@@ -203,23 +237,41 @@ val_dataloader = dict(
     #     with_velocity=False,
     #     backend_args=backend_args))
 
-val_evaluator = dict(
-    type='NuScenesKittiMetric',
-    ann_file=data_root + ann_file_val,
-    metric='bbox',
-    pcd_limit_range=point_cloud_range,
-    default_cam_key='CAM_FRONT',
-    label_mapping={                 # handles GT label mapping by the metric
-        'car': 'Car',
-        'bicycle': 'Cyclist',
-        'motorcycle': 'Cyclist',
-        'pedestrian': 'Pedestrian'}
-)
+# val_evaluator = [
+#     dict(
+#         type='NuScenesKittiMetric',
+#         ann_file=data_root + ann_file_val,
+#         metric='bbox',
+#         pcd_limit_range=point_cloud_range,
+#         default_cam_key='CAM_FRONT',
+#         label_mapping={                 # handles GT label mapping by the metric
+#             'car': 'Car',
+#             'bicycle': 'Cyclist',
+#             'motorcycle': 'Cyclist',
+#             'pedestrian': 'Pedestrian'}
+#         ),
+#     # dict(
+#     #     type='DumpResults', 
+#     #     out_file_path='work_dirs/pretrain_8apr/results.pkl'
+#     #     )
+# ]
 
 
-# val_cfg = None
-# test_cfg = None
-train_cfg = dict(type='EpochBasedTrainLoop', max_epochs=36, val_interval=18)
+val_evaluator = [
+    dict(
+        type='NuScenesRemappedMetric',
+        data_root=data_root,
+        ann_file=data_root + ann_file_val,
+        metric='bbox',
+        model_classes=metainfo['classes'],    # ['Car', 'Pedestrian', 'Cyclist']
+        class_mapping={
+            'Car':        'car',
+            # 'Pedestrian': 'pedestrian',
+            # 'Cyclist':    'bicycle',          # bicycle+motorcycle → Cyclist during train
+        },
+    )
+]
+
 test_dataloader = val_dataloader
 test_evaluator = val_evaluator
 
@@ -250,15 +302,16 @@ model = dict(
         feat_channels=[64],
         with_distance=False,
         voxel_size=voxel_size,
+        norm_cfg=dict(type='BN1d', eps=1e-3, momentum=0.01),
         point_cloud_range=point_cloud_range),
-    
+
     middle_encoder=dict(
         type='PointPillarsScatter', in_channels=64, output_shape=output_shape),       # output_shape = range / voxel_size (x and y)
-    
+
     backbone=dict(
         type='SECOND',
         in_channels=64,
-        norm_cfg=dict(type='naiveSyncBN2d', eps=1e-3, momentum=0.01),
+        norm_cfg=dict(type='BN2d', eps=1e-3, momentum=0.01),
         layer_nums=[3, 5, 5],
         layer_strides=[2, 2, 2],
         out_channels=[64, 128, 256]),
@@ -271,7 +324,8 @@ model = dict(
     
     bbox_head=dict(
         type='Anchor3DHead',
-        num_classes=3,
+        # num_classes=3,
+        num_classes=1,
         in_channels=384,
         feat_channels=384,
         use_direction_classifier=True,
@@ -279,23 +333,29 @@ model = dict(
         anchor_generator=dict(                      
             type='AlignedAnchor3DRangeGenerator',
             ranges=[
-                [0, -50.40, -1.62, 68.80, 50.40, -1.62],    # Pedestrian
-                [0, -50.40, -1.67, 68.80, 50.40, -1.67],    # Cyclist
-                [0, -50.40, -1.80, 68.80, 50.40, -1.80]     # Car
-            ],
+                [-50.40, -50.40, -1.80, 50.40, 50.40, -1.80],    # Car
+                # [-50.40, -50.40, -1.62, 50.40, 50.40, -1.62],    # Pedestrian
+                # [-50.40, -50.40, -1.67, 50.40, 50.40, -1.67],    # Cyclist
+                ],
+            # ranges=[                                          # front face range
+            #     [0, -50.40, -1.80, 68.80, 50.40, -1.80],    # Car
+            #     [0, -50.40, -1.62, 68.80, 50.40, -1.62],    # Pedestrian
+            #     [0, -50.40, -1.67, 68.80, 50.40, -1.67]     # Cyclist
+            # ],
             # ranges=[
             #     [0, -50.40, -0.6, 68.80, 50.40, -0.6],    # Pedestrian
             #     [0, -50.40, -0.6, 68.80, 50.40, -0.6],    # Cyclist
             #     [0, -50.40, -1.78, 68.80, 50.40, -1.78]     # Car
             # ],
             sizes=[
-                [0.8, 0.6, 1.73],           # Pedestrian    
-                [1.72, 0.6, 1.73],          # Cyclist
-                [4.25, 1.78, 1.65]            # Car
+                [4.60, 1.95, 1.72],         # Car
+                # [0.72, 0.66, 1.76],           # Pedestrian    
+                # [1.68, 0.6, 1.27]           # Cyclist
             ],
             rotations=[0, 1.57],
             reshape_out=False),
         diff_rad_by_sin=True,
+        dir_offset=-0.7854,  # -pi / 4
         bbox_coder=dict(type='DeltaXYZWLHRBBoxCoder'),
         loss_cls=dict(
             type='mmdet.FocalLoss',
@@ -304,7 +364,7 @@ model = dict(
             alpha=0.25,
             loss_weight=1.0),
         loss_bbox=dict(
-            type='mmdet.SmoothL1Loss', beta=1.0 / 9.0, loss_weight=2.0),
+            type='mmdet.SmoothL1Loss', beta=1.0 / 9.0, loss_weight=1.5),
         loss_dir=dict(
             type='mmdet.CrossEntropyLoss', use_sigmoid=False,
             loss_weight=0.2)),
@@ -312,27 +372,27 @@ model = dict(
     # model training and testing settings
     train_cfg=dict(
         assigner=[
-            dict(  # for Pedestrian
-                type='Max3DIoUAssigner',
-                iou_calculator=dict(type='mmdet3d.BboxOverlapsNearest3D'),
-                pos_iou_thr=0.6,
-                neg_iou_thr=0.3,
-                min_pos_iou=0.3,
-                ignore_iof_thr=-1),
-            dict(  # for Cyclist
-                type='Max3DIoUAssigner',
-                iou_calculator=dict(type='mmdet3d.BboxOverlapsNearest3D'),
-                pos_iou_thr=0.6,
-                neg_iou_thr=0.3,
-                min_pos_iou=0.3,
-                ignore_iof_thr=-1),
             dict(  # for Car
                 type='Max3DIoUAssigner',
                 iou_calculator=dict(type='mmdet3d.BboxOverlapsNearest3D'),
-                pos_iou_thr=0.6,
+                pos_iou_thr=0.55,
                 neg_iou_thr=0.3,
                 min_pos_iou=0.3,
                 ignore_iof_thr=-1),
+            # dict(  # for Pedestrian
+            #     type='Max3DIoUAssigner',
+            #     iou_calculator=dict(type='mmdet3d.BboxOverlapsNearest3D'),
+            #     pos_iou_thr=0.45,
+            #     neg_iou_thr=0.3,
+            #     min_pos_iou=0.3,
+            #     ignore_iof_thr=-1),
+            # dict(  # for Cyclist
+            #     type='Max3DIoUAssigner',
+            #     iou_calculator=dict(type='mmdet3d.BboxOverlapsNearest3D'),
+            #     pos_iou_thr=0.45,
+            #     neg_iou_thr=0.3,
+            #     min_pos_iou=0.3,
+            #     ignore_iof_thr=-1),
         ],
         allowed_border=0,
         pos_weight=-1,
@@ -347,7 +407,16 @@ model = dict(
         nms_pre=1000,
         max_num=500))
 
-# less momory usage during training with amp
-# LR adjusted to batch size (batch size=2 vs original total batch size=32)
+default_hooks = dict(
+    checkpoint=dict(type='CheckpointHook', interval=1, save_best=None),
+    visualization=dict(type='Det3DVisualizationHook', draw=False)
+)
+
+
+train_cfg = dict(type='EpochBasedTrainLoop', max_epochs=24, val_interval=12)
+
+# Gradient accumulation with 8 steps to achieve effective batch size of 32 (8 x 4)
 optim_wrapper = dict(type='OptimWrapper',
-                     optimizer=dict(type='AdamW', lr=6.25e-5, weight_decay=0.01))
+                     optimizer=dict(type='AdamW', lr=0.001, weight_decay=0.01),
+                     accumulative_counts=4,
+                     clip_grad=dict(max_norm=35, norm_type=2))
