@@ -1,4 +1,4 @@
-python tools/train.py configs/mean_teacher/mean_teacher_pointpillars_config.py --work-dir work_dirs/train_one_epoch_26jan
+python tools/train.py configs/mean_teacher/mean_teacher_pointpillars_config.py --work-dir work_dirs/mt_smoke_test_09may --cfg-options pretrained_ckpt=./work_dirs/baseline_pointpillars_5may/epoch_24.pth
 
 python tools/train.py configs/mean_teacher/mt_ckpt_config_pp.py --work-dir work_dirs/train_mt_pretrained_1feb
 

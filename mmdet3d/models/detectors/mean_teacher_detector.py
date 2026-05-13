@@ -64,7 +64,7 @@ class MeanTeacher3DDetector(Base3DDetector):
                      use_bev_consistency=True,
                      tau=0.07,
                      symmetric_contrastive=True,
-                     conf_threshold=0.6,
+                     conf_threshold=0.3,
                      use_class_specific_thresh=False,
                      class_thresholds=None,
                      source_loss_weight=1.0,
@@ -73,6 +73,7 @@ class MeanTeacher3DDetector(Base3DDetector):
                      burn_in_iters=0,
                      min_pseudo_per_sample=0,
                      verbose=False,
+                     eval_use_teacher=True,
                  ),
                  pretrained_ckpt=None,
                  train_cfg=None,
@@ -107,9 +108,19 @@ class MeanTeacher3DDetector(Base3DDetector):
             logger.info(
                 f'Pretrained weights loaded from {pretrained_ckpt}: '
                 f'{len(missing)} missing keys, {len(unexpected)} unexpected keys')
-            if missing:
-                logger.warning(f'Missing keys: {missing[:5]}')
-                logger.warning(f'Unexpected keys: {unexpected[:5]}')
+            # Guard against silent partial loads in core layers (e.g. num_classes mismatch).
+            critical_prefixes = (
+                'bbox_head.', 'voxel_encoder.', 'middle_encoder.', 'backbone.', 'neck.')
+            critical_missing    = [k for k in missing    if k.startswith(critical_prefixes)]
+            critical_unexpected = [k for k in unexpected if k.startswith(critical_prefixes)]
+            if critical_missing or critical_unexpected:
+                raise RuntimeError(
+                    f'Pretrained checkpoint architectural mismatch — refusing to train '
+                    f'with randomly-initialised core layers.\n'
+                    f'  missing    (model has, ckpt lacks): {critical_missing}\n'
+                    f'  unexpected (ckpt has, model lacks): {critical_unexpected}\n'
+                    f'Check that num_classes, anchor sizes, and head architecture match '
+                    f'between this config and {pretrained_ckpt}.')
 
 
         # Initialise teacher from student (parameters + BN buffers).
@@ -131,6 +142,14 @@ class MeanTeacher3DDetector(Base3DDetector):
         self._ema_update_count = 0
         self._last_param_norm = None
         self._train_iter = 0
+
+        logger = MMLogger.get_current_instance()
+        logger.info(
+            f'[MT init] student/teacher initialised from pretrained_ckpt={pretrained_ckpt}; '
+            f'ema_momentum={mean_teacher_cfg.get("ema_momentum", 0.999)}, '
+            f'update_teacher_buffers={mean_teacher_cfg.get("update_teacher_buffers", True)}, '
+            f'teacher_pseudo_eval={mean_teacher_cfg.get("teacher_pseudo_eval", True)}, '
+            f'burn_in_iters={mean_teacher_cfg.get("burn_in_iters", 0)}')
 
     # ------------------------------------------------------------------
     # EMA update
@@ -167,7 +186,7 @@ class MeanTeacher3DDetector(Base3DDetector):
             delta = ''
             if self._last_param_norm is not None:
                 delta = f' (Δ: {avg_norm - self._last_param_norm:+.2e})'
-            MMLogger.get_current_instance().debug(
+            MMLogger.get_current_instance().info(
                 f'[EMA #{self._ema_update_count}] avg param norm: {avg_norm:.4f}{delta}')
             self._last_param_norm = avg_norm
 
@@ -210,7 +229,7 @@ class MeanTeacher3DDetector(Base3DDetector):
             mask = scores >= conf_threshold
 
         kept = mask.sum().item()
-        if verbose:
+        if verbose and len(scores) > 0:
             logger = MMLogger.get_current_instance()
             total = len(scores)
             logger.info(
@@ -228,6 +247,135 @@ class MeanTeacher3DDetector(Base3DDetector):
             filtered_pred.bev_features = teacher_pred.bev_features
 
         return filtered_pred
+
+    # ------------------------------------------------------------------
+    # Iter-0 sanity diagnostic
+    # ------------------------------------------------------------------
+
+    def _log_teacher_output_sanity(self, target_weak_in, target_samp_weak):
+        """One-shot diagnostic at iter 0: trace the full prediction chain.
+
+        Logs point stats → voxelization output → cls-score distribution in eval
+        and train mode so the exact failure point is visible.
+        """
+        logger = MMLogger.get_current_instance()
+        thresholds = [0.1, 0.3, 0.5]
+        original_mode = self.teacher.training
+
+        # ── 1. Raw point statistics ──────────────────────────────────────────
+        # target_weak_in is already preprocessed (voxels); recover raw points
+        # from the voxel tensor so we can check coordinates.
+        try:
+            voxels = target_weak_in['voxels']['voxels']   # [M, max_pts, C]
+            coors  = target_weak_in['voxels']['coors']    # [M, 4]  (batch, z, y, x)
+            n_pts  = target_weak_in['voxels']['num_points']  # [M]
+            total_voxels = voxels.shape[0]
+            total_points = int(n_pts.sum().item())
+            # Collect occupied point xyz from packed voxel tensor
+            pts_flat = []
+            for vi in range(min(total_voxels, 500)):   # sample first 500 voxels only
+                nv = int(n_pts[vi].item())
+                if nv > 0:
+                    pts_flat.append(voxels[vi, :nv, :3])
+            if pts_flat:
+                pts = torch.cat(pts_flat, dim=0).cpu()
+                logger.info(
+                    f'[Sanity iter-0] voxelized input: '
+                    f'total_voxels={total_voxels}  total_points={total_points}  '
+                    f'batch_indices={coors[:, 0].unique().cpu().tolist()}  '
+                    f'x=[{pts[:, 0].min():.1f}, {pts[:, 0].max():.1f}]  '
+                    f'y=[{pts[:, 1].min():.1f}, {pts[:, 1].max():.1f}]  '
+                    f'z=[{pts[:, 2].min():.1f}, {pts[:, 2].max():.1f}]')
+            else:
+                logger.warning('[Sanity iter-0] voxelized input: NO voxels (empty input!)')
+        except Exception as exc:
+            logger.warning(f'[Sanity iter-0] could not inspect voxels: {exc}')
+            logger.info(f'[Sanity iter-0] target_weak_in keys: {list(target_weak_in.keys()) if isinstance(target_weak_in, dict) else type(target_weak_in)}')
+
+        # ── 2. Raw cls-score histogram (before NMS) ──────────────────────────
+        # Forward through backbone+neck+head manually so we can see score distribution
+        # without NMS filtering.
+        try:
+            self.teacher.eval()
+            with torch.no_grad():
+                x = self.teacher.extract_feat(target_weak_in, return_bev=False)
+                # bbox_head.forward_single returns cls_scores list
+                cls_scores_raw = []
+                if hasattr(self.teacher, 'bbox_head'):
+                    head = self.teacher.bbox_head
+                    if hasattr(head, 'forward_single'):
+                        for feat in x:
+                            cls, _, _ = head.forward_single(feat)
+                            cls_scores_raw.append(cls.sigmoid().cpu())
+                    else:
+                        # CenterPoint-style: just call forward
+                        outs = head(x)
+                        if isinstance(outs, (list, tuple)) and len(outs) > 0:
+                            if isinstance(outs[0], (list, tuple)):
+                                for t in outs[0]:
+                                    if isinstance(t, torch.Tensor):
+                                        cls_scores_raw.append(t.sigmoid().cpu())
+
+                if cls_scores_raw:
+                    all_cls = torch.cat([c.flatten() for c in cls_scores_raw])
+                    percentiles = [50, 75, 90, 95, 99]
+                    pct_str = '  '.join(
+                        f'p{p}={torch.quantile(all_cls, p/100).item():.4f}'
+                        for p in percentiles)
+                    above_thresh = {t: int((all_cls >= t).sum()) for t in thresholds}
+                    logger.info(
+                        f'[Sanity iter-0] raw cls scores (pre-NMS, {len(all_cls)} anchors): '
+                        f'{pct_str}  '
+                        + '  '.join(f'>={t:.1f}:{n}' for t, n in above_thresh.items()))
+                else:
+                    logger.warning('[Sanity iter-0] could not extract raw cls scores')
+        except Exception as exc:
+            logger.warning(f'[Sanity iter-0] raw cls score extraction failed: {exc}')
+
+        # ── 3. Full predict in eval vs train mode ────────────────────────────
+        logger.info('[Sanity iter-0] comparing teacher predictions in eval vs train mode')
+
+        for mode_label, use_eval in (('eval', True), ('train', False)):
+            if use_eval:
+                self.teacher.eval()
+            else:
+                self.teacher.train()
+
+            samp_copy = copy.deepcopy(target_samp_weak)
+            with torch.no_grad():
+                try:
+                    preds = self.teacher.predict(target_weak_in, samp_copy)
+                except Exception as exc:
+                    logger.warning(
+                        f'[Sanity iter-0 teacher:{mode_label}] predict raised: {exc}')
+                    continue
+
+            score_lists = []
+            for p in preds:
+                inst = getattr(p, 'pred_instances_3d', None)
+                if inst is not None:
+                    s = getattr(inst, 'scores_3d', None)
+                    if s is not None:
+                        score_lists.append(s.detach().cpu())
+
+            if score_lists:
+                scores = torch.cat(score_lists)
+                count_str = '  '.join(
+                    f'>={t:.1f}:{int((scores >= t).sum())}' for t in thresholds)
+                logger.info(
+                    f'[Sanity iter-0 teacher:{mode_label}] '
+                    f'total_returned={len(scores)}  {count_str}')
+            else:
+                logger.info(
+                    f'[Sanity iter-0 teacher:{mode_label}] zero predictions returned')
+
+        self.teacher.train(original_mode)
+        logger.info(
+            '[Sanity iter-0] INTERPRETATION: '
+            'total_voxels~0  → points empty or all outside range; check KittiToNuscenes + PointsRangeFilter. '
+            'voxels OK but raw cls scores all low  → pretrained weights not loading correctly or wrong coordinate frame. '
+            'raw scores OK but total_returned=0  → NMS/score_thr too aggressive; lower score_thr in test_cfg. '
+            'eval >> train  → BN train-mode instability.')
 
     # ------------------------------------------------------------------
     # InfoNCE contrastive loss
@@ -457,12 +605,18 @@ class MeanTeacher3DDetector(Base3DDetector):
                 gt.scores_3d = scores
             sample_strong.gt_instances_3d = gt
 
+        if verbose:
+            per_sample = [len(p.pred_instances_3d.bboxes_3d) for p in teacher_predictions]
+            logger.info(
+                f'[PseudoStats] per-sample boxes: '
+                f'mean={sum(per_sample)/max(len(per_sample),1):.1f} '
+                f'min={min(per_sample) if per_sample else 0} '
+                f'max={max(per_sample) if per_sample else 0} '
+                f'total={total_boxes}')
         if total_boxes == 0:
             logger.warning(
                 '[PseudoLabels] No pseudo-labels kept '
                 '(all filtered out or below min_pseudo_per_sample)')
-        elif verbose:
-            logger.info(f'[PseudoLabels] Total boxes assigned: {total_boxes}')
 
         return pseudo_labeled_samples
 
@@ -526,11 +680,17 @@ class MeanTeacher3DDetector(Base3DDetector):
 
         target_weak_in, target_samp_weak_proc = preprocess(target_weak, target_samp_weak)
 
-        self.teacher.train()
+        if self._train_iter == 1:
+            self._log_teacher_output_sanity(target_weak_in, target_samp_weak_proc)
+
+        # Use eval mode so BN uses stable pretrained running stats, not noisy
+        # batch stats from the small target batch (confirmed cause of teacher collapse).
+        self.teacher.eval()
         with torch.no_grad():
             teacher_pred = self.teacher.predict(
                 target_weak_in, target_samp_weak_proc,
                 return_bev_features=True)
+        self.teacher.train()
 
         filtered_preds = [self.filter_teacher_predictions(p) for p in teacher_pred]
 
@@ -593,20 +753,20 @@ class MeanTeacher3DDetector(Base3DDetector):
             losses['loss_contrastive'] = torch.tensor(0., device=device)
 
         # ── Debug summary ──────────────────────────────────────────────
-        if verbose:
-            source_loss_total = sum(v for k, v in losses.items()
-                                    if '_source' in k and isinstance(v, torch.Tensor))
-            target_loss_parts = [v for k, v in losses.items()
-                                  if '_target' in k and isinstance(v, torch.Tensor)]
-            target_loss_total = (sum(target_loss_parts) if target_loss_parts
-                                 else torch.tensor(0., device=device))
-            contrastive_loss_total = losses.get(
-                'loss_contrastive', torch.tensor(0., device=device))
-            logger.info(
-                f'[iter {self._train_iter}] '
-                f'source_loss={source_loss_total.item():.4f}  '
-                f'target_pseudo_loss={target_loss_total.item():.4f}  '
-                f'contrastive_loss={contrastive_loss_total.item():.4f}')
+        # if verbose:
+        #     source_loss_total = sum(v for k, v in losses.items()
+        #                             if '_source' in k and isinstance(v, torch.Tensor))
+        #     target_loss_parts = [v for k, v in losses.items()
+        #                           if '_target' in k and isinstance(v, torch.Tensor)]
+        #     target_loss_total = (sum(target_loss_parts) if target_loss_parts
+        #                          else torch.tensor(0., device=device))
+        #     contrastive_loss_total = losses.get(
+        #         'loss_contrastive', torch.tensor(0., device=device))
+        #     logger.info(
+        #         f'[iter {self._train_iter}] '
+        #         f'source_loss={source_loss_total.item():.4f}  '
+        #         f'target_pseudo_loss={target_loss_total.item():.4f}  '
+        #         f'contrastive_loss={contrastive_loss_total.item():.4f}')
 
         return {k: v for k, v in losses.items() if not k.startswith('_')}
 
@@ -615,17 +775,30 @@ class MeanTeacher3DDetector(Base3DDetector):
     # ------------------------------------------------------------------
 
     def predict(self, batch_inputs, batch_data_samples,
-                use_teacher=False, **kwargs):
-        """Run inference with student (default) or teacher.
+                use_teacher=None, **kwargs):
+        """Run inference with student or teacher.
 
         The chosen subnet is temporarily set to eval mode so BN running stats
         are not updated from validation data.
+
+        Args:
+            use_teacher (bool | None): If None (default), consults
+                ``mean_teacher_cfg['eval_use_teacher']`` (default True).
+                Pass True/False explicitly to override.
         """
+        if use_teacher is None:
+            use_teacher = self.mean_teacher_cfg.get('eval_use_teacher', True)
         subnet = self.teacher if use_teacher else self.student
         was_training = subnet.training
         subnet.eval()
         try:
-            result = subnet.predict(batch_inputs, batch_data_samples, **kwargs)
+            # The MT wrapper has no data_preprocessor of its own, so mmengine's
+            # val_step only device-transfers the points.  Voxelize here via the
+            # subnet's preprocessor before forwarding.
+            data = subnet.data_preprocessor(
+                {'inputs': batch_inputs, 'data_samples': batch_data_samples},
+                training=False)
+            result = subnet.predict(data['inputs'], data['data_samples'], **kwargs)
         finally:
             subnet.train(was_training)
         return result

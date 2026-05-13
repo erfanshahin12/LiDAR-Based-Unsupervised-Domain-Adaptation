@@ -129,7 +129,7 @@ val_pipeline = [        # nuScenes
 ]
 
 train_dataloader = dict(
-    batch_size=2,
+    batch_size=4,
     num_workers=6,
     prefetch_factor=4,
     persistent_workers=True,

@@ -14,18 +14,18 @@ target_dataset_type = 'KittiDataset'
 target_data_root = 'data/kitti/'
 ann_file_target = 'kitti_infos_train.pkl'
 data_prefix_target = dict(pts='training/velodyne_reduced')
-classes_kitti = ['Car', 'Pedestrian', 'Cyclist']
+classes_kitti = ['Car']
 box_origin_target = (0.5, 0.5, 0)        # KITTI box origin
 metainfo_target = dict(classes=classes_kitti, origin=box_origin_target)
 
 hard_instance_bank_path = './configs/mean_teacher/hard_instance_bank/hard_instance_bank_nuscenes_quantile_kitti_20.pkl'
-pretrained_ckpt = './work_dirs/pretrain_16feb/epoch_24.pth'
+pretrained_ckpt = './work_dirs/baseline_pointpillars_5may/epoch_24.pth'
 
 # point_cloud_range = [-50.40, -50.40, -5, 50.40, 50.40, 3]   # nuScenes point cloud range
-point_cloud_range = [0, -50.40, -5, 68.80, 50.40, 3]
+point_cloud_range = [-50.40, -50.40, -5, 50.40, 50.40, 3]
 input_modality = dict(use_lidar=True, use_camera=False)
 metainfo = dict(
-        classes=['Car', 'Pedestrian', 'Cyclist'],
+        classes=['Car'],
         origin=(0.5, 0.5, 0.5))
 backend_args = None
 
@@ -59,12 +59,9 @@ source_pipeline = [     # nuScenes         # supervised training on source data
             type='ClassRemapWithLabel',
             mapping={
                 'car': 'Car',
-                'bicycle': 'Cyclist',
-                'motorcycle': 'Cyclist',
-                'pedestrian': 'Pedestrian',
             },
             class_names=classes_kitti,
-            keep_unmapped=False),  # Drop unmapped classes like 'trailer', 'barrier'
+            keep_unmapped=False),  # Drop all non-Car classes
    dict(
         type='GlobalRotScaleTrans',
         rot_range=[-0.3925, 0.3925],        # +/- 22.5 degrees
@@ -136,15 +133,33 @@ target_strong_pipeline = [       # KITTI      # sent to student model for unsupe
     #     ),
     dict(
         type='GlobalRotScaleTrans',
-        rot_range=[-0.78539816, 0.78539816],                # +/- 45 degrees
+        rot_range=[-0.3925, 0.3925],                        # +/- 22.5 degrees (matches source)
         scale_ratio_range=[0.95, 1.05]),
     dict(type='RandomFlip3D', flip_ratio_bev_horizontal=0.5),
-    dict(type='PointsRangeFilter', point_cloud_range=point_cloud_range),
-    # dict(type='ObjectRangeFilter', point_cloud_range=point_cloud_range),
+    # dict(type='PointsRangeFilter', point_cloud_range=point_cloud_range),
+    # PointsRangeFilter is intentionally omitted here: after rotating KITTI data
+    # (which in nuScenes frame clusters at x_nus≈0, y_nus>0) by ±22.5° the range
+    # filter [0, -50.4,...] can eliminate ALL points, crashing the CUDA voxelizer
+    # with gridDim=0.  The voxelizer's own internal clip (same range) is
+    # equivalent and never receives an empty tensor.
     dict(type='PointShuffle'),
     dict(
         type='Pack3DDetInputs',
         keys=['points'])            # pack only points for unlabeled data
+]
+
+val_pipeline = [        # KITTI val — evaluated in nuScenes frame, then inverted by NusOnKittiMetric
+    dict(type='LoadPointsFromFile',
+         coord_type='LIDAR', load_dim=4, use_dim=4, backend_args=backend_args),
+    dict(type='LoadAnnotations3D',
+         with_bbox_3d=True, with_label_3d=True, backend_args=backend_args),
+    # Rotate KITTI (X-fwd, Y-left) → nuScenes (X-right, Y-fwd) so the teacher
+    # sees data in its training frame.  NusOnKittiMetric inverts predictions back.
+    dict(type='KittiToNuscenes'),
+    dict(type='PointsRangeFilter', point_cloud_range=point_cloud_range),
+    dict(type='ObjectRangeFilter', point_cloud_range=point_cloud_range),
+    dict(type='Pack3DDetInputs',
+         keys=['points', 'gt_bboxes_3d', 'gt_labels_3d']),
 ]
 
 labeled_dataset = dict(          # nuScenes
@@ -192,9 +207,10 @@ unlabeled_strong_dataset = dict(        # KITTI
     )
 
 train_dataloader = dict(
-    batch_size=2,
-    num_workers=2,
-    persistent_workers=False,
+    batch_size=8,
+    num_workers=6,
+    prefetch_factor=4,      # each worker pre-fetches 4 batches
+    persistent_workers=True,
     sampler=dict(type='DefaultSampler', shuffle=True),
     collate_fn=dict(type='mean_teacher_collate_fn'),
     dataset=dict(
@@ -205,8 +221,39 @@ train_dataloader = dict(
             metainfo=metainfo)
     )
 
-# val_dataloader = dict()
-# test_dataloader = dict()
+ann_file_target_val = 'kitti_infos_val.pkl'
+
+val_dataloader = dict(
+    batch_size=1,
+    num_workers=2,
+    persistent_workers=True,
+    drop_last=False,
+    sampler=dict(type='DefaultSampler', shuffle=False),
+    dataset=dict(
+        type=target_dataset_type,
+        data_root=target_data_root,
+        ann_file=ann_file_target_val,
+        data_prefix=data_prefix_target,
+        pipeline=val_pipeline,
+        metainfo=metainfo_target,
+        modality=input_modality,
+        box_type_3d='LiDAR',
+        test_mode=False,
+        filter_empty_gt=False,
+        backend_args=backend_args))
+
+test_dataloader = val_dataloader
+
+val_evaluator = dict(
+    type='NusOnKittiMetric',
+    ann_file=target_data_root + ann_file_target_val,
+    metric='bbox',
+    pcd_limit_range=[0, -40, -3, 70.4, 40, 0],
+    label_mapping=None,
+    default_cam_key='CAM2',
+    backend_args=backend_args)
+
+test_evaluator = val_evaluator
 
 # Model
 voxel_size = [0.2, 0.2, 8]      # nuscenes/kitti intermediate voxel size
@@ -228,16 +275,17 @@ model = dict(
                      tau=0.07,
                      symmetric_contrastive=True,
                      # Confidence thresholding params
-                     conf_threshold=0.3,
+                     conf_threshold=0.2,
                      use_class_specific_thresh=False,
                      class_thresholds=None,
                      # loss weights
                      source_loss_weight=1.0,
-                     target_loss_weight=0.5,
-                     contrastive_weight=1.0,
+                     target_loss_weight=0.25,
+                     contrastive_weight=0.05,
                      burn_in_iters=500,
-                     min_pseudo_per_sample=0,
-                     verbose=False,
+                     min_pseudo_per_sample=3,
+                     verbose=True,
+                     eval_use_teacher=True,
                  ),
     pretrained_ckpt=pretrained_ckpt,
 
@@ -259,15 +307,16 @@ model = dict(
             feat_channels=[64],
             with_distance=False,
             voxel_size=voxel_size,
+            norm_cfg=dict(type='BN1d', eps=1e-3, momentum=0.01),
             point_cloud_range=point_cloud_range),
         
         middle_encoder=dict(
-            type='PointPillarsScatter', in_channels=64, output_shape=output_shape),
+            type='PointPillarsScatter', in_channels=64, output_shape=output_shape),       # output_shape = range / voxel_size (x and y)
         
         backbone=dict(
             type='SECOND',
             in_channels=64,
-            norm_cfg=dict(type='naiveSyncBN2d', eps=1e-3, momentum=0.01),
+            norm_cfg=dict(type='BN2d', eps=1e-3, momentum=0.01),
             layer_nums=[3, 5, 5],
             layer_strides=[2, 2, 2],
             out_channels=[64, 128, 256]),
@@ -280,26 +329,38 @@ model = dict(
         
         bbox_head=dict(
             type='Anchor3DHead',
-            num_classes=3,
+            # num_classes=3,
+            num_classes=1,
             in_channels=384,
             feat_channels=384,
             use_direction_classifier=True,
             assign_per_class=True,
             anchor_generator=dict(                      
                 type='AlignedAnchor3DRangeGenerator',
-                ranges=[                                        # use source dataset anchor ranges
-                    [0, -50.40, -1.80, 68.80, 50.40, -1.80],    # Car
-                    [0, -50.40, -1.62, 68.80, 50.40, -1.62],    # Pedestrian
-                    [0, -50.40, -1.67, 68.80, 50.40, -1.67]     # Cyclist
-                ],
+                ranges=[
+                    [-50.40, -50.40, -1.80, 50.40, 50.40, -1.80],    # Car
+                    # [-50.40, -50.40, -1.62, 50.40, 50.40, -1.62],    # Pedestrian
+                    # [-50.40, -50.40, -1.67, 50.40, 50.40, -1.67],    # Cyclist
+                    ],
+                # ranges=[                                          # front face range
+                #     [0, -50.40, -1.80, 68.80, 50.40, -1.80],    # Car
+                #     [0, -50.40, -1.62, 68.80, 50.40, -1.62],    # Pedestrian
+                #     [0, -50.40, -1.67, 68.80, 50.40, -1.67]     # Cyclist
+                # ],
+                # ranges=[
+                #     [0, -50.40, -0.6, 68.80, 50.40, -0.6],    # Pedestrian
+                #     [0, -50.40, -0.6, 68.80, 50.40, -0.6],    # Cyclist
+                #     [0, -50.40, -1.78, 68.80, 50.40, -1.78]     # Car
+                # ],
                 sizes=[
-                    [4.25, 1.78, 1.65],         # Car
-                    [0.8, 0.6, 1.73],           # Pedestrian    
-                    [1.72, 0.6, 1.73]           # Cyclist
+                    [4.60, 1.95, 1.72],         # Car
+                    # [0.72, 0.66, 1.76],           # Pedestrian    
+                    # [1.68, 0.6, 1.27]           # Cyclist
                 ],
                 rotations=[0, 1.57],
                 reshape_out=False),
             diff_rad_by_sin=True,
+            dir_offset=-0.7854,  # -pi / 4
             bbox_coder=dict(type='DeltaXYZWLHRBBoxCoder'),
             loss_cls=dict(
                 type='mmdet.FocalLoss',
@@ -308,7 +369,7 @@ model = dict(
                 alpha=0.25,
                 loss_weight=1.0),
             loss_bbox=dict(
-                type='mmdet.SmoothL1Loss', beta=1.0 / 9.0, loss_weight=2.0),
+                type='mmdet.SmoothL1Loss', beta=1.0 / 9.0, loss_weight=1.5),
             loss_dir=dict(
                 type='mmdet.CrossEntropyLoss', use_sigmoid=False,
                 loss_weight=0.2)),
@@ -319,24 +380,24 @@ model = dict(
                 dict(  # for Car
                     type='Max3DIoUAssigner',
                     iou_calculator=dict(type='mmdet3d.BboxOverlapsNearest3D'),
-                    pos_iou_thr=0.6,
-                    neg_iou_thr=0.45,
-                    min_pos_iou=0.45,
+                    pos_iou_thr=0.55,
+                    neg_iou_thr=0.3,
+                    min_pos_iou=0.3,
                     ignore_iof_thr=-1),
-                dict(  # for Pedestrian
-                    type='Max3DIoUAssigner',
-                    iou_calculator=dict(type='mmdet3d.BboxOverlapsNearest3D'),
-                    pos_iou_thr=0.5,
-                    neg_iou_thr=0.35,
-                    min_pos_iou=0.35,
-                    ignore_iof_thr=-1),
-                dict(  # for Cyclist
-                    type='Max3DIoUAssigner',
-                    iou_calculator=dict(type='mmdet3d.BboxOverlapsNearest3D'),
-                    pos_iou_thr=0.5,
-                    neg_iou_thr=0.35,
-                    min_pos_iou=0.35,
-                    ignore_iof_thr=-1),
+                # dict(  # for Pedestrian
+                #     type='Max3DIoUAssigner',
+                #     iou_calculator=dict(type='mmdet3d.BboxOverlapsNearest3D'),
+                #     pos_iou_thr=0.45,
+                #     neg_iou_thr=0.3,
+                #     min_pos_iou=0.3,
+                #     ignore_iof_thr=-1),
+                # dict(  # for Cyclist
+                #     type='Max3DIoUAssigner',
+                #     iou_calculator=dict(type='mmdet3d.BboxOverlapsNearest3D'),
+                #     pos_iou_thr=0.45,
+                #     neg_iou_thr=0.3,
+                #     min_pos_iou=0.3,
+                #     ignore_iof_thr=-1),
             ],
             allowed_border=0,
             pos_weight=-1,
@@ -345,17 +406,18 @@ model = dict(
         test_cfg=dict(
             use_rotate_nms=True,
             nms_across_levels=False,
-            nms_thr=0.01,
+            nms_thr=0.05,
             score_thr=0.1,
             min_bbox_size=0,
-            nms_pre=100,
-            max_num=50)))
+            nms_pre=200,
+            max_num=100)))
 
 # Runtime configs
 # Hooks
 default_hooks = dict(
-    checkpoint=dict(type='CheckpointHook', interval=5),
-    logger=dict(type='LoggerHook', interval=1))
+    checkpoint=dict(type='CheckpointHook', interval=1, save_best=None),
+    visualization=dict(type='Det3DVisualizationHook', draw=False)
+)
 
 # custom_imports = dict(
 #     imports=['mmdet3d.engine.hooks.mean_teacher_hook'],
@@ -364,6 +426,10 @@ default_hooks = dict(
 custom_hooks = [dict(type='MeanTeacherHook', interval=1)]
 
 # Scheduler and optimizer config
-train_cfg = dict(type='EpochBasedTrainLoop', max_epochs=1, val_interval=1)
-val_cfg = None
-test_cfg = None
+train_cfg = dict(type='EpochBasedTrainLoop', max_epochs=2, val_interval=1)
+
+# Gradient accumulation with 8 steps to achieve effective batch size of 32 (8 x 4)
+optim_wrapper = dict(type='OptimWrapper',
+                     optimizer=dict(type='AdamW', lr=0.001, weight_decay=0.01),
+                     accumulative_counts=4,
+                     clip_grad=dict(max_norm=35, norm_type=2))
