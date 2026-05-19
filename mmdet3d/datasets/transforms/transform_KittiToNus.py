@@ -7,7 +7,8 @@ from mmdet3d.structures.bbox_3d import LiDARInstance3DBoxes
 @TRANSFORMS.register_module()
 class KittiToNuscenes(BaseTransform):
     """
-    Convert KITTI LiDAR coordinates to nuScenes LiDAR coordinates.
+    Convert KITTI LiDAR coordinates to nuScenes LiDAR coordinates
+    + adjust intensity scale from [0, 1] to [0, 255]
 
     KITTI:     +X forward, +Y left, +Z up
     nuScenes:  +X right,  +Y forward, +Z up
@@ -28,6 +29,9 @@ class KittiToNuscenes(BaseTransform):
                 [0,  0, 0, 1]
             ], dtype=results['points'].tensor.dtype, device=results['points'].tensor.device)
             results['points'].tensor = results['points'].tensor @ rot_mat.T
+            # Scale KITTI intensity [0, 1] → nuScenes scale [0, 255]
+            if results['points'].tensor.shape[1] >= 4:
+                results['points'].tensor[:, 3] *= 255.0
 
         # --- Transform 3D boxes ---
         if 'gt_bboxes_3d' in results:

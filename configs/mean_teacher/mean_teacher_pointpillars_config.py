@@ -52,7 +52,12 @@ source_pipeline = [     # nuScenes         # supervised training on source data
         type='LoadPointsFromFile',
         coord_type='LIDAR',
         load_dim=5,
-        use_dim=4),
+        use_dim=5),
+    dict(
+        type='LoadPointsFromMultiSweeps',
+        sweeps_num=5,
+        use_dim=[0, 1, 2, 3],              # drop ring index; final output: x,y,z,intensity (4-ch, KITTI-compatible)
+        backend_args=backend_args),
     dict(
         type='LoadAnnotations3D', with_bbox_3d=True, with_label_3d=True),
     dict(
@@ -270,22 +275,19 @@ model = dict(
     mean_teacher_cfg=dict(
                      point_cloud_range=point_cloud_range,
                      ema_momentum=0.999,
-                     update_teacher_buffers=False,      # BAN: teacher BN tracks target stats via .train()
+                     update_teacher_buffers=True,       # required with use_dsnorm: teacher is always in eval,
+                                                        # so its DSNorm running stats only update via EMA copy
                      use_bev_consistency=True,
                      tau=0.07,
-                     symmetric_contrastive=True,
-                     # Confidence thresholding params
-                     conf_threshold=0.2,
-                     use_class_specific_thresh=False,
-                     class_thresholds=None,
-                     # loss weights
-                     source_loss_weight=1.0,
-                     target_loss_weight=0.25,
-                     contrastive_weight=0.05,
-                     burn_in_iters=500,
-                     min_pseudo_per_sample=3,
+                     conf_threshold=0.3,
+                     source_loss_weight=0.0,
+                     target_loss_weight=0.2,
+                     contrastive_weight=0.2,
+                     burn_in_iters=0,
+                     min_pseudo_per_sample=0,
                      verbose=True,
                      eval_use_teacher=True,
+                     use_dsnorm=True,
                  ),
     pretrained_ckpt=pretrained_ckpt,
 
@@ -407,10 +409,10 @@ model = dict(
             use_rotate_nms=True,
             nms_across_levels=False,
             nms_thr=0.05,
-            score_thr=0.1,
+            score_thr=0.05,
             min_bbox_size=0,
-            nms_pre=200,
-            max_num=100)))
+            nms_pre=500,
+            max_num=250)))
 
 # Runtime configs
 # Hooks
@@ -418,15 +420,19 @@ default_hooks = dict(
     checkpoint=dict(type='CheckpointHook', interval=1, save_best=None),
     visualization=dict(type='Det3DVisualizationHook', draw=False)
 )
-
-# custom_imports = dict(
-#     imports=['mmdet3d.engine.hooks.mean_teacher_hook'],
-#     allow_failed_imports=False
-# )
-custom_hooks = [dict(type='MeanTeacherHook', interval=1)]
+custom_hooks = [
+    dict(type='MeanTeacherHook', interval=1),
+    dict(
+        type='PseudoLabelRefreshHook',
+        interval=4,             # re-run teacher every 4 epochs
+        update_at_epochs=(0,),  # always refresh before epoch 0 starts
+        ps_batch_size=4,
+        ps_num_workers=4,
+    ),
+]
 
 # Scheduler and optimizer config
-train_cfg = dict(type='EpochBasedTrainLoop', max_epochs=2, val_interval=1)
+train_cfg = dict(type='EpochBasedTrainLoop', max_epochs=24, val_interval=4)
 
 # Gradient accumulation with 8 steps to achieve effective batch size of 32 (8 x 4)
 optim_wrapper = dict(type='OptimWrapper',

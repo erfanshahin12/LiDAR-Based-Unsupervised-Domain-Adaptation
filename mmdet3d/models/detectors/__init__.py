@@ -24,6 +24,7 @@ from .voxelnet import VoxelNet
 from .mean_teacher_detector import MeanTeacher3DDetector
 from .simple_mean_teacher_detector import SimpleMeanTeacher3DDetector
 from .voxelnet_bev_roi import VoxelNetBEVRoI
+from .centerpoint_bev_roi import CenterPointBEVRoI
 
 __all__ = [
     'Base3DDetector', 'VoxelNet', 'DynamicVoxelNet', 'MVXTwoStageDetector',
@@ -31,5 +32,5 @@ __all__ = [
     'CenterPoint', 'SSD3DNet', 'ImVoteNet', 'SingleStageMono3DDetector',
     'FCOSMono3D', 'ImVoxelNet', 'GroupFree3DNet', 'PointRCNN', 'SMOKEMono3D',
     'SASSD', 'MinkSingleStage3DDetector', 'MultiViewDfM', 'DfM', 'PointVoxelRCNN',
-    'MeanTeacher3DDetector', 'SimpleMeanTeacher3DDetector', 'VoxelNetBEVRoI',
+    'MeanTeacher3DDetector', 'SimpleMeanTeacher3DDetector', 'VoxelNetBEVRoI', 'CenterPointBEVRoI',
 ]

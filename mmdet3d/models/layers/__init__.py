@@ -8,6 +8,7 @@ from .fusion_layers import (PointFusion, VoteFusion, apply_3d_transformation,
 from .minkowski_engine_block import (MinkowskiBasicBlock, MinkowskiBottleneck,
                                      MinkowskiConvModule)
 from .mlp import MLP
+from .dsnorm import (DSNorm, DSNorm1d, DSNorm2d, set_ds_source, set_ds_target)
 from .norm import NaiveSyncBatchNorm1d, NaiveSyncBatchNorm2d
 from .paconv import PAConv, PAConvCUDA
 from .pointnet_modules import (PAConvCUDASAModule, PAConvCUDASAModuleMSG,
@@ -24,7 +25,8 @@ from .vote_module import VoteModule
 __all__ = [
     'VoteModule', 'GroupFree3DMHA', 'EdgeFusionModule', 'DGCNNFAModule',
     'DGCNNFPModule', 'DGCNNGFModule', 'NaiveSyncBatchNorm1d',
-    'NaiveSyncBatchNorm2d', 'PAConv', 'PAConvCUDA', 'SparseBasicBlock',
+    'NaiveSyncBatchNorm2d', 'DSNorm', 'DSNorm1d', 'DSNorm2d',
+    'set_ds_source', 'set_ds_target', 'PAConv', 'PAConvCUDA', 'SparseBasicBlock',
     'SparseBottleneck', 'make_sparse_convmodule', 'PointFusion', 'VoteFusion',
     'apply_3d_transformation', 'bbox_2d_transform', 'coord_2d_transform',
     'MLP', 'box3d_multiclass_nms', 'aligned_3d_nms', 'circle_nms', 'nms_bev',

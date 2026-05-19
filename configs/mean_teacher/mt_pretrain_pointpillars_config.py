@@ -48,7 +48,7 @@ train_pipeline = [       # nuScenes
     dict(
         type='LoadPointsFromMultiSweeps',
         sweeps_num=5,
-        use_dim=[0, 1, 2, 3],              # drop time; final output: x,y,z,intensity (4-ch, KITTI-compatible)
+        use_dim=[0, 1, 2, 3],              # drop ring index; final output: x,y,z,intensity (4-ch, KITTI-compatible)
         backend_args=backend_args),
     dict(type='LoadAnnotations3D', with_bbox_3d=True, with_label_3d=True),
     dict(type='ObjectSample', db_sampler=db_sampler, use_ground_plane=False),

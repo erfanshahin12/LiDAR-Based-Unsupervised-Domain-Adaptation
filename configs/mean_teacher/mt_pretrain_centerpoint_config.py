@@ -7,11 +7,12 @@ ann_file_train = 'nuscenes_infos_train.pkl'
 ann_file_val = 'nuscenes_infos_val.pkl'
 data_prefix = dict(pts='samples/LIDAR_TOP', img='', sweeps='sweeps/LIDAR_TOP')
 
-classes_nuscenes = ['car', 'truck', 'construction_vehicle', 'bus', 'trailer',
-                    'barrier', 'motorcycle', 'bicycle', 'pedestrian', 'traffic_cone']
-metainfo_source = dict(classes=classes_nuscenes, origin=(0.5, 0.5, 0.5))
-metainfo = dict(classes=['Car'], origin=(0.5, 0.5, 0.5))
 box_origin = (0.5, 0.5, 0.5)        # nuScenes box origin
+
+classes_nuscenes = ['car', 'truck', 'construction_vehicle', 'bus', 'trailer',
+                  'barrier', 'motorcycle', 'bicycle', 'pedestrian', 'traffic_cone']
+metainfo_source = dict(classes=classes_nuscenes, origin=box_origin)
+metainfo = dict(classes=['Car'], origin=box_origin)
 
 # 51.2 m chosen deliberately: 102.4 / 0.1 = 1024 (power-of-2), matches the
 # base config's sparse_shape=[41,1024,1024] exactly.
@@ -55,12 +56,7 @@ train_pipeline = [          # nuscenes
     dict(type='ObjectSample', db_sampler=db_sampler, use_ground_plane=False),
     dict(
         type='ClassRemapWithLabel',
-        mapping={
-                'car': 'Car',
-                # 'bicycle': 'Cyclist',
-                # 'motorcycle': 'Cyclist',
-                # 'pedestrian': 'Pedestrian',
-            },
+        mapping={'car': 'Car'},
         class_names=metainfo['classes'],
         keep_unmapped=False),       # Keep or Drop unmapped classes
     dict(
@@ -95,17 +91,11 @@ val_pipeline = [        # nuScenes
         use_dim=[0, 1, 2, 3],
         pad_empty_sweeps=True,
         remove_close=True,
-        test_mode=True,
         backend_args=backend_args),
     dict(type='LoadAnnotations3D', with_bbox_3d=True, with_label_3d=True),
     dict(
         type='ClassRemapWithLabel',
-        mapping={
-                'car': 'Car',
-                # 'bicycle': 'Cyclist',
-                # 'motorcycle': 'Cyclist',
-                # 'pedestrian': 'Pedestrian',
-            },
+        mapping={'car': 'Car'},
         class_names=metainfo['classes'],
         keep_unmapped=False),
     dict(
@@ -129,7 +119,7 @@ val_pipeline = [        # nuScenes
 ]
 
 train_dataloader = dict(
-    batch_size=4,
+    batch_size=8,           # Reduce to 6 or 4 if GPU OOM; effective batch size is 32 via accumulative_counts=4.
     num_workers=6,
     prefetch_factor=4,
     persistent_workers=True,
@@ -177,11 +167,7 @@ val_evaluator = [
         ann_file=data_root + ann_file_val,
         metric='bbox',
         model_classes=metainfo['classes'],
-        class_mapping={
-            'Car':        'car',
-            # 'Pedestrian': 'pedestrian',
-            # 'Cyclist':    'bicycle',          # bicycle+motorcycle → Cyclist during train
-        },
+        class_mapping={'Car': 'car'},
     )
 ]
 test_evaluator = val_evaluator
@@ -189,13 +175,12 @@ test_evaluator = val_evaluator
 # ── Model ─────────────────────────────────────────────────────────────────────
 # Key deviations from the standard 10-class CenterPoint base:
 #
-#   1. HardSimpleVFE num_features=4, SparseEncoder in_channels=4:
-#      The time channel is dropped (KITTI-compatible 4-ch input).
+#   1. HardSimpleVFE num_features=4, SparseEncoder in_channels=4, matching the 4 channels used
 #
 #   2. tasks: single task for 'Car' only.
 #
 #   3. common_heads: velocity removed (no 'vel').  The downstream KITTI target
-#      has no velocity annotations.  NuScenesRemappedMetric zero-pads vel.
+#      has no velocity annotations.      zero-pads vel.
 #      code_size=7 (x,y,z,l,w,h,yaw) and code_weights has 7 entries.
 #
 #   4. DCNSeparateHead: as in the -head-dcn variant; improves localisation via
@@ -210,7 +195,7 @@ test_evaluator = val_evaluator
 voxel_size = [0.1, 0.1, 0.2]
 
 model = dict(
-    type='CenterPoint',
+    type='CenterPointBEVRoI',
     data_preprocessor=dict(
         type='Det3DDataPreprocessor',
         voxel=True,
@@ -219,7 +204,9 @@ model = dict(
             voxel_size=voxel_size,
             point_cloud_range=point_cloud_range,
             max_voxels=(90000, 120000))),
+            
     pts_voxel_encoder=dict(type='HardSimpleVFE', num_features=4),
+
     pts_middle_encoder=dict(
         type='SparseEncoder',
         in_channels=4,
@@ -229,6 +216,7 @@ model = dict(
         encoder_channels=((16, 16, 32), (32, 32, 64), (64, 64, 128), (128, 128)),
         encoder_paddings=((0, 0, 1), (0, 0, 1), (0, 0, [0, 1, 1]), (0, 0)),
         block_type='basicblock'),
+
     pts_backbone=dict(
         type='SECOND',
         in_channels=256,
@@ -237,6 +225,7 @@ model = dict(
         layer_strides=[1, 2],
         norm_cfg=dict(type='BN', eps=1e-3, momentum=0.01),
         conv_cfg=dict(type='Conv2d', bias=False)),
+
     pts_neck=dict(
         type='SECONDFPN',
         in_channels=[128, 256],
@@ -245,6 +234,7 @@ model = dict(
         norm_cfg=dict(type='BN', eps=1e-3, momentum=0.01),
         upsample_cfg=dict(type='deconv', bias=False),
         use_conv_for_no_stride=True),
+
     pts_bbox_head=dict(
         type='CenterHead',
         in_channels=512,
@@ -272,9 +262,12 @@ model = dict(
                 groups=4),
             init_bias=-2.19,
             final_kernel=3),
-        loss_cls=dict(type='mmdet.GaussianFocalLoss', reduction='mean'),
-        loss_bbox=dict(type='mmdet.L1Loss', reduction='mean', loss_weight=0.25),
+        loss_cls=dict(
+            type='mmdet.GaussianFocalLoss', reduction='mean'),
+        loss_bbox=dict(
+            type='mmdet.L1Loss', reduction='mean', loss_weight=0.25),
         norm_bbox=True),
+
     train_cfg=dict(
         pts=dict(
             grid_size=[1024, 1024, 40],
@@ -285,7 +278,8 @@ model = dict(
             max_objs=500,
             min_radius=2,
             point_cloud_range=point_cloud_range,
-            code_weights=[1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0])),
+            code_weights=[1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0])),
+            
     test_cfg=dict(
         pts=dict(
             post_center_limit_range=[-61.2, -61.2, -10.0, 61.2, 61.2, 10.0],
@@ -298,20 +292,21 @@ model = dict(
             pc_range=point_cloud_range[:2],
             nms_type='rotate',
             pre_max_size=1000,
-            post_max_size=200,
-            nms_thr=0.2)))
+            post_max_size=83,
+            nms_thr=0.2))
+)
 
 default_hooks = dict(
     checkpoint=dict(type='CheckpointHook', interval=1, save_best=None),
     visualization=dict(type='Det3DVisualizationHook', draw=False))
 
 train_cfg = dict(max_epochs=20, val_interval=10)
+val_cfg = dict(type='ValLoop')
+test_cfg = dict(type='TestLoop')
 
-# Effective batch size 32: single GPU batch_size=2 × accumulative_counts=16.
-# Base LR 1e-4 from cyclic-20e; the cyclic scheduler peaks at 1e-3 during
-# the first 8-epoch warmup, matching the standard CenterPoint recipe.
+# Effective batch size 32: single GPU batch_size= 8 × accumulative_counts=4
 optim_wrapper = dict(
     type='OptimWrapper',
     optimizer=dict(type='AdamW', lr=1e-4, weight_decay=0.01),
-    accumulative_counts=16,
+    accumulative_counts=4,
     clip_grad=dict(max_norm=35, norm_type=2))
