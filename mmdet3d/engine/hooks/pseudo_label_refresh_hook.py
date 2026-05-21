@@ -38,32 +38,70 @@ class PseudoLabelRefreshHook(Hook):
     On training start the hook checks for existing pkl files from prior runs and
     loads the most recent one whose epoch ≤ ``runner.epoch``.
 
+    Adaptive confidence threshold
+    ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    When ``use_knee_threshold=True`` (default), each epoch the hook:
+
+    1. Runs teacher inference with a broad threshold (``ps_min_score``, default
+       0.05) to collect all candidate boxes.
+    2. Finds the *knee* of the descending score curve (Kneedle method) — the
+       score where the high-confidence tail separates from the dense low-score
+       cluster.
+    3. If the knee threshold would keep fewer than ``min_boxes_kept`` boxes,
+       lowers the threshold to the score at which exactly ``min_boxes_kept``
+       boxes are retained (box-count floor).  This prevents training starvation
+       when teacher confidence collapses globally.
+    4. Updates ``model.mean_teacher_cfg['conf_threshold']`` so the online
+       training path (when the store is empty) uses the same threshold.
+
+    The count floor is the critical design choice: a *score* floor (e.g. 0.30)
+    acts as an aggressive count filter once the score distribution collapses,
+    while a *count* floor guarantees sufficient gradient signal every epoch.
+
     Args:
-        interval (int): Refresh every this many epochs. Default: 4.
+        interval (int): Refresh every this many epochs. Default: 1.
         update_at_epochs (Sequence[int]): Additionally refresh at these specific
             epochs.  Include 0 to refresh before the first training epoch.
             Default: (0,).
         ps_label_subdir (str): Subdirectory under ``work_dir`` for pkl files.
             Default: 'ps_labels'.
         ps_batch_size (int): Batch size for the teacher inference pass.
-            Default: 4.
+            Default: 8.
         ps_num_workers (int): Dataloader workers for the inference pass.
-            Default: 4.
+            Default: 6.
+        use_knee_threshold (bool): If True, use the Kneedle-based adaptive
+            threshold with ``min_boxes_kept`` count floor.  If False, use the
+            fixed ``conf_threshold`` from ``mean_teacher_cfg``.  Default: True.
+        min_boxes_kept (int): Minimum number of pseudo-boxes to retain per
+            epoch.  If the knee threshold would keep fewer boxes, it is lowered
+            until this count is satisfied.  Ignored when
+            ``use_knee_threshold=False``.  Default: 2000.
+        ps_min_score (float): Broad threshold used during the teacher inference
+            pass when ``use_knee_threshold=True``.  Should be low enough to
+            capture the full score distribution (≤ model's test_cfg.score_thr).
+            Acts as the absolute lower bound on the adaptive threshold.
+            Default: 0.05.
     """
 
     def __init__(
         self,
-        interval: int = 4,
+        interval: int = 1,
         update_at_epochs: Sequence[int] = (0,),
         ps_label_subdir: str = 'ps_labels',
-        ps_batch_size: int = 4,
-        ps_num_workers: int = 4,
+        ps_batch_size: int = 8,
+        ps_num_workers: int = 6,
+        use_knee_threshold: bool = True,
+        min_boxes_kept: int = 2000,
+        ps_min_score: float = 0.05,
     ) -> None:
         self.interval = interval
         self.update_at_epochs = list(update_at_epochs)
         self.ps_label_subdir = ps_label_subdir
         self.ps_batch_size = ps_batch_size
         self.ps_num_workers = ps_num_workers
+        self.use_knee_threshold = use_knee_threshold
+        self.min_boxes_kept = min_boxes_kept
+        self.ps_min_score = ps_min_score
 
         self._ps_loader: Optional[DataLoader] = None
 
@@ -102,16 +140,31 @@ class PseudoLabelRefreshHook(Hook):
             shuffle=False,
         )
 
+    def _ps_dir(self, runner: Runner) -> str:
+        """Return the ps_labels directory for the current run (under log_dir)."""
+        return os.path.join(runner.log_dir, self.ps_label_subdir)
+
     def _load_existing_pkl(self, runner: Runner, model) -> None:
-        """Load the most recent ps_label pkl whose epoch <= runner.epoch."""
-        ps_dir = os.path.join(runner.work_dir, self.ps_label_subdir)
-        if not os.path.isdir(ps_dir):
-            return
-        pkls = glob.glob(os.path.join(ps_dir, 'ps_label_e*.pkl'))
+        """Load the most recent ps_label pkl whose epoch <= runner.epoch.
+
+        On a fresh start (runner.epoch == 0) nothing is loaded — the hook will
+        generate labels at epoch 0 as usual.  On resume (runner.epoch > 0) all
+        timestamp subdirectories under work_dir are searched so that the pkl
+        written by the original run is found even though the resumed run has a
+        new log_dir (new timestamp).
+        """
+        start_epoch = runner.epoch
+        if start_epoch == 0:
+            return  # fresh start — let the epoch-0 refresh generate labels
+
+        # Search all <work_dir>/<timestamp>/ps_labels/ dirs so resume finds the
+        # pkl from the previous timestamp directory.
+        search_pattern = os.path.join(
+            runner.work_dir, '*', self.ps_label_subdir, 'ps_label_e*.pkl')
+        pkls = glob.glob(search_pattern)
         if not pkls:
             return
-        # Find the latest pkl with epoch <= start_epoch.
-        start_epoch = runner.epoch
+
         best_epoch, best_path = -1, None
         for path in pkls:
             m = re.search(r'ps_label_e(\d+)\.pkl', path)
@@ -154,7 +207,16 @@ class PseudoLabelRefreshHook(Hook):
         logger.info(
             f'[PseudoLabelRefreshHook] Refreshing pseudo-labels at epoch {epoch}')
 
+        # For adaptive mode, temporarily lower conf_threshold so the inference
+        # pass collects a broad candidate set; we apply the final threshold below.
+        orig_conf_thr = model.mean_teacher_cfg.get('conf_threshold', 0.6)
+        if self.use_knee_threshold:
+            model.mean_teacher_cfg['conf_threshold'] = self.ps_min_score
+
         new_labels = self._run_teacher_inference(model, logger)
+
+        # Restore original threshold — may be overwritten by adaptive logic below.
+        model.mean_teacher_cfg['conf_threshold'] = orig_conf_thr
 
         # DDP: gather all-rank results on rank 0, then broadcast.
         rank, world_size = get_dist_info()
@@ -166,8 +228,15 @@ class PseudoLabelRefreshHook(Hook):
             else:
                 new_labels = {}
 
+        # Compute and apply the adaptive threshold on rank 0 (has full dataset).
+        # Single-rank training: rank == 0, so the condition is always satisfied.
+        adaptive_thr = orig_conf_thr
+        if self.use_knee_threshold and rank == 0:
+            adaptive_thr = self._compute_adaptive_threshold(new_labels, logger)
+            new_labels = self._filter_by_threshold(new_labels, adaptive_thr)
+
         # Rank 0 writes the pkl; all ranks update the model store.
-        ps_dir = os.path.join(runner.work_dir, self.ps_label_subdir)
+        ps_dir = self._ps_dir(runner)
         if rank == 0:
             os.makedirs(ps_dir, exist_ok=True)
             pkl_path = os.path.join(ps_dir, f'ps_label_e{epoch}.pkl')
@@ -178,14 +247,18 @@ class PseudoLabelRefreshHook(Hook):
                 f'to {pkl_path}')
 
         if world_size > 1:
-            # Broadcast the merged dict to non-zero ranks via temp file.
+            # Broadcast the merged (and adaptive-filtered) dict to non-zero ranks.
             import torch.distributed as dist
             if rank == 0:
-                dist.broadcast_object_list([new_labels], src=0)
+                dist.broadcast_object_list([new_labels, adaptive_thr], src=0)
             else:
-                container = [None]
+                container = [None, None]
                 dist.broadcast_object_list(container, src=0)
-                new_labels = container[0]
+                new_labels, adaptive_thr = container[0], container[1]
+
+        # Propagate the adaptive threshold so the online path uses the same cutoff.
+        if self.use_knee_threshold:
+            model.mean_teacher_cfg['conf_threshold'] = adaptive_thr
 
         model.set_pseudo_labels(new_labels)
         self._log_ps_stats(new_labels, logger)
@@ -247,6 +320,91 @@ class PseudoLabelRefreshHook(Hook):
             f'pseudo-boxes across {len(new_labels)} frames '
             f'(conf_threshold={conf_threshold})')
         return new_labels
+
+    @staticmethod
+    def _knee_threshold(scores: np.ndarray) -> float:
+        """Kneedle: score at the elbow of the descending score curve.
+
+        Finds the point of maximum perpendicular distance from the line
+        connecting the first and last points of the normalised descending
+        score curve.  For distributions with a dense low-score cluster and a
+        sparse high-quality tail, this falls at the natural break between them.
+        """
+        sorted_scores = np.sort(scores)[::-1]
+        n = len(sorted_scores)
+        if n < 3:
+            return float(sorted_scores[0]) if n else 0.0
+        x = np.linspace(0, 1, n)
+        s_min, s_max = sorted_scores[-1], sorted_scores[0]
+        y = (sorted_scores - s_min) / (s_max - s_min + 1e-8)
+        p1 = np.array([x[0], y[0]])
+        p2 = np.array([x[-1], y[-1]])
+        line_len = np.linalg.norm(p2 - p1)
+        distances = np.abs(
+            (p2[0] - p1[0]) * (p1[1] - y) - (p1[0] - x) * (p2[1] - p1[1])
+        ) / (line_len + 1e-8)
+        return float(sorted_scores[np.argmax(distances)])
+
+    def _compute_adaptive_threshold(self, new_labels: dict, logger) -> float:
+        """Knee threshold with a box-count floor.
+
+        1. Compute the knee of the descending score curve.
+        2. If fewer than ``min_boxes_kept`` candidates meet the knee threshold,
+           lower it to the score of the ``min_boxes_kept``-th highest-scoring box
+           (count floor).  This prevents training starvation when confidence
+           collapses globally.
+        3. Clamp below by ``ps_min_score`` as an absolute lower bound.
+        """
+        all_scores = []
+        for v in new_labels.values():
+            if len(v['scores']) > 0:
+                all_scores.extend(v['scores'].tolist())
+        if not all_scores:
+            logger.warning(
+                '[PseudoLabelRefreshHook] No candidates for adaptive threshold; '
+                f'using ps_min_score={self.ps_min_score}')
+            return self.ps_min_score
+        all_scores_arr = np.array(all_scores, dtype=np.float32)
+
+        # Step 1: quality threshold from the knee
+        knee_thr = self._knee_threshold(all_scores_arr)
+        n_above_knee = int((all_scores_arr >= knee_thr).sum())
+
+        # Step 2: count floor — if knee keeps too few boxes, lower the threshold
+        floor_triggered = False
+        if n_above_knee < self.min_boxes_kept:
+            floor_triggered = True
+            sorted_desc = np.sort(all_scores_arr)[::-1]
+            if len(sorted_desc) >= self.min_boxes_kept:
+                knee_thr = float(sorted_desc[self.min_boxes_kept - 1])
+            else:
+                knee_thr = float(sorted_desc[-1])  # keep all
+
+        # Step 3: absolute lower bound
+        thr = max(knee_thr, self.ps_min_score)
+        n_kept = int((all_scores_arr >= thr).sum())
+
+        logger.info(
+            f'[PseudoLabelRefreshHook] Adaptive threshold: '
+            f'knee={self._knee_threshold(all_scores_arr):.4f}  →  '
+            f'applied={thr:.4f}  '
+            f'({"count floor" if floor_triggered else "knee"}, '
+            f'kept={n_kept}/{len(all_scores_arr)},'
+            f' min_boxes={self.min_boxes_kept})')
+        return thr
+
+    def _filter_by_threshold(self, new_labels: dict, thr: float) -> dict:
+        """Return a copy of new_labels with boxes scoring below thr removed."""
+        filtered: dict = {}
+        for key, entry in new_labels.items():
+            scores = entry['scores']
+            keep = scores >= thr
+            filtered[key] = {
+                'gt_boxes':  entry['gt_boxes'][keep],
+                'gt_labels': entry['gt_labels'][keep],
+                'scores':    scores[keep],
+            }
+        return filtered
 
     def _log_ps_stats(self, new_labels: dict, logger) -> None:
         counts: list = [v['gt_labels'] for v in new_labels.values() if len(v['gt_labels']) > 0]

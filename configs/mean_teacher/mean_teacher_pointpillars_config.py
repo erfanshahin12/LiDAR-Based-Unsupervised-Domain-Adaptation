@@ -18,6 +18,8 @@ classes_kitti = ['Car']
 box_origin_target = (0.5, 0.5, 0)        # KITTI box origin
 metainfo_target = dict(classes=classes_kitti, origin=box_origin_target)
 
+z_domain_offset = 0.11   # nuScenes sensor 1.84 m − KITTI sensor 1.73 m
+
 hard_instance_bank_path = './configs/mean_teacher/hard_instance_bank/hard_instance_bank_nuscenes_quantile_kitti_20.pkl'
 pretrained_ckpt = './work_dirs/baseline_pointpillars_5may/epoch_24.pth'
 
@@ -275,15 +277,15 @@ model = dict(
     mean_teacher_cfg=dict(
                      point_cloud_range=point_cloud_range,
                      ema_momentum=0.999,
-                     update_teacher_buffers=True,       # required with use_dsnorm: teacher is always in eval,
-                                                        # so its DSNorm running stats only update via EMA copy
+                     update_teacher_buffers=False,      # teacher updates its own DSNorm target stats via .train()
+                                                        # on weak-aug KITTI; EMA of stats would contaminate with
+                                                        # student's strong-aug stats causing confidence collapse
                      use_bev_consistency=True,
                      tau=0.07,
-                     conf_threshold=0.3,
-                     source_loss_weight=0.0,
-                     target_loss_weight=0.2,
-                     contrastive_weight=0.2,
-                     burn_in_iters=0,
+                     conf_threshold=0.30,   # starting value; overwritten each epoch by PseudoLabelRefreshHook knee threshold
+                     source_loss_weight=1.0,
+                     target_loss_weight=0.5,
+                     contrastive_weight=0.05,
                      min_pseudo_per_sample=0,
                      verbose=True,
                      eval_use_teacher=True,
@@ -408,11 +410,11 @@ model = dict(
         test_cfg=dict(
             use_rotate_nms=True,
             nms_across_levels=False,
-            nms_thr=0.05,
-            score_thr=0.05,
+            nms_thr=0.01,
+            score_thr=0.1,
             min_bbox_size=0,
-            nms_pre=500,
-            max_num=250)))
+            nms_pre=200,
+            max_num=100)))
 
 # Runtime configs
 # Hooks
@@ -424,15 +426,21 @@ custom_hooks = [
     dict(type='MeanTeacherHook', interval=1),
     dict(
         type='PseudoLabelRefreshHook',
-        interval=4,             # re-run teacher every 4 epochs
+        interval=1,             # re-run teacher every 1 epochs
         update_at_epochs=(0,),  # always refresh before epoch 0 starts
-        ps_batch_size=4,
-        ps_num_workers=4,
+        ps_batch_size=8,
+        ps_num_workers=6,
+        # Knee threshold + count floor: finds the natural quality break in the
+        # score distribution (Kneedle), but always retains at least min_boxes_kept
+        # boxes to prevent training starvation when teacher confidence collapses.
+        use_knee_threshold=True,
+        min_boxes_kept=2000,
+        ps_min_score=0.05,
     ),
 ]
 
 # Scheduler and optimizer config
-train_cfg = dict(type='EpochBasedTrainLoop', max_epochs=24, val_interval=4)
+train_cfg = dict(type='EpochBasedTrainLoop', max_epochs=4, val_interval=1)
 
 # Gradient accumulation with 8 steps to achieve effective batch size of 32 (8 x 4)
 optim_wrapper = dict(type='OptimWrapper',

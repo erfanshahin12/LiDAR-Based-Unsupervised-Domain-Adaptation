@@ -44,8 +44,6 @@ class MeanTeacher3DDetector(Base3DDetector):
             - ``contrastive_weight`` (float, 0.1): Weight on the contrastive loss.
             - ``use_bev_consistency`` (bool, True): Enable the contrastive loss term.
             - ``tau`` (float, 0.07): InfoNCE temperature.
-            - ``burn_in_iters`` (int, 0): Skip target + contrastive losses for the
-              first N iterations (teacher is too close to student to be useful).
             - ``min_pseudo_per_sample`` (int, 0): Discard samples with fewer
               pseudo-boxes than this (avoids noisy gradients on empty scenes).
             - ``verbose`` (bool, False): Enable per-iter debug logging.
@@ -69,7 +67,6 @@ class MeanTeacher3DDetector(Base3DDetector):
                      source_loss_weight=1.0,
                      target_loss_weight=0.5,
                      contrastive_weight=0.1,
-                     burn_in_iters=0,
                      min_pseudo_per_sample=0,
                      verbose=False,
                      eval_use_teacher=True,
@@ -113,7 +110,7 @@ class MeanTeacher3DDetector(Base3DDetector):
             f'ema_momentum={mean_teacher_cfg.get("ema_momentum", 0.999)}, '
             f'update_teacher_buffers={mean_teacher_cfg.get("update_teacher_buffers", False)}, '
             f'eval_use_teacher={mean_teacher_cfg.get("eval_use_teacher", True)}, '
-            f'burn_in_iters={mean_teacher_cfg.get("burn_in_iters", 0)}')
+            f'burn_in_iters={mean_teacher_cfg.get("burn_in_iters", 0)} ')
 
     # ------------------------------------------------------------------
     # Load pretrained weights to both student and teacher at initialization
@@ -568,7 +565,11 @@ class MeanTeacher3DDetector(Base3DDetector):
         else:
             boxes_tensor = boxes.clone()
 
-        origin = metainfo_strong.get('box_origin', (0.5, 0.5, 0.5))
+        # boxes_tensor is always in LiDARInstance3DBoxes internal format
+        # (z = bottom-center, origin=(0.5,0.5,0)).  Do NOT read 'box_origin'
+        # from metainfo here: Pack3DDetInputs never stores that key, so the
+        # old default (0.5,0.5,0.5) silently applied a spurious -h/2 z-shift
+        # on every call, causing pseudo-label z to drift downward during training.
         device = boxes_tensor.device
 
         # ── rotation ────────────────────────────────────────────────
@@ -642,8 +643,8 @@ class MeanTeacher3DDetector(Base3DDetector):
             torch.sin(boxes_tensor[:, 6]),
             torch.cos(boxes_tensor[:, 6]))
 
-        return LiDARInstance3DBoxes(
-            boxes_tensor, box_dim=boxes_tensor.shape[-1], origin=origin)
+        # Use default origin=(0.5,0.5,0): boxes_tensor already has z at bottom-center.
+        return LiDARInstance3DBoxes(boxes_tensor, box_dim=boxes_tensor.shape[-1])
 
     # ------------------------------------------------------------------
     # Pseudo-label construction
@@ -712,13 +713,10 @@ class MeanTeacher3DDetector(Base3DDetector):
           1. Supervised source loss (student on labeled data).
           2. Pseudo-label loss (student on unlabeled target with teacher GT).
           3. InfoNCE BEV contrastive loss (student vs teacher features).
-
-        Terms 2 and 3 are skipped for the first ``burn_in_iters`` iterations.
         """
         w_source = self.mean_teacher_cfg.get('source_loss_weight', 1.0)
         w_target = self.mean_teacher_cfg.get('target_loss_weight', 0.5)
         w_cont   = self.mean_teacher_cfg.get('contrastive_weight', 0.1)
-        burn_in  = self.mean_teacher_cfg.get('burn_in_iters', 0)
         verbose  = self.mean_teacher_cfg.get('verbose', False)
         _use_dsnorm = self.mean_teacher_cfg.get('use_dsnorm', False)
 
@@ -730,7 +728,6 @@ class MeanTeacher3DDetector(Base3DDetector):
                 pass
 
         self._train_iter += 1
-        past_burnin = self._train_iter > burn_in
 
         device = next(self.student.parameters()).device
         logger = MMLogger.get_current_instance()
@@ -775,7 +772,7 @@ class MeanTeacher3DDetector(Base3DDetector):
 
         # ── Teacher forward on weak-augmented target ─────────────────
         _ds_switch(self.teacher, 'target')
-        self.teacher.eval()
+        self.teacher.train()
         with torch.no_grad():
             teacher_pred = self.teacher.predict(
                 target_weak_in, target_samp_weak,
@@ -820,31 +817,30 @@ class MeanTeacher3DDetector(Base3DDetector):
 
         use_bev = self.mean_teacher_cfg.get('use_bev_consistency', False)
 
-        if past_burnin:
-            _ds_switch(self.student, 'target')
-            if use_bev and w_cont > 0:
-                # Single forward: get neck features + BEV map in one pass.
-                x_strong, bev_features_student = self.student.extract_feat(
-                    target_strong_in, return_bev=True)
-                if w_target > 0:
-                    loss_target = self.student.bbox_head.loss(x_strong, pseudo_samples)
-                    for key, value in loss_target.items():
-                        if isinstance(value, (list, tuple)):
-                            losses[f'{key}_target'] = [v * w_target for v in value]
-                        else:
-                            losses[f'{key}_target'] = value * w_target
-            else:
-                bev_features_student = None
-                if w_target > 0:
-                    loss_target = self.student.loss(target_strong_in, pseudo_samples)
-                    for key, value in loss_target.items():
-                        if isinstance(value, (list, tuple)):
-                            losses[f'{key}_target'] = [v * w_target for v in value]
-                        else:
-                            losses[f'{key}_target'] = value * w_target
+        _ds_switch(self.student, 'target')
+        if use_bev and w_cont > 0:
+            # Single forward: get neck features + BEV map in one pass.
+            x_strong, bev_features_student = self.student.extract_feat(
+                target_strong_in, return_bev=True)
+            if w_target > 0:
+                loss_target = self.student.bbox_head.loss(x_strong, pseudo_samples)
+                for key, value in loss_target.items():
+                    if isinstance(value, (list, tuple)):
+                        losses[f'{key}_target'] = [v * w_target for v in value]
+                    else:
+                        losses[f'{key}_target'] = value * w_target
+        else:
+            bev_features_student = None
+            if w_target > 0:
+                loss_target = self.student.loss(target_strong_in, pseudo_samples)
+                for key, value in loss_target.items():
+                    if isinstance(value, (list, tuple)):
+                        losses[f'{key}_target'] = [v * w_target for v in value]
+                    else:
+                        losses[f'{key}_target'] = value * w_target
 
         # ── TERM 3: BEV contrastive loss ──────────────────────────────
-        if use_bev and w_cont > 0 and past_burnin:
+        if use_bev and w_cont > 0:
             loss_cont_total = torch.tensor(0., device=device)
             n_valid = 0
 

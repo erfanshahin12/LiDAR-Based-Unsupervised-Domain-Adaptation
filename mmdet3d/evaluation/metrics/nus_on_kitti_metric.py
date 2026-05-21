@@ -82,8 +82,9 @@ class NusOnKittiMetric(KittiMetric):
         t = bboxes_3d.tensor.clone()
         x = t[:, 0].clone()
         y = t[:, 1].clone()
-        t[:, 0] = y            # x_kitti = y_nus
-        t[:, 1] = -x           # y_kitti = -x_nus
+        t[:, 0] = y             # x_kitti = y_nus
+        t[:, 1] = -x            # y_kitti = -x_nus
+        t[:, 2] -= 0.11         # remove sensor height shift to get back to KITTI z
         # l, w (indices 3, 4) unchanged
         t[:, 6] = t[:, 6] - np.pi / 2  # yaw_kitti = yaw_nus - π/2
         return LiDARInstance3DBoxes(t, box_dim=7, origin=(0.5, 0.5, 0))

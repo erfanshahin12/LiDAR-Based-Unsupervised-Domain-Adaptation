@@ -1,20 +1,21 @@
-python tools/train.py configs/mean_teacher/mean_teacher_pointpillars_config.py --work-dir work_dirs/mt_smoke_test_09may --cfg-options pretrained_ckpt=./work_dirs/baseline_pointpillars_5may/epoch_24.pth
+python tools/train.py configs/mean_teacher/mean_teacher_pointpillars_config.py --work-dir work_dirs/mt_smoke_test_09may
 
 python tools/train.py configs/mean_teacher/mt_pretrain_pointpillars_config.py --work-dir work_dirs/pretrain_05may_full_pcl_range
 
 python tools/train.py configs/mean_teacher/mt_pretrain_centerpoint_config.py --work-dir work_dirs/pretrain_centerpoint_05may
 
-python tools/test.py \
-    work_dirs/pretrain_centerpoint_18may/mt_pretrain_centerpoint_config.py \
-    work_dirs/pretrain_centerpoint_18may/epoch_3.pth \
-    --work-dir work_dirs/test_pretrain_18may \
-    --score-thr 0.1\
-    --task lidar_det
 
 python tools/test.py \
     configs/mean_teacher/test_kitti_nuspretrained_centerpoint.py \
     work_dirs/baseline_centerpoint_18may/epoch_20.pth \
     --work-dir work_dirs/baseline_centerpoint_18may/test_kitti \
+    --score-thr 0.05\
+    --task lidar_det
+
+python tools/test.py \
+    configs/mean_teacher/mean_teacher_pointpillars_config.py \
+    work_dirs/mt_pointpillars_20may/epoch_1.pth \
+    --work-dir work_dirs/mt_pointpillars_20may/test_kitti \
     --score-thr 0.05\
     --task lidar_det
 
