@@ -25,6 +25,7 @@ from .transform_KittiToNus import KittiToNuscenes
 from .transform_NusToKitti import NuscenesToKitti
 from .class_remap import (ClassRemap, ClassRemapWithLabel)
 from .hard_instance_mining import (HardInstanceBank, HardInstanceSampling, build_hard_instance_bank)
+from .random_object_scaling import RandomObjectScaling
 
 __all__ = [
     'ObjectSample', 'RandomFlip3D', 'ObjectNoise', 'GlobalRotScaleTrans',
@@ -43,4 +44,5 @@ __all__ = [
     #'LoadEmptyAnnotations3D', 'MultiBranch3D',                                     # custom made
     'KittiToNuscenes', 'NuscenesToKitti', 'ClassRemap', 'ClassRemapWithLabel',      # custom made
     'HardInstanceBank', 'HardInstanceSampling', 'build_hard_instance_bank',         # custom made
+    'RandomObjectScaling',                                                           # custom made
 ]

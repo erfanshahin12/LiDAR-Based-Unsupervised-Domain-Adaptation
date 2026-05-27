@@ -18,10 +18,9 @@ classes_kitti = ['Car']
 box_origin_target = (0.5, 0.5, 0)        # KITTI box origin
 metainfo_target = dict(classes=classes_kitti, origin=box_origin_target)
 
-z_domain_offset = 0.11   # nuScenes sensor 1.84 m − KITTI sensor 1.73 m
-
 hard_instance_bank_path = './configs/mean_teacher/hard_instance_bank/hard_instance_bank_nuscenes_quantile_kitti_20.pkl'
-pretrained_ckpt = './work_dirs/baseline_pointpillars_5may/epoch_24.pth'
+# pretrained_ckpt = './work_dirs/baseline_pointpillars_5may/epoch_24.pth'
+pretrained_ckpt = './work_dirs/iou_head_finetune/epoch_6.pth'    # iou head trained separately
 
 # point_cloud_range = [-50.40, -50.40, -5, 50.40, 50.40, 3]   # nuScenes point cloud range
 point_cloud_range = [-50.40, -50.40, -5, 50.40, 50.40, 3]
@@ -69,7 +68,12 @@ source_pipeline = [     # nuScenes         # supervised training on source data
             },
             class_names=classes_kitti,
             keep_unmapped=False),  # Drop all non-Car classes
-   dict(
+    dict(
+        type='RandomObjectScaling',
+        scale_range=[0.75, 1.0],   # shrink nuScenes Cars toward KITTI size
+        num_try=50,
+        class_names=['Car']),
+    dict(
         type='GlobalRotScaleTrans',
         rot_range=[-0.3925, 0.3925],        # +/- 22.5 degrees
         scale_ratio_range=[0.95, 1.05],
@@ -255,7 +259,7 @@ val_evaluator = dict(
     type='NusOnKittiMetric',
     ann_file=target_data_root + ann_file_target_val,
     metric='bbox',
-    pcd_limit_range=[0, -40, -3, 70.4, 40, 0],
+    pcd_limit_range=point_cloud_range,
     label_mapping=None,
     default_cam_key='CAM2',
     backend_args=backend_args)
@@ -282,14 +286,21 @@ model = dict(
                                                         # student's strong-aug stats causing confidence collapse
                      use_bev_consistency=True,
                      tau=0.07,
-                     conf_threshold=0.30,   # starting value; overwritten each epoch by PseudoLabelRefreshHook knee threshold
+                     # NOTE: no static ``conf_threshold`` for teacher here on purpose.
+                     # PseudoLabelRefreshHook writes the kneedle + count-floor threshold
+                     # into mean_teacher_cfg['conf_threshold'] before running iters of every epoch
                      source_loss_weight=1.0,
-                     target_loss_weight=0.5,
+                     target_loss_weight=1.0,
                      contrastive_weight=0.05,
-                     min_pseudo_per_sample=0,
                      verbose=True,
                      eval_use_teacher=True,
                      use_dsnorm=True,
+                     # Hybrid IoU pseudo-label scoring. The detector filters teacher predictions
+                     # with ``hybrid = w_iou * iou + (1 - w_iou) * cls`` after  ``iou_warmup_iters`
+                     # of student iterations; before that it falls back to cls-only.
+                     # Setting ``hybrid_w_iou=0`` disables hybrid scoring.
+                     hybrid_w_iou=0.7,
+                    #  iou_warmup_iters=2000,
                  ),
     pretrained_ckpt=pretrained_ckpt,
 
@@ -357,7 +368,7 @@ model = dict(
                 #     [0, -50.40, -1.78, 68.80, 50.40, -1.78]     # Car
                 # ],
                 sizes=[
-                    [4.60, 1.95, 1.72],         # Car
+                    [4.2, 2.0, 1.6],         # Car
                     # [0.72, 0.66, 1.76],           # Pedestrian    
                     # [1.68, 0.6, 1.27]           # Cyclist
                 ],
@@ -376,7 +387,15 @@ model = dict(
                 type='mmdet.SmoothL1Loss', beta=1.0 / 9.0, loss_weight=1.5),
             loss_dir=dict(
                 type='mmdet.CrossEntropyLoss', use_sigmoid=False,
-                loss_weight=0.2)),
+                loss_weight=0.2),
+            # Per-anchor IoU regression head. Loss is BCE-with-logits
+            # against the actual 3D IoU between decoded prediction and assigned
+            # GT (positives only). Random-init at adaptation time — the
+            # detector's ``filter_teacher_predictions`` runs cls-only filtering
+            # during the ``iou_warmup_iters`` set in mean_teacher_cfg above,
+            # then switches to hybrid scoring once this head is trained up.
+            predict_iou=True,
+            loss_iou_weight=1.0),
     
         # model training and testing settings
         train_cfg=dict(
@@ -414,12 +433,16 @@ model = dict(
             score_thr=0.1,
             min_bbox_size=0,
             nms_pre=200,
-            max_num=100)))
+            max_num=100,
+            # Hybrid-IoU ranking at val/test (ST3D POST_PROCESSING.SCORE_TYPE
+            # analog). Independent from mean_teacher_cfg.hybrid_w_iou.
+            score_type='hybrid',
+            score_weights=dict(iou=0.7, cls=0.3))))
 
 # Runtime configs
 # Hooks
 default_hooks = dict(
-    checkpoint=dict(type='CheckpointHook', interval=1, save_best=None),
+    checkpoint=dict(type='CheckpointHook', interval=2, save_best=None),
     visualization=dict(type='Det3DVisualizationHook', draw=False)
 )
 custom_hooks = [
@@ -434,16 +457,25 @@ custom_hooks = [
         # score distribution (Kneedle), but always retains at least min_boxes_kept
         # boxes to prevent training starvation when teacher confidence collapses.
         use_knee_threshold=True,
-        min_boxes_kept=2000,
+        min_boxes_kept=8000,
         ps_min_score=0.05,
+        # Hybrid filter already drops poorly-localised boxes; the fallback
+        # would re-inject them as pseudo-GT and poison the student.
+        use_top1_fallback=False,
+        # Dimension recalibration: scale pseudo-box l/w/h from nuScenes anchor
+        # bias toward KITTI car statistics.
+        # Factors = KITTI median / nuScenes median: [3.90/4.575, 1.63/1.946, 1.50/1.704]
+        apply_dim_scaling=False,
+        dim_scale_factors=[0.852, 0.838, 0.880],
     ),
 ]
 
 # Scheduler and optimizer config
-train_cfg = dict(type='EpochBasedTrainLoop', max_epochs=4, val_interval=1)
+train_cfg = dict(type='EpochBasedTrainLoop', max_epochs=12, val_interval=1)
 
 # Gradient accumulation with 8 steps to achieve effective batch size of 32 (8 x 4)
-optim_wrapper = dict(type='OptimWrapper',
+optim_wrapper = dict(type='AmpOptimWrapper',
+                     loss_scale='dynamic',
                      optimizer=dict(type='AdamW', lr=0.001, weight_decay=0.01),
                      accumulative_counts=4,
                      clip_grad=dict(max_norm=35, norm_type=2))

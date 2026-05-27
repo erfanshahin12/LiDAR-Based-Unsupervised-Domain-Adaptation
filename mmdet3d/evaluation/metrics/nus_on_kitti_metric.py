@@ -68,7 +68,7 @@ class NusOnKittiMetric(KittiMetric):
             x_nus = -y_kitti,  y_nus = x_kitti
             yaw_nus = yaw_kitti + π/2
             l, w unchanged (box-local dims are frame-independent)
-            z_nus = z_kitti + h/2  (bottom-center → gravity-center, GT only)
+            z_nus = z_kitti - 0.11 + h/2  (bottom-center → gravity-center + sensor alignment, GT only)
 
         Model predictions use the standard mmdet3d bottom-center convention
         (origin=(0.5, 0.5, 0)), so no z-shift is applied here.
@@ -84,7 +84,7 @@ class NusOnKittiMetric(KittiMetric):
         y = t[:, 1].clone()
         t[:, 0] = y             # x_kitti = y_nus
         t[:, 1] = -x            # y_kitti = -x_nus
-        t[:, 2] -= 0.11         # remove sensor height shift to get back to KITTI z
+        t[:, 2] += 0.11         # undo sensor height alignment: nuScenes z → KITTI z
         # l, w (indices 3, 4) unchanged
         t[:, 6] = t[:, 6] - np.pi / 2  # yaw_kitti = yaw_nus - π/2
         return LiDARInstance3DBoxes(t, box_dim=7, origin=(0.5, 0.5, 0))

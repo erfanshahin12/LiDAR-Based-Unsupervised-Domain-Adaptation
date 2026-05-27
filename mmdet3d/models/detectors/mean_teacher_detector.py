@@ -37,16 +37,26 @@ class MeanTeacher3DDetector(Base3DDetector):
             - ``update_teacher_buffers`` (bool, True): Also EMA BN buffers.
             - ``point_cloud_range`` (list): [x_min, y_min, z_min, x_max, y_max, z_max].
               Used to normalise box centres to [-1, 1] for BEV feature sampling.
-            - ``conf_threshold`` (float, 0.6): Teacher confidence threshold for
-              pseudo-label filtering.
             - ``source_loss_weight`` (float, 1.0): Weight on the supervised source loss.
             - ``target_loss_weight`` (float, 0.5): Weight on the pseudo-label loss.
             - ``contrastive_weight`` (float, 0.1): Weight on the contrastive loss.
             - ``use_bev_consistency`` (bool, True): Enable the contrastive loss term.
             - ``tau`` (float, 0.07): InfoNCE temperature.
-            - ``min_pseudo_per_sample`` (int, 0): Discard samples with fewer
-              pseudo-boxes than this (avoids noisy gradients on empty scenes).
             - ``verbose`` (bool, False): Enable per-iter debug logging.
+            - ``hybrid_w_iou`` (float, 0.0): Target weight on the IoU head in
+              the hybrid pseudo-label score ``w_iou * iou + (1 - w_iou) * cls``.
+              0 disables hybrid scoring (cls-only filtering).
+            - ``iou_warmup_iters`` (int, 0): Number of student iterations to
+              run cls-only filtering before the IoU head's score gates
+              pseudo-labels — gives the randomly-initialised IoU head time to
+              learn before it gets a say.
+
+            Note: ``conf_threshold`` is NOT a user-facing config key.
+            ``PseudoLabelRefreshHook`` writes the kneedle + count-floor
+            threshold into ``mean_teacher_cfg['conf_threshold']`` at the start
+            of every refresh epoch; the detector reads it from there. Setting
+            it in the config has no lasting effect — it will be overwritten
+            before the first training iter of epoch 0.
 
         pretrained_ckpt (str, optional): Path to a checkpoint to initialise the
             student (and thus the teacher) before training begins.
@@ -63,11 +73,9 @@ class MeanTeacher3DDetector(Base3DDetector):
                      update_teacher_buffers=False,
                      use_bev_consistency=True,
                      tau=0.07,
-                     conf_threshold=0.3,
                      source_loss_weight=1.0,
                      target_loss_weight=0.5,
                      contrastive_weight=0.1,
-                     min_pseudo_per_sample=0,
                      verbose=False,
                      eval_use_teacher=True,
                      use_dsnorm=False,
@@ -121,11 +129,20 @@ class MeanTeacher3DDetector(Base3DDetector):
 
         if self.pretrained_ckpt is not None:
 
+            # Keys allowed to be missing from a pretrain checkpoint.  Hybrid thresholding's
+            # IoU head (``bbox_head.conv_iou.*``) is added at adaptation time
+            # and therefore expected to be absent from pretrain w/o IoU head.
+            hybrid_iou_prefix = 'bbox_head.conv_iou.'
+
             def _check_loaded_keys(missing, unexpected):
                 # Guard against silent partial loads in core layers (e.g. num_classes mismatch).
                 critical_prefixes = (
                     'bbox_head.', 'voxel_encoder.', 'middle_encoder.', 'backbone.', 'neck.')
-                critical_missing    = [k for k in missing    if k.startswith(critical_prefixes)]
+                critical_missing    = [
+                    k for k in missing
+                    if k.startswith(critical_prefixes)
+                    and not k.startswith(hybrid_iou_prefix)
+                ]
                 critical_unexpected = [k for k in unexpected if k.startswith(critical_prefixes)]
                 if critical_missing or critical_unexpected:
                     raise RuntimeError(
@@ -135,6 +152,14 @@ class MeanTeacher3DDetector(Base3DDetector):
                         f'  unexpected (ckpt has, model lacks): {critical_unexpected}\n'
                         f'Check that num_classes, anchor sizes, and head architecture match '
                         f'between this config and {self.pretrained_ckpt}.')
+                # Surface (but don't fail on) IoU-head keys so it's
+                # visible in the log that random init was used.
+                hybrid_keys = [k for k in missing if k.startswith(hybrid_iou_prefix)]
+                if hybrid_keys:
+                    MMLogger.get_current_instance().info(
+                        f'  [Hybrid IoU] {len(hybrid_keys)} IoU-head keys absent from '
+                        f'checkpoint — randomly initialised at adaptation time: '
+                        f'{hybrid_keys}')
 
             device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
             checkpoint = torch.load(self.pretrained_ckpt, map_location=device)
@@ -226,7 +251,6 @@ class MeanTeacher3DDetector(Base3DDetector):
         Samples missing from the store contribute zero gradient (empty GT).
         """
         verbose = self.mean_teacher_cfg.get('verbose', False)
-        min_pseudo = self.mean_teacher_cfg.get('min_pseudo_per_sample', 0)
         logger = MMLogger.get_current_instance()
 
         pseudo_labeled_samples = copy.deepcopy(target_samp_strong)
@@ -246,11 +270,6 @@ class MeanTeacher3DDetector(Base3DDetector):
 
                 boxes_3d = LiDARInstance3DBoxes(boxes_t)
                 boxes_3d = self._transform_boxes(boxes_3d, samp_strong.metainfo)
-
-                if len(boxes_3d) < min_pseudo:
-                    boxes_3d = boxes_3d[:0]
-                    labels_t = labels_t[:0]
-                    scores_t = scores_t[:0]
             else:
                 boxes_3d = LiDARInstance3DBoxes(
                     torch.zeros(0, 7, device=device))
@@ -277,8 +296,37 @@ class MeanTeacher3DDetector(Base3DDetector):
     # Teacher prediction filtering
     # ------------------------------------------------------------------
 
+    def _hybrid_effective_w_iou(self) -> float:
+        """Effective IoU weight in the hybrid pseudo-label score.
+
+        Linearly: ``hybrid = w_iou * iou + (1 - w_iou) * cls``.  Returns 0
+        (cls-only filtering) until ``self._train_iter`` reaches
+        ``iou_warmup_iters``, then the configured ``hybrid_w_iou`` target.
+        This way the randomly-initialised IoU head can train before its
+        score actually gates pseudo-labels.
+
+        Both ``hybrid_w_iou`` and ``iou_warmup_iters`` live in
+        ``mean_teacher_cfg``; the absence of ``hybrid_w_iou`` (or value 0)
+        disables hybrid scoring entirely.
+        """
+        target = float(self.mean_teacher_cfg.get('hybrid_w_iou', 0.0))
+        if target <= 0.0:
+            return 0.0
+        warmup = int(self.mean_teacher_cfg.get('iou_warmup_iters', 0))
+        if self._train_iter < warmup:
+            return 0.0
+        return target
+
     def filter_teacher_predictions(self, teacher_pred):
         """Keep only high-confidence teacher detections for pseudo-labelling.
+
+        Hybrid thresholding: when the bbox head emits ``iou_scores_3d`` and
+        the effective IoU weight is > 0 (after the warmup period configured
+        via ``mean_teacher_cfg``), the threshold is applied to the hybrid
+        score ``w_iou * iou + (1 - w_iou) * cls`` instead of cls alone, and
+        the hybrid value is written back into ``scores_3d`` so every
+        downstream path (online filter, pseudo-label store, kneedle
+        threshold) thresholds the same quantity.
 
         Args:
             teacher_pred: Single-sample prediction object with ``pred_instances_3d``.
@@ -289,20 +337,28 @@ class MeanTeacher3DDetector(Base3DDetector):
         """
         verbose = self.mean_teacher_cfg.get('verbose', False)
         conf_threshold = self.mean_teacher_cfg.get('conf_threshold', 0.6)
+        w_iou_eff = self._hybrid_effective_w_iou()
 
         scores = teacher_pred.pred_instances_3d.scores_3d
         labels = teacher_pred.pred_instances_3d.labels_3d
         bboxes = teacher_pred.pred_instances_3d.bboxes_3d
+        iou_scores = getattr(
+            teacher_pred.pred_instances_3d, 'iou_scores_3d', None)
 
         if scores is None:
             return teacher_pred
 
-        mask = scores >= conf_threshold
+        if iou_scores is not None and w_iou_eff > 0:
+            hybrid = w_iou_eff * iou_scores + (1.0 - w_iou_eff) * scores
+        else:
+            hybrid = scores
+
+        mask = hybrid >= conf_threshold
 
         filtered_pred = copy.copy(teacher_pred)
         filtered_pred.pred_instances_3d = InstanceData(
             bboxes_3d=bboxes[mask],
-            scores_3d=scores[mask],
+            scores_3d=hybrid[mask],
             labels_3d=labels[mask],
         )
         if hasattr(teacher_pred, 'bev_features'):
@@ -384,7 +440,7 @@ class MeanTeacher3DDetector(Base3DDetector):
                         head = model.bbox_head
                         if hasattr(head, 'forward_single'):
                             for feat in x:
-                                cls, _, _ = head.forward_single(feat)
+                                cls, *_ = head.forward_single(feat)
                                 cls_scores_raw.append(cls.sigmoid().cpu())
                         else:
                             outs = head(x)
@@ -653,9 +709,6 @@ class MeanTeacher3DDetector(Base3DDetector):
     def _create_pseudo_labels(self, teacher_predictions, target_samples_strong):
         """Replace ``gt_instances_3d`` in each strong-aug sample with teacher predictions.
 
-        Samples whose pseudo-box count is below ``min_pseudo_per_sample`` receive
-        an empty GT so they contribute zero gradient rather than noisy gradient.
-
         Args:
             teacher_predictions: Filtered + box-transformed teacher preds.
             target_samples_strong: Strongly augmented samples (already preprocessed).
@@ -664,7 +717,6 @@ class MeanTeacher3DDetector(Base3DDetector):
             Deep-copied samples with updated ``gt_instances_3d``.
         """
         verbose = self.mean_teacher_cfg.get('verbose', False)
-        min_pseudo = self.mean_teacher_cfg.get('min_pseudo_per_sample', 0)
         logger = MMLogger.get_current_instance()
 
         pseudo_labeled_samples = copy.deepcopy(target_samples_strong)
@@ -675,11 +727,6 @@ class MeanTeacher3DDetector(Base3DDetector):
             boxes  = instance.bboxes_3d
             labels = instance.labels_3d
             scores = instance.scores_3d if hasattr(instance, 'scores_3d') else None
-
-            if len(boxes) < min_pseudo:
-                boxes  = boxes[:0]
-                labels = labels[:0]
-                scores = scores[:0] if scores is not None else None
 
             total_boxes += len(boxes)
             gt = InstanceData(bboxes_3d=boxes, labels_3d=labels)
@@ -697,8 +744,7 @@ class MeanTeacher3DDetector(Base3DDetector):
                 f'total={total_boxes}')
         if total_boxes == 0:
             logger.warning(
-                '[PseudoLabels] No pseudo-labels kept '
-                '(all filtered out or below min_pseudo_per_sample)')
+                '[PseudoLabels] No pseudo-labels kept (all filtered out)')
 
         return pseudo_labeled_samples
 

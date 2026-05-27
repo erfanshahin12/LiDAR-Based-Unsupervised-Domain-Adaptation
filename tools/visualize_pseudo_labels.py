@@ -161,14 +161,18 @@ def load_points_nus(bin_path: str) -> np.ndarray:
     KITTI: +X forward, +Y left, +Z up
     nuScenes: +X right, +Y forward, +Z up  →  x_n = -y_k, y_n = x_k
 
+    Also subtracts 0.11 m from z to align KITTI ground (−1.73 m, sensor 1.73 m
+    above ground) to nuScenes ground (−1.84 m, sensor 1.84 m above ground),
+    mirroring KittiToNuscenes.transform applied in the training pipeline.
+
     Intensity is also scaled [0,1] → [0,255] to match nuScenes convention.
     Returns (M, 4) float32 [x, y, z, intensity] in nuScenes frame.
     """
     pts = np.fromfile(bin_path, dtype=np.float32).reshape(-1, 4)
     pts_nus = np.empty_like(pts)
-    pts_nus[:, 0] = -pts[:, 1]      # x_nus = -y_kitti
-    pts_nus[:, 1] = pts[:, 0]       # y_nus =  x_kitti
-    pts_nus[:, 2] = pts[:, 2]       # z unchanged
+    pts_nus[:, 0] = -pts[:, 1]          # x_nus = -y_kitti
+    pts_nus[:, 1] = pts[:, 0]           # y_nus =  x_kitti
+    pts_nus[:, 2] = pts[:, 2] - 0.11    # align KITTI ground (−1.73) to nuScenes (−1.84)
     pts_nus[:, 3] = pts[:, 3] * 255.0
     return pts_nus
 
@@ -384,12 +388,12 @@ def render_bev(pts_nus: np.ndarray,
     ax_bev.set_ylim(pts_nus[:, 1].min() - margin, pts_nus[:, 1].max() + margin)
 
     # ── Side-view panel styling ──
-    # Ground reference: KITTI LiDAR sensor is ~1.73 m above ground, so
-    # z_ground ≈ −1.73 m in KITTI/nuScenes LiDAR frame. A correctly placed
-    # car has its bottom edge at this line; pseudo-labels dipping well below
-    # indicate the z-axis domain gap.
-    ax_side.axhline(-1.73, color='white', linestyle=':', linewidth=0.8,
-                    alpha=0.5, label='ground ref z≈−1.73 m')
+    # Ground reference: after KittiToNuscenes shifts KITTI z by −0.11 m,
+    # ground sits at z ≈ −1.84 m (nuScenes sensor height convention).
+    # A correctly placed car has its bottom edge at this line; boxes well
+    # below indicate a residual z-axis domain gap.
+    ax_side.axhline(-1.84, color='white', linestyle=':', linewidth=0.8,
+                    alpha=0.5, label='ground ref z≈−1.84 m')
     ax_side.legend(loc='upper right', fontsize=8,
                    facecolor='#222222', edgecolor='white', labelcolor='white')
     ax_side.set_title(

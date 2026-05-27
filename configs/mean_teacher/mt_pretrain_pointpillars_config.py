@@ -62,7 +62,12 @@ train_pipeline = [       # nuScenes
             },
             class_names=metainfo['classes'],
             keep_unmapped=False),  # Keep or Drop unmapped classes like 'trailer', 'barrier'
-   dict(
+    dict(
+        type='RandomObjectScaling',
+        scale_range=[0.75, 1.0],   # shrink nuScenes Cars toward KITTI size
+        num_try=50,
+        class_names=['Car']),
+    dict(
         type='GlobalRotScaleTrans',
         rot_range=[-0.3925, 0.3925],        # +/- 22.5 degrees
         scale_ratio_range=[0.95, 1.05],
@@ -200,7 +205,7 @@ train_dataloader = dict(
 
 val_dataloader = dict(
     batch_size=1,
-    num_workers=1,
+    num_workers=2,
     persistent_workers=True,
     drop_last=False,
     sampler=dict(type='DefaultSampler', shuffle=False),
@@ -348,7 +353,7 @@ model = dict(
             #     [0, -50.40, -1.78, 68.80, 50.40, -1.78]     # Car
             # ],
             sizes=[
-                [4.60, 1.95, 1.72],         # Car
+                [4.2, 2.0, 1.6],         # Car
                 # [0.72, 0.66, 1.76],           # Pedestrian    
                 # [1.68, 0.6, 1.27]           # Cyclist
             ],
@@ -408,7 +413,7 @@ model = dict(
         max_num=500))
 
 default_hooks = dict(
-    checkpoint=dict(type='CheckpointHook', interval=1, save_best=None),
+    checkpoint=dict(type='CheckpointHook', interval=3, save_best=None),
     visualization=dict(type='Det3DVisualizationHook', draw=False)
 )
 
@@ -416,7 +421,8 @@ default_hooks = dict(
 train_cfg = dict(type='EpochBasedTrainLoop', max_epochs=24, val_interval=12)
 
 # Gradient accumulation with 8 steps to achieve effective batch size of 32 (8 x 4)
-optim_wrapper = dict(type='OptimWrapper',
+optim_wrapper = dict(type='AmpOptimWrapper',
+                     loss_scale='dynamic',
                      optimizer=dict(type='AdamW', lr=0.001, weight_decay=0.01),
                      accumulative_counts=4,
                      clip_grad=dict(max_norm=35, norm_type=2))

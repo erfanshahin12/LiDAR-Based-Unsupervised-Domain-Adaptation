@@ -6,19 +6,20 @@ python tools/train.py configs/mean_teacher/mt_pretrain_centerpoint_config.py --w
 
 
 python tools/test.py \
-    configs/mean_teacher/test_kitti_nuspretrained_centerpoint.py \
-    work_dirs/baseline_centerpoint_18may/epoch_20.pth \
-    --work-dir work_dirs/baseline_centerpoint_18may/test_kitti \
-    --score-thr 0.05\
-    --task lidar_det
-
-python tools/test.py \
-    configs/mean_teacher/mean_teacher_pointpillars_config.py \
-    work_dirs/mt_pointpillars_20may/epoch_1.pth \
-    --work-dir work_dirs/mt_pointpillars_20may/test_kitti \
+    configs/mean_teacher/test_kitti_nuspretrained_pointpillars.py \
+    work_dirs/pretrain_pp_ros_26may/epoch_24.pth \
+    --work-dir work_dirs/pretrain_pp_ros_26may/test_kitti_ros \
     --score-thr 0.05\
     --task lidar_det
 
 work_dirs/baseline_centerpoint_18may/test_kitti
 
 python tools/plot_losses.py work_dirs/pretrain_03may/20260503_092027/vis_data/20260503_092027.json --out work_dirs/pretrain_03may/losses.png
+
+***** visualize_pseudo_labels vs GT vs baseline *****
+python tools/visualize_pseudo_labels.py \
+        --ps-label-pkl work_dirs/26may_no_hybrid_no_scaling/20260526_084016/ps_labels/ps_label_e4.pkl \
+        --baseline-config work_dirs/baseline_pointpillars_5may/mt_pretrain_pointpillars_config.py \
+        --baseline-ckpt   work_dirs/baseline_pointpillars_5may/epoch_24.pth \
+        --num-scenes 20 --out-dir work_dirs/26may_no_hybrid_no_scaling/vis_ps_labels_ep7 --baseline-score-thr 0.3 \
+        --gt-cars-only

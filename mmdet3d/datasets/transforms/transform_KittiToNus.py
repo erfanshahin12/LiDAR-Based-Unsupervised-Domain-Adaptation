@@ -29,7 +29,7 @@ class KittiToNuscenes(BaseTransform):
                 [0,  0, 0, 1]
             ], dtype=results['points'].tensor.dtype, device=results['points'].tensor.device)
             results['points'].tensor = results['points'].tensor @ rot_mat.T
-            results['points'].tensor[:, 2] += 0.11             # add sensor height shift
+            results['points'].tensor[:, 2] -= 0.11             # align KITTI ground (−1.73m) to nuScenes (−1.84m)
             # Scale KITTI intensity [0, 1] → nuScenes scale [0, 255]
             if results['points'].tensor.shape[1] >= 4:
                 results['points'].tensor[:, 3] *= 255.0
@@ -45,7 +45,7 @@ class KittiToNuscenes(BaseTransform):
             x, y, z, l, w, h, yaw = [boxes[:, i].copy() for i in range(7)]
             boxes[:, 0] = -y
             boxes[:, 1] = x
-            boxes[:, 2] = z + h / 2.0 + 0.11       # bottom-center → gravity-center + sensor height shift
+            boxes[:, 2] = z - 0.11 + h / 2.0       # bottom-center → gravity-center, align to nuScenes ground
             # l, w (indices 3, 4) unchanged: box-local dims don't change with coord rotation
             boxes[:, 5] = h
             boxes[:, 6] = np.arctan2(np.sin(yaw + np.pi / 2), np.cos(yaw + np.pi / 2))

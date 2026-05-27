@@ -64,7 +64,6 @@ val_evaluator = dict(
     type='NusOnKittiMetric',
     ann_file=data_root + 'kitti_infos_val.pkl',
     metric='bbox',
-    # pcd_limit_range=[0, -40, -3, 70.4, 40, 0],          # should use kitti's pcl range to filter predictions before evaluation
     pcd_limit_range=[-50.40, -50.40, -5.0, 50.40, 50.40, 3.0],
     label_mapping=None,
     default_cam_key='CAM2',
