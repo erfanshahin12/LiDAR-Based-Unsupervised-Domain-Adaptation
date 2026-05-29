@@ -2,7 +2,7 @@ import glob
 import os
 import pickle
 import re
-from typing import List, Optional, Sequence
+from typing import Optional, Sequence
 
 import numpy as np
 import torch
@@ -84,16 +84,6 @@ class PseudoLabelRefreshHook(Hook):
         use_top1_fallback (bool): If True, scenes with zero boxes above the
             adaptive threshold keep their top-1 candidate as a pseudo-label.
             Default: True.
-        apply_dim_scaling (bool): If True, rescale pseudo-box dimensions
-            (l, w, h) by ``dim_scale_factors`` after teacher inference.
-            Use this to recalibrate source-domain anchor bias when the
-            target domain has systematically different car sizes (e.g.
-            nuScenes → KITTI).  z_center is adjusted to keep the box bottom
-            at the same position after height scaling.  Default: False.
-        dim_scale_factors (List[float]): Per-axis scale factors ``[s_l, s_w,
-            s_h]`` applied to box dimensions when ``apply_dim_scaling=True``.
-            Values < 1 shrink boxes; values > 1 enlarge them.  Ignored when
-            ``apply_dim_scaling=False``.  Default: None.
     """
 
     def __init__(
@@ -107,8 +97,6 @@ class PseudoLabelRefreshHook(Hook):
         min_boxes_kept: int = 2000,
         ps_min_score: float = 0.05,
         use_top1_fallback: bool = True,
-        apply_dim_scaling: bool = False,
-        dim_scale_factors: Optional[List[float]] = None,
     ) -> None:
         self.interval = interval
         self.update_at_epochs = list(update_at_epochs)
@@ -119,15 +107,6 @@ class PseudoLabelRefreshHook(Hook):
         self.min_boxes_kept = min_boxes_kept
         self.ps_min_score = ps_min_score
         self.use_top1_fallback = use_top1_fallback
-        self.apply_dim_scaling = apply_dim_scaling
-        if apply_dim_scaling:
-            if dim_scale_factors is None or len(dim_scale_factors) != 3:
-                raise ValueError(
-                    'dim_scale_factors must be a list of 3 floats [s_l, s_w, s_h] '
-                    'when apply_dim_scaling=True')
-            if any(s <= 0 for s in dim_scale_factors):
-                raise ValueError('All dim_scale_factors must be positive')
-        self.dim_scale_factors = list(dim_scale_factors) if dim_scale_factors else None
 
         self._ps_loader: Optional[DataLoader] = None
 
@@ -240,9 +219,6 @@ class PseudoLabelRefreshHook(Hook):
             model.mean_teacher_cfg['conf_threshold'] = self.ps_min_score
 
         new_labels = self._run_teacher_inference(model, logger)
-
-        if self.apply_dim_scaling:
-            new_labels = self._apply_dim_scaling(new_labels, logger)
 
         # Restore original threshold — may be overwritten by adaptive logic below.
         model.mean_teacher_cfg['conf_threshold'] = orig_conf_thr
@@ -465,32 +441,6 @@ class PseudoLabelRefreshHook(Hook):
                 f'[PseudoLabelRefreshHook] Top-1 fallback: {n_fallback} scenes '
                 f'with 0 boxes above threshold received their top-1 candidate')
         return filtered
-
-    def _apply_dim_scaling(self, new_labels: dict, logger) -> dict:
-        """Rescale pseudo-box l/w/h by dim_scale_factors.
-
-        z_center is shifted by (h_new - h_old) / 2 so the box bottom stays
-        at the same position after height scaling (gravity-center convention).
-        """
-        sl, sw, sh = self.dim_scale_factors
-        scaled = {}
-        for key, entry in new_labels.items():
-            boxes = entry['gt_boxes'].copy()  # (N, 7): x, y, z, l, w, h, yaw
-            if len(boxes):
-                h_old = boxes[:, 5].copy()
-                boxes[:, 3] *= sl
-                boxes[:, 4] *= sw
-                boxes[:, 5] *= sh
-                boxes[:, 2] += (boxes[:, 5] - h_old) / 2  # keep bottom fixed
-            scaled[key] = {
-                'gt_boxes':  boxes,
-                'gt_labels': entry['gt_labels'],
-                'scores':    entry['scores'],
-            }
-        logger.info(
-            f'[PseudoLabelRefreshHook] Applied dim scaling '
-            f'[s_l={sl:.3f}, s_w={sw:.3f}, s_h={sh:.3f}] to pseudo-boxes')
-        return scaled
 
     def _log_ps_stats(self, new_labels: dict, logger) -> None:
         non_empty = [v['gt_labels'] for v in new_labels.values() if len(v['gt_labels']) > 0]

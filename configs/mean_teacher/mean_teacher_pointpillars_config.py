@@ -299,8 +299,8 @@ model = dict(
                      # with ``hybrid = w_iou * iou + (1 - w_iou) * cls`` after  ``iou_warmup_iters`
                      # of student iterations; before that it falls back to cls-only.
                      # Setting ``hybrid_w_iou=0`` disables hybrid scoring.
-                     hybrid_w_iou=0.7,
-                    #  iou_warmup_iters=2000,
+                     hybrid_w_iou=0.0,
+                     iou_warmup_iters=5000,
                  ),
     pretrained_ckpt=pretrained_ckpt,
 
@@ -437,7 +437,7 @@ model = dict(
             # Hybrid-IoU ranking at val/test (ST3D POST_PROCESSING.SCORE_TYPE
             # analog). Independent from mean_teacher_cfg.hybrid_w_iou.
             score_type='hybrid',
-            score_weights=dict(iou=0.7, cls=0.3))))
+            score_weights=dict(iou=0.0, cls=1.0))))
 
 # Runtime configs
 # Hooks
@@ -462,11 +462,6 @@ custom_hooks = [
         # Hybrid filter already drops poorly-localised boxes; the fallback
         # would re-inject them as pseudo-GT and poison the student.
         use_top1_fallback=False,
-        # Dimension recalibration: scale pseudo-box l/w/h from nuScenes anchor
-        # bias toward KITTI car statistics.
-        # Factors = KITTI median / nuScenes median: [3.90/4.575, 1.63/1.946, 1.50/1.704]
-        apply_dim_scaling=False,
-        dim_scale_factors=[0.852, 0.838, 0.880],
     ),
 ]
 

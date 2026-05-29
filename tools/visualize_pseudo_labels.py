@@ -108,15 +108,19 @@ def match_boxes(pred: np.ndarray, gt: np.ndarray,
 
 # ── Ground-truth helpers ───────────────────────────────────────────────────────
 
-def build_gt_lookup(info_path: str) -> dict:
-    """Return {scene_id_str → dict} from kitti_infos_train.pkl.
+def build_gt_lookup(info_path: str) -> tuple[dict, int]:
+    """Return ({scene_id → dict}, gt_car_label) from kitti_infos_train.pkl.
 
-    scene_id_str is the zero-padded 6-digit frame id, e.g. '000042'.
+    scene_id is the stem of the lidar_path filename, e.g. '000042'.
     Each value: {'cam_boxes': (N,7) float32, 'labels': (N,) int64,
                  'lidar2cam': (4,4) float64}
+    gt_car_label is the integer label for 'Car' read from the pkl's metainfo.
     """
     with open(info_path, 'rb') as f:
         d = pickle.load(f)
+    categories = d.get('metainfo', {}).get('categories', {})
+    gt_car_label = categories.get('Car', 2)  # 2 is the standard MMDet3D KITTI value
+    print(f'GT Car label = {gt_car_label}  (from {info_path} metainfo)')
     lookup = {}
     for info in d['data_list']:
         basename = os.path.splitext(info['lidar_points']['lidar_path'])[0]
@@ -135,7 +139,7 @@ def build_gt_lookup(info_path: str) -> dict:
             'labels': labels,
             'lidar2cam': lidar2cam,
         }
-    return lookup
+    return lookup, gt_car_label
 
 
 def gt_boxes_to_nus(cam_boxes: np.ndarray, lidar2cam: np.ndarray) -> np.ndarray:
@@ -180,11 +184,12 @@ def load_points_nus(bin_path: str) -> np.ndarray:
 # ── Baseline inference ─────────────────────────────────────────────────────────
 
 def run_baseline(model, pts_nus: np.ndarray, device: str,
-                 score_thr: float) -> tuple[np.ndarray, np.ndarray]:
+                 score_thr: float) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Run baseline VoxelNetBEVRoI on a single scene.
 
     Pattern mirrors PseudoLabelRefreshHook._run_teacher_inference.
-    Returns (K, 7) boxes and (K,) scores in nuScenes frame, filtered by score_thr.
+    Returns (K, 7) boxes, (K,) scores, and (K,) labels in nuScenes frame,
+    filtered by score_thr.
     """
     pts_tensor = torch.from_numpy(pts_nus).float()
     sample = Det3DDataSample()
@@ -202,8 +207,9 @@ def run_baseline(model, pts_nus: np.ndarray, device: str,
     inst = pred.pred_instances_3d
     scores = inst.scores_3d.cpu().numpy()
     boxes = inst.bboxes_3d.tensor.cpu().numpy()[:, :7]
+    labels = inst.labels_3d.cpu().numpy()
     mask = scores >= score_thr
-    return boxes[mask], scores[mask]
+    return boxes[mask], scores[mask], labels[mask]
 
 
 # ── BEV / side-view rendering helpers ─────────────────────────────────────────
@@ -252,7 +258,8 @@ def render_bev(pts_nus: np.ndarray,
                ps_boxes: np.ndarray, ps_scores: np.ndarray,
                bl_boxes, bl_scores,
                scene_id: str, out_path: str,
-               gt_cars_only: bool = False) -> None:
+               gt_cars_only: bool = False,
+               gt_car_label: int = 2) -> None:
     """Render and save a two-panel PNG (BEV left + side-view right) for one scene.
 
     BEV annotations show 'score/BEV-IoU' per box, colour-coded by IoU quality
@@ -276,7 +283,7 @@ def render_bev(pts_nus: np.ndarray,
                     linewidths=0, zorder=1)
 
     # IoU reference: GT Car boxes only (single-class model comparison)
-    gt_car_boxes = (gt_boxes[gt_labels == 2]
+    gt_car_boxes = (gt_boxes[gt_labels == gt_car_label]
                     if len(gt_labels) > 0 else np.zeros((0, 7), dtype=np.float32))
     ps_iou = bev_iou_matrix(ps_boxes, gt_car_boxes)
     bl_arr = bl_boxes if bl_boxes is not None else np.zeros((0, 7), dtype=np.float32)
@@ -285,10 +292,10 @@ def render_bev(pts_nus: np.ndarray,
     legend_items = []
 
     # ── GT boxes ──
-    n_gt_car = int((gt_labels == 2).sum()) if len(gt_labels) else 0
+    n_gt_car = int((gt_labels == gt_car_label).sum()) if len(gt_labels) else 0
     n_gt_other = len(gt_labels) - n_gt_car
     for box, label in zip(gt_boxes, gt_labels):
-        is_car = (label == 2)
+        is_car = (label == gt_car_label)
         if gt_cars_only and not is_car:
             continue
         color = 'limegreen' if is_car else '#888888'
@@ -501,6 +508,35 @@ def _empty_stats() -> dict:
             '0.50': {'tp': 0, 'fp': 0, 'fn': 0}}
 
 
+def _pred_car_label(baseline_model, ps_labels: dict) -> int:
+    """Return the integer label index that means 'Car' in prediction space.
+
+    Prefers looking up 'Car' by name in the baseline model's dataset_meta.
+    Falls back to scanning pseudo-label gt_labels: a single-class model always
+    emits label 0, so if only one unique label exists it must be Car.
+    """
+    if baseline_model is not None:
+        classes = list(baseline_model.dataset_meta.get('classes', []))
+        if 'Car' in classes:
+            idx = classes.index('Car')
+            print(f'Prediction Car label = {idx}  (from model classes {classes})')
+            return idx
+
+    # No model available — infer from ps_labels
+    all_labels = []
+    for v in ps_labels.values():
+        all_labels.extend(v.get('gt_labels', []).tolist())
+    unique = sorted(set(all_labels))
+    if len(unique) == 1:
+        print(f'Prediction Car label = {unique[0]}  '
+              f'(single unique label in ps_labels — assumed Car)')
+        return unique[0]
+
+    print('WARNING: cannot determine Car label index automatically; defaulting to 0. '
+          'Pass a baseline model or ensure ps_labels contain only Car boxes.')
+    return 0
+
+
 def main():
     args = parse_args()
 
@@ -534,7 +570,7 @@ def main():
 
     # ── GT lookup ──
     print(f'Loading KITTI GT from {args.kitti_info}...')
-    gt_lookup = build_gt_lookup(args.kitti_info)
+    gt_lookup, gt_car_label = build_gt_lookup(args.kitti_info)
 
     # ── Random scene selection ──
     available = list(ps_labels.keys())
@@ -551,6 +587,10 @@ def main():
             args.baseline_config, args.baseline_ckpt, device=args.device)
         baseline_model.eval()
         print('Baseline model ready.')
+
+    # Label index for 'Car' in the prediction space (model output).
+    # Looked up by name so it works regardless of how many classes the model has.
+    pred_car_label = _pred_car_label(baseline_model, ps_labels)
 
     # ── Stats accumulators ──
     stats = {
@@ -579,7 +619,7 @@ def main():
                 gt_info['cam_boxes'], gt_info['lidar2cam'])
             gt_labels = gt_info['labels']
             print(f'  GT:     {len(gt_boxes_nus)} boxes '
-                  f'({(gt_labels==2).sum()} Car)')
+                  f'({(gt_labels==gt_car_label).sum()} Car)')
 
         # Pseudo-labels
         ps_entry = ps_labels[key]
@@ -588,27 +628,30 @@ def main():
         print(f'  Pseudo: {len(ps_boxes)} boxes')
 
         # Baseline
-        bl_boxes, bl_scores = None, None
+        bl_boxes, bl_scores, bl_labels = None, None, None
         if baseline_model is not None:
-            bl_boxes, bl_scores = run_baseline(
+            bl_boxes, bl_scores, bl_labels = run_baseline(
                 baseline_model, pts_nus, args.device,
                 args.baseline_score_thr)
             print(f'  Baseline: {len(bl_boxes)} boxes '
                   f'(thr={args.baseline_score_thr})')
 
         # Stats or render
-        gt_car = (gt_boxes_nus[gt_labels == 2]
+        gt_car = (gt_boxes_nus[gt_labels == gt_car_label]
                   if len(gt_labels) > 0 else np.zeros((0, 7), dtype=np.float32))
 
         if args.stats_only:
-            print(f'  GT Car={len(gt_car)}')
+            ps_labels_arr = ps_entry.get('gt_labels', np.zeros(len(ps_boxes), dtype=np.int64))
+            ps_car_boxes = ps_boxes[ps_labels_arr == pred_car_label]
+            print(f'  GT Car={len(gt_car)}  Pseudo Car={len(ps_car_boxes)}/{len(ps_boxes)}')
             for thr_key, thr_val in (('0.25', 0.25), ('0.50', 0.50)):
-                ps_tp, ps_fp, ps_fn = match_boxes(ps_boxes, gt_car, thr_val)
+                ps_tp, ps_fp, ps_fn = match_boxes(ps_car_boxes, gt_car, thr_val)
                 stats['pseudo'][thr_key]['tp'] += ps_tp
                 stats['pseudo'][thr_key]['fp'] += ps_fp
                 stats['pseudo'][thr_key]['fn'] += ps_fn
                 if bl_boxes is not None:
-                    bl_tp, bl_fp, bl_fn = match_boxes(bl_boxes, gt_car, thr_val)
+                    bl_car_boxes = bl_boxes[bl_labels == pred_car_label]
+                    bl_tp, bl_fp, bl_fn = match_boxes(bl_car_boxes, gt_car, thr_val)
                     stats['baseline'][thr_key]['tp'] += bl_tp
                     stats['baseline'][thr_key]['fp'] += bl_fp
                     stats['baseline'][thr_key]['fn'] += bl_fn
@@ -620,7 +663,8 @@ def main():
                 ps_boxes, ps_scores,
                 bl_boxes, bl_scores,
                 scene_id, out_path,
-                gt_cars_only=args.gt_cars_only)
+                gt_cars_only=args.gt_cars_only,
+                gt_car_label=gt_car_label)
 
     # ── Final output ──
     if args.stats_only:
