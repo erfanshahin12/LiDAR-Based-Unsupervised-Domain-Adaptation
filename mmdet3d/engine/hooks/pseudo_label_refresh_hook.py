@@ -29,8 +29,7 @@ class PseudoLabelRefreshHook(Hook):
 
     Every ``interval`` epochs (and at the epochs listed in ``update_at_epochs``)
     the teacher model is run in eval mode over the full unlabeled target split.
-    Predictions are filtered using the detector's own ``filter_teacher_predictions``
-    (which reads ``conf_threshold`` from ``mean_teacher_cfg``) and saved to disk as
+    Predictions are filtered using a three-constraint scheme and saved to disk as
     ``<work_dir>/ps_labels/ps_label_e{epoch}.pkl``.  The detector's in-memory
     ``pseudo_label_store`` is updated so the student can use the refreshed labels
     for the next training interval.
@@ -38,25 +37,28 @@ class PseudoLabelRefreshHook(Hook):
     On training start the hook checks for existing pkl files from prior runs and
     loads the most recent one whose epoch ≤ ``runner.epoch``.
 
-    Adaptive confidence threshold
-    ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-    When ``use_knee_threshold=True`` (default), each epoch the hook:
+    Three-constraint filtering
+    ~~~~~~~~~~~~~~~~~~~~~~~~~~
+    The same scheme used in ``tools/visualize_pseudo_labels.py::run_baseline``:
 
-    1. Runs teacher inference with a broad threshold (``ps_min_score``, default
-       0.05) to collect all candidate boxes.
-    2. Finds the *knee* of the descending score curve (Kneedle method) — the
-       score where the high-confidence tail separates from the dense low-score
-       cluster.
-    3. If the knee threshold would keep fewer than ``min_boxes_kept`` boxes,
-       lowers the threshold to the score at which exactly ``min_boxes_kept``
-       boxes are retained (box-count floor).  This prevents training starvation
-       when teacher confidence collapses globally.
-    4. Updates ``model.mean_teacher_cfg['conf_threshold']`` so the online
-       training path (when the store is empty) uses the same threshold.
+    1. **Hybrid floor** (primary): ``iou_weight * IoU + (1 - iou_weight) * CLS
+       >= hybrid_thr``.  When ``iou_weight=0`` this reduces to ``CLS >= hybrid_thr``.
+    2. **IoU floor** (independent): ``IoU >= iou_thr``.  Set ``iou_thr=0`` to
+       disable.
+    3. **CLS floor** (independent): ``CLS >= cls_thr``.  Set ``cls_thr=0`` to
+       disable.
 
-    The count floor is the critical design choice: a *score* floor (e.g. 0.30)
-    acts as an aggressive count filter once the score distribution collapses,
-    while a *count* floor guarantees sufficient gradient signal every epoch.
+    All three constraints must be satisfied simultaneously.  ``CLS`` here is the
+    ``scores_3d`` from the detector's NMS output (the test_cfg ranking score).
+    ``IoU`` is the post-NMS RoI IoU head score (``iou_scores_3d``).
+
+    During the refresh inference pass, ``mean_teacher_cfg['conf_threshold']`` is
+    temporarily lowered to ``ps_min_score`` so the detector's
+    ``filter_teacher_predictions`` acts as a broad pre-floor, passing through the
+    full candidate set (all NMS survivors scoring ≥ ps_min_score).  The
+    three-constraint filter is then applied here in the hook on the raw scores.
+    After inference the original ``conf_threshold`` is restored so the online
+    store-empty training path continues to use the configured cutoff.
 
     Args:
         interval (int): Refresh every this many epochs. Default: 1.
@@ -69,21 +71,23 @@ class PseudoLabelRefreshHook(Hook):
             Default: 8.
         ps_num_workers (int): Dataloader workers for the inference pass.
             Default: 6.
-        use_knee_threshold (bool): If True, use the Kneedle-based adaptive
-            threshold with ``min_boxes_kept`` count floor.  If False, use the
-            fixed ``conf_threshold`` from ``mean_teacher_cfg``.  Default: True.
-        min_boxes_kept (int): Minimum number of pseudo-boxes to retain per
-            epoch.  If the knee threshold would keep fewer boxes, it is lowered
-            until this count is satisfied.  Ignored when
-            ``use_knee_threshold=False``.  Default: 2000.
-        ps_min_score (float): Broad threshold used during the teacher inference
-            pass when ``use_knee_threshold=True``.  Should be low enough to
-            capture the full score distribution (≤ model's test_cfg.score_thr).
-            Acts as the absolute lower bound on the adaptive threshold.
-            Default: 0.05.
+        hybrid_thr (float): Minimum hybrid score to keep a pseudo-box.
+            ``hybrid = iou_weight * IoU + (1 - iou_weight) * CLS``.
+            Default: 0.3.
+        iou_weight (float): IoU weight in the hybrid score [0, 1].
+            0 = CLS-only hybrid.  Default: 0.5.
+        iou_thr (float): Minimum raw RoI-IoU score (independent constraint).
+            0.0 = disabled.  Default: 0.0.
+        cls_thr (float): Minimum raw CLS score (independent constraint).
+            0.0 = disabled.  Default: 0.0.
+        ps_min_score (float): Broad threshold used during teacher inference to
+            collect the candidate pool (temporarily overrides
+            ``mean_teacher_cfg['conf_threshold']``).  Should be ≤
+            ``test_cfg.score_thr`` (0.1 by default), acting as the absolute
+            lower bound on candidates.  Default: 0.05.
         use_top1_fallback (bool): If True, scenes with zero boxes above the
-            adaptive threshold keep their top-1 candidate as a pseudo-label.
-            Default: True.
+            three-constraint thresholds keep their top-1 candidate (ranked by
+            hybrid score) as a pseudo-label.  Default: True.
     """
 
     def __init__(
@@ -93,8 +97,10 @@ class PseudoLabelRefreshHook(Hook):
         ps_label_subdir: str = 'ps_labels',
         ps_batch_size: int = 8,
         ps_num_workers: int = 6,
-        use_knee_threshold: bool = True,
-        min_boxes_kept: int = 2000,
+        hybrid_thr: float = 0.3,
+        iou_weight: float = 0.5,
+        iou_thr: float = 0.0,
+        cls_thr: float = 0.0,
         ps_min_score: float = 0.05,
         use_top1_fallback: bool = True,
     ) -> None:
@@ -103,8 +109,10 @@ class PseudoLabelRefreshHook(Hook):
         self.ps_label_subdir = ps_label_subdir
         self.ps_batch_size = ps_batch_size
         self.ps_num_workers = ps_num_workers
-        self.use_knee_threshold = use_knee_threshold
-        self.min_boxes_kept = min_boxes_kept
+        self.hybrid_thr = hybrid_thr
+        self.iou_weight = iou_weight
+        self.iou_thr = iou_thr
+        self.cls_thr = cls_thr
         self.ps_min_score = ps_min_score
         self.use_top1_fallback = use_top1_fallback
 
@@ -212,16 +220,18 @@ class PseudoLabelRefreshHook(Hook):
         logger.info(
             f'[PseudoLabelRefreshHook] Refreshing pseudo-labels at epoch {epoch}')
 
-        # For adaptive mode, temporarily lower conf_threshold so the inference
-        # pass collects a broad candidate set; we apply the final threshold below.
+        # Temporarily lower conf_threshold so filter_teacher_predictions acts as
+        # a broad pre-floor (ps_min_score), passing raw candidates through.  The
+        # three-constraint filter applied below does the real quality cut.
+        # try/finally guarantees the original threshold is restored even if
+        # inference raises, so the online store-empty training path is never
+        # left using ps_min_score as its quality cutoff.
         orig_conf_thr = model.mean_teacher_cfg.get('conf_threshold', 0.6)
-        if self.use_knee_threshold:
-            model.mean_teacher_cfg['conf_threshold'] = self.ps_min_score
-
-        new_labels = self._run_teacher_inference(model, logger)
-
-        # Restore original threshold — may be overwritten by adaptive logic below.
-        model.mean_teacher_cfg['conf_threshold'] = orig_conf_thr
+        model.mean_teacher_cfg['conf_threshold'] = self.ps_min_score
+        try:
+            new_labels = self._run_teacher_inference(model, logger)
+        finally:
+            model.mean_teacher_cfg['conf_threshold'] = orig_conf_thr
 
         # DDP: gather all-rank results on rank 0, then broadcast.
         rank, world_size = get_dist_info()
@@ -233,16 +243,12 @@ class PseudoLabelRefreshHook(Hook):
             else:
                 new_labels = {}
 
-        # Compute and apply the adaptive threshold on rank 0 (has full dataset).
-        # Single-rank training: rank == 0, so the condition is always satisfied.
-        adaptive_thr = orig_conf_thr
-        if self.use_knee_threshold and rank == 0:
-            adaptive_thr = self._compute_adaptive_threshold(new_labels, logger)
+        # Apply three-constraint filter and optional top-1 fallback on rank 0.
+        if rank == 0:
             raw_labels = new_labels
-            new_labels = self._filter_by_threshold(new_labels, adaptive_thr)
+            new_labels = self._apply_three_constraint_filter(new_labels, logger)
             if self.use_top1_fallback:
-                new_labels = self._top1_fallback(
-                    new_labels, raw_labels, logger)
+                new_labels = self._top1_fallback(new_labels, raw_labels, logger)
 
         # Rank 0 writes the pkl; all ranks update the model store.
         ps_dir = self._ps_dir(runner)
@@ -256,18 +262,14 @@ class PseudoLabelRefreshHook(Hook):
                 f'to {pkl_path}')
 
         if world_size > 1:
-            # Broadcast the merged (and adaptive-filtered) dict to non-zero ranks.
+            # Broadcast the filtered dict to non-zero ranks.
             import torch.distributed as dist
             if rank == 0:
-                dist.broadcast_object_list([new_labels, adaptive_thr], src=0)
+                dist.broadcast_object_list([new_labels], src=0)
             else:
-                container = [None, None]
+                container = [None]
                 dist.broadcast_object_list(container, src=0)
-                new_labels, adaptive_thr = container[0], container[1]
-
-        # Propagate the adaptive threshold so the online path uses the same cutoff.
-        if self.use_knee_threshold:
-            model.mean_teacher_cfg['conf_threshold'] = adaptive_thr
+                new_labels = container[0]
 
         model.set_pseudo_labels(new_labels)
         self._log_ps_stats(new_labels, logger)
@@ -279,8 +281,10 @@ class PseudoLabelRefreshHook(Hook):
     def _run_teacher_inference(self, model, logger) -> dict:
         """Run teacher over the entire weak target split and build the store.
 
-        Confidence filtering is delegated to ``model.filter_teacher_predictions``
-        so the threshold is read from a single place (``mean_teacher_cfg['conf_threshold']``).
+        ``mean_teacher_cfg['conf_threshold']`` is expected to already be lowered
+        to ``ps_min_score`` by the caller so that ``filter_teacher_predictions``
+        acts only as a broad pre-floor.  Raw ``iou_scores`` and ``cls_scores``
+        are preserved in the output dict for the three-constraint filter.
         """
         if getattr(model, 'mean_teacher_cfg', {}).get('use_dsnorm', False):
             from mmdet3d.models.layers.dsnorm import set_ds_target
@@ -307,117 +311,108 @@ class PseudoLabelRefreshHook(Hook):
                 if key is None:
                     continue
 
-                # Re-use the same filtering logic as the online training path.
+                # Broad pre-floor via the detector's own filter
+                # (conf_threshold == ps_min_score at this point).
                 pred = model.filter_teacher_predictions(pred)
                 inst = pred.pred_instances_3d
 
                 boxes_t  = inst.bboxes_3d.tensor.cpu().numpy()[:, :7]
                 labels_t = inst.labels_3d.cpu().numpy()
                 scores_t = inst.scores_3d.cpu().numpy()
+                iou_t    = getattr(inst, 'iou_scores_3d', None)
+                cls_t    = getattr(inst, 'cls_scores_3d', None)
 
                 new_labels[key] = {
                     'gt_boxes':  boxes_t.astype(np.float32),
                     'gt_labels': labels_t.astype(np.int64),
                     'scores':    scores_t.astype(np.float32),
+                    'iou_scores': iou_t.cpu().numpy().astype(np.float32)
+                                  if iou_t is not None else scores_t.astype(np.float32),
+                    'cls_scores': cls_t.cpu().numpy().astype(np.float32)
+                                  if cls_t is not None else None,
                 }
                 total_pos += len(labels_t)
 
         model.teacher.train()
-        conf_threshold = model.mean_teacher_cfg.get('conf_threshold', 0.6)
         logger.info(
-            f'[PseudoLabelRefreshHook] Generated {total_pos} positive '
+            f'[PseudoLabelRefreshHook] Collected {total_pos} candidate '
             f'pseudo-boxes across {len(new_labels)} frames '
-            f'(conf_threshold={conf_threshold})')
+            f'(pre-floor={self.ps_min_score})')
         return new_labels
 
-    @staticmethod
-    def _knee_threshold(scores: np.ndarray) -> float:
-        """Kneedle: score at the elbow of the descending score curve.
+    # ------------------------------------------------------------------
+    # Three-constraint filter
+    # ------------------------------------------------------------------
 
-        Finds the point of maximum perpendicular distance from the line
-        connecting the first and last points of the normalised descending
-        score curve.  For distributions with a dense low-score cluster and a
-        sparse high-quality tail, this falls at the natural break between them.
+    def _apply_three_constraint_filter(self, new_labels: dict, logger) -> dict:
+        """Filter pseudo-boxes with three independent constraints.
+
+        Mirrors ``tools/visualize_pseudo_labels.run_baseline`` exactly:
+
+          hybrid = iou_weight * IoU + (1 - iou_weight) * CLS >= hybrid_thr
+          IoU  >= iou_thr   (when iou_thr > 0)
+          CLS  >= cls_thr   (when cls_thr > 0)
+
+        ``CLS`` is ``cls_scores`` (raw ``scores_3d`` ranking score preserved by
+        ``filter_teacher_predictions``).  ``IoU`` is ``iou_scores`` (post-NMS
+        RoI IoU head score).  The stored ``scores`` field is set to the hybrid
+        value so ``_create_pseudo_labels_from_store`` and the visualizer
+        histogram see the pseudo-label quality score.
+
+        Args:
+            new_labels: Candidate dict from ``_run_teacher_inference``.
+            logger: MMLogger instance.
+
+        Returns:
+            Filtered dict with the same structure.
         """
-        sorted_scores = np.sort(scores)[::-1]
-        n = len(sorted_scores)
-        if n < 3:
-            return float(sorted_scores[0]) if n else 0.0
-        x = np.linspace(0, 1, n)
-        s_min, s_max = sorted_scores[-1], sorted_scores[0]
-        y = (sorted_scores - s_min) / (s_max - s_min + 1e-8)
-        p1 = np.array([x[0], y[0]])
-        p2 = np.array([x[-1], y[-1]])
-        line_len = np.linalg.norm(p2 - p1)
-        distances = np.abs(
-            (p2[0] - p1[0]) * (p1[1] - y) - (p1[0] - x) * (p2[1] - p1[1])
-        ) / (line_len + 1e-8)
-        return float(sorted_scores[np.argmax(distances)])
+        filtered: dict = {}
+        total_before = 0
+        total_after  = 0
 
-    def _compute_adaptive_threshold(self, new_labels: dict, logger) -> float:
-        """Knee threshold with a box-count floor.
+        for key, entry in new_labels.items():
+            cls_sc = entry.get('cls_scores')
+            iou_sc = entry['iou_scores']
 
-        1. Compute the knee of the descending score curve.
-        2. If fewer than ``min_boxes_kept`` candidates meet the knee threshold,
-           lower it to the score of the ``min_boxes_kept``-th highest-scoring box
-           (count floor).  This prevents training starvation when confidence
-           collapses globally.
-        3. Clamp below by ``ps_min_score`` as an absolute lower bound.
-        """
-        all_scores = []
-        for v in new_labels.values():
-            if len(v['scores']) > 0:
-                all_scores.extend(v['scores'].tolist())
-        if not all_scores:
-            logger.warning(
-                '[PseudoLabelRefreshHook] No candidates for adaptive threshold; '
-                f'using ps_min_score={self.ps_min_score}')
-            return self.ps_min_score
-        all_scores_arr = np.array(all_scores, dtype=np.float32)
+            # Fallback: if raw cls_scores were not stored, use scores (hybrid).
+            if cls_sc is None:
+                cls_sc = entry['scores']
 
-        # Step 1: quality threshold from the knee
-        knee_thr = self._knee_threshold(all_scores_arr)
-        n_above_knee = int((all_scores_arr >= knee_thr).sum())
-
-        # Step 2: count floor — if knee keeps too few boxes, lower the threshold
-        floor_triggered = False
-        if n_above_knee < self.min_boxes_kept:
-            floor_triggered = True
-            sorted_desc = np.sort(all_scores_arr)[::-1]
-            if len(sorted_desc) >= self.min_boxes_kept:
-                knee_thr = float(sorted_desc[self.min_boxes_kept - 1])
+            # Hybrid score — mirrors run_baseline:224-225.
+            if self.iou_weight > 0:
+                hybrid = self.iou_weight * iou_sc + (1.0 - self.iou_weight) * cls_sc
             else:
-                knee_thr = float(sorted_desc[-1])  # keep all
+                hybrid = cls_sc
 
-        # Step 3: absolute lower bound
-        thr = max(knee_thr, self.ps_min_score)
-        n_kept = int((all_scores_arr >= thr).sum())
+            # Build the combined mask — mirrors run_baseline:229-233.
+            mask = hybrid >= self.hybrid_thr
+            if self.iou_thr > 0:
+                mask = mask & (iou_sc >= self.iou_thr)
+            if self.cls_thr > 0:
+                mask = mask & (cls_sc >= self.cls_thr)
+
+            total_before += len(mask)
+            total_after  += int(mask.sum())
+
+            filtered[key] = {
+                'gt_boxes':   entry['gt_boxes'][mask],
+                'gt_labels':  entry['gt_labels'][mask],
+                'scores':     hybrid[mask],   # hybrid quality score for store
+                'iou_scores': iou_sc[mask],
+                'cls_scores': cls_sc[mask],
+            }
 
         logger.info(
-            f'[PseudoLabelRefreshHook] Adaptive threshold: '
-            f'knee={self._knee_threshold(all_scores_arr):.4f}  →  '
-            f'applied={thr:.4f}  '
-            f'({"count floor" if floor_triggered else "knee"}, '
-            f'kept={n_kept}/{len(all_scores_arr)},'
-            f' min_boxes={self.min_boxes_kept})')
-        return thr
-
-    def _filter_by_threshold(self, new_labels: dict, thr: float) -> dict:
-        """Return a copy of new_labels with boxes scoring below thr removed."""
-        filtered: dict = {}
-        for key, entry in new_labels.items():
-            scores = entry['scores']
-            keep = scores >= thr
-            filtered[key] = {
-                'gt_boxes':  entry['gt_boxes'][keep],
-                'gt_labels': entry['gt_labels'][keep],
-                'scores':    scores[keep],
-            }
+            f'[PseudoLabelRefreshHook] Three-constraint filter: '
+            f'kept {total_after}/{total_before} boxes '
+            f'(hybrid_thr={self.hybrid_thr}, iou_weight={self.iou_weight}, '
+            f'iou_thr={self.iou_thr}, cls_thr={self.cls_thr})')
         return filtered
 
     @staticmethod
     def _top1_fallback(filtered: dict, candidates: dict, logger) -> dict:
-        """For scenes with 0 boxes after global threshold, keep the top-1 candidate.
+        """For scenes with 0 boxes after the three-constraint filter, keep the
+        top-1 candidate ranked by hybrid score.
 
         Prevents empty-GT scenes from training the student toward background
         suppression. Every scene where the teacher found anything above
@@ -430,10 +425,14 @@ class PseudoLabelRefreshHook(Hook):
                 src_scores = src.get('scores', np.zeros(0, dtype=np.float32))
                 if len(src_scores) > 0:
                     top1 = int(np.argmax(src_scores))
+                    src_cls = src.get('cls_scores')
+                    src_iou = src.get('iou_scores', src_scores)
                     filtered[key] = {
-                        'gt_boxes':  src['gt_boxes'][top1:top1 + 1],
-                        'gt_labels': src['gt_labels'][top1:top1 + 1],
-                        'scores':    src_scores[top1:top1 + 1],
+                        'gt_boxes':   src['gt_boxes'][top1:top1 + 1],
+                        'gt_labels':  src['gt_labels'][top1:top1 + 1],
+                        'scores':     src_scores[top1:top1 + 1],
+                        'iou_scores': src_iou[top1:top1 + 1],
+                        'cls_scores': src_cls[top1:top1 + 1] if src_cls is not None else None,
                     }
                     n_fallback += 1
         if n_fallback:
@@ -449,11 +448,12 @@ class PseudoLabelRefreshHook(Hook):
             return
         n_scenes = len(new_labels)
         n_covered = len(non_empty)
-        logger.info(
-            f'[PseudoLabelRefreshHook] Scene coverage: '
-            f'{n_covered}/{n_scenes} ({100 * n_covered / max(n_scenes, 1):.1f}%) '
-            f'scenes have ≥1 pseudo-box')
         all_labels = np.concatenate(non_empty)
+        n_total_surviving = len(all_labels)
+        logger.info(
+            f'[PseudoLabelRefreshHook] Pseudo-label store summary: '
+            f'{n_total_surviving} boxes | scene coverage '
+            f'{n_covered}/{n_scenes} ({100 * n_covered / max(n_scenes, 1):.1f}%)')
         for cls_id in np.unique(all_labels):
             n = int((all_labels == cls_id).sum())
             logger.info(

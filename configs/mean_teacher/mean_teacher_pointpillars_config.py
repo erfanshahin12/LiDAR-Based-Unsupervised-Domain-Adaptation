@@ -20,9 +20,8 @@ metainfo_target = dict(classes=classes_kitti, origin=box_origin_target)
 
 hard_instance_bank_path = './configs/mean_teacher/hard_instance_bank/hard_instance_bank_nuscenes_quantile_kitti_20.pkl'
 # pretrained_ckpt = './work_dirs/baseline_pointpillars_5may/epoch_24.pth'
-pretrained_ckpt = './work_dirs/iou_head_finetune/epoch_6.pth'    # iou head trained separately
+pretrained_ckpt = './work_dirs/iou_head_finetune_29may/epoch_6.pth'    # iou head trained separately
 
-# point_cloud_range = [-50.40, -50.40, -5, 50.40, 50.40, 3]   # nuScenes point cloud range
 point_cloud_range = [-50.40, -50.40, -5, 50.40, 50.40, 3]
 input_modality = dict(use_lidar=True, use_camera=False)
 metainfo = dict(
@@ -286,11 +285,12 @@ model = dict(
                                                         # student's strong-aug stats causing confidence collapse
                      use_bev_consistency=True,
                      tau=0.07,
-                     # NOTE: no static ``conf_threshold`` for teacher here on purpose.
-                     # PseudoLabelRefreshHook writes the kneedle + count-floor threshold
-                     # into mean_teacher_cfg['conf_threshold'] before running iters of every epoch
+                     # NOTE: conf_threshold here governs only the online store-empty training
+                     # path (filter_teacher_predictions called per-iteration when the store
+                     # is empty).  PseudoLabelRefreshHook temporarily overrides this value
+                     # to ps_min_score during the refresh inference pass, then restores it.
                      source_loss_weight=1.0,
-                     target_loss_weight=1.0,
+                     target_loss_weight=0.5,
                      contrastive_weight=0.05,
                      verbose=True,
                      eval_use_teacher=True,
@@ -299,8 +299,9 @@ model = dict(
                      # with ``hybrid = w_iou * iou + (1 - w_iou) * cls`` after  ``iou_warmup_iters`
                      # of student iterations; before that it falls back to cls-only.
                      # Setting ``hybrid_w_iou=0`` disables hybrid scoring.
-                     hybrid_w_iou=0.0,
-                     iou_warmup_iters=5000,
+                     conf_threshold=0.1,
+                     hybrid_w_iou=0.5,
+                     iou_warmup_iters=0,
                  ),
     pretrained_ckpt=pretrained_ckpt,
 
@@ -341,7 +342,18 @@ model = dict(
             in_channels=[64, 128, 256],
             upsample_strides=[1, 2, 4],
             out_channels=[128, 128, 128]),
-        
+
+        # Add RoI feature extractor (matches middle_encoder output: 64ch, 504×504 BEV).
+        roi_extractor_cfg=dict(
+            in_channels=64,
+            out_channels=256,
+            roi_size=7,
+            voxel_size=voxel_size[0],
+            point_cloud_range=point_cloud_range),
+            
+        # Two-stage post-NMS IoU head trained jointly with conv_iou.
+        bev_roi_iou_head_cfg=dict(hidden_dim=256),
+
         bbox_head=dict(
             type='Anchor3DHead',
             # num_classes=3,
@@ -357,16 +369,6 @@ model = dict(
                     # [-50.40, -50.40, -1.62, 50.40, 50.40, -1.62],    # Pedestrian
                     # [-50.40, -50.40, -1.67, 50.40, 50.40, -1.67],    # Cyclist
                     ],
-                # ranges=[                                          # front face range
-                #     [0, -50.40, -1.80, 68.80, 50.40, -1.80],    # Car
-                #     [0, -50.40, -1.62, 68.80, 50.40, -1.62],    # Pedestrian
-                #     [0, -50.40, -1.67, 68.80, 50.40, -1.67]     # Cyclist
-                # ],
-                # ranges=[
-                #     [0, -50.40, -0.6, 68.80, 50.40, -0.6],    # Pedestrian
-                #     [0, -50.40, -0.6, 68.80, 50.40, -0.6],    # Cyclist
-                #     [0, -50.40, -1.78, 68.80, 50.40, -1.78]     # Car
-                # ],
                 sizes=[
                     [4.2, 2.0, 1.6],         # Car
                     # [0.72, 0.66, 1.76],           # Pedestrian    
@@ -432,41 +434,49 @@ model = dict(
             nms_thr=0.01,
             score_thr=0.1,
             min_bbox_size=0,
-            nms_pre=200,
-            max_num=100,
+            nms_pre=1000,
+            max_num=500,
             # Hybrid-IoU ranking at val/test (ST3D POST_PROCESSING.SCORE_TYPE
             # analog). Independent from mean_teacher_cfg.hybrid_w_iou.
-            score_type='hybrid',
-            score_weights=dict(iou=0.0, cls=1.0))))
+            score_type='cls',           # NEVER CHANGE to hybrid or iou w/o changing detector
+            score_weights=dict(iou=0.5, cls=0.5))))
 
 # Runtime configs
 # Hooks
 default_hooks = dict(
-    checkpoint=dict(type='CheckpointHook', interval=2, save_best=None),
+    checkpoint=dict(type='CheckpointHook', interval=1, save_best=None),
     visualization=dict(type='Det3DVisualizationHook', draw=False)
 )
 custom_hooks = [
     dict(type='MeanTeacherHook', interval=1),
     dict(
         type='PseudoLabelRefreshHook',
-        interval=1,             # re-run teacher every 1 epochs
+        interval=2,             # re-run teacher every 2 epochs
         update_at_epochs=(0,),  # always refresh before epoch 0 starts
         ps_batch_size=8,
         ps_num_workers=6,
-        # Knee threshold + count floor: finds the natural quality break in the
-        # score distribution (Kneedle), but always retains at least min_boxes_kept
-        # boxes to prevent training starvation when teacher confidence collapses.
-        use_knee_threshold=True,
-        min_boxes_kept=8000,
+        # Three-constraint filter applied to teacher predictions at each refresh.
+        # Mirrors tools/visualize_pseudo_labels.py::run_baseline:
+        #   hybrid = iou_weight * IoU + (1 - iou_weight) * CLS >= hybrid_thr
+        #   IoU  >= iou_thr   (0.0 = disabled)
+        #   CLS  >= cls_thr   (0.0 = disabled)
+        # IoU = post-NMS RoI IoU head score; CLS = test_cfg ranking score.
+        hybrid_thr=0.35,
+        iou_weight=0.5,
+        iou_thr=0.15,
+        cls_thr=0.15,
+        # Broad candidate floor: conf_threshold is temporarily set to this during
+        # the refresh inference pass so filter_teacher_predictions passes the full
+        # NMS-survivor pool through; the three constraints above do the real cut.
         ps_min_score=0.05,
-        # Hybrid filter already drops poorly-localised boxes; the fallback
-        # would re-inject them as pseudo-GT and poison the student.
+        # Top-1 fallback: scenes with 0 boxes after filtering keep their
+        # highest-hybrid candidate to avoid empty-GT scenes during training.
         use_top1_fallback=False,
     ),
 ]
 
 # Scheduler and optimizer config
-train_cfg = dict(type='EpochBasedTrainLoop', max_epochs=12, val_interval=1)
+train_cfg = dict(type='EpochBasedTrainLoop', max_epochs=5, val_interval=2)
 
 # Gradient accumulation with 8 steps to achieve effective batch size of 32 (8 x 4)
 optim_wrapper = dict(type='AmpOptimWrapper',

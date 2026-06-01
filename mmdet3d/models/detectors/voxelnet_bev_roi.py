@@ -6,6 +6,28 @@ from typing import Tuple, Dict, List, Optional
 from mmdet3d.registry import MODELS
 from mmdet3d.models.detectors import VoxelNet
 from mmdet3d.structures import Det3DDataSample, LiDARInstance3DBoxes
+from mmdet3d.structures.ops.iou3d_calculator import bbox_overlaps_nearest_3d
+
+
+class BEVRoIIoUHead(nn.Module):
+    """Post-NMS RoI-level IoU quality head. Operates on RoI-pooled BEV features
+    from decoded boxes, giving calibrated per-proposal scores unlike the
+    single-stage per-anchor conv_iou.
+    """
+
+    def __init__(self, in_dim: int, hidden_dim: int = 256) -> None:
+        super().__init__()
+        self.fc = nn.Sequential(
+            nn.Linear(in_dim, hidden_dim),
+            nn.ReLU(inplace=True),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(inplace=True),
+            nn.Linear(hidden_dim, 1),
+        )
+
+    def forward(self, roi_feats: Tensor) -> Tensor:
+        """Args: roi_feats [N, in_dim]. Returns: iou_scores [N] in (0, 1)."""
+        return self.fc(roi_feats).squeeze(-1).sigmoid()
 
 
 @MODELS.register_module()
@@ -20,28 +42,33 @@ class VoxelNetBEVRoI(VoxelNet):
 
     def __init__(self,
                  roi_extractor_cfg=None,
+                 bev_roi_iou_head_cfg=None,
                  *args, **kwargs):
         super().__init__(*args, **kwargs)
-        
-        # Flag to control whether to return BEV and RoI features
+
         self.return_bev_features = False
         self.return_roi_features = False
 
-        # Initialize ROI feature extractor
         if roi_extractor_cfg is not None:
-            # Get BEV channel count from middle_encoder output
-            # Typically the same as backbone input channels
-            bev_channels = roi_extractor_cfg.get('in_channels', 256)
-            
+            roi_out_channels = roi_extractor_cfg.get('out_channels', 256)
             self.roi_extractor = ROIFeatureExtractor(
-                in_channels=bev_channels,
-                out_channels=roi_extractor_cfg.get('out_channels', 256),
+                in_channels=roi_extractor_cfg.get('in_channels', 64),
+                out_channels=roi_out_channels,
                 roi_size=roi_extractor_cfg.get('roi_size', 7),
-                voxel_size=roi_extractor_cfg.get('voxel_size', 0.16),
-                point_cloud_range=roi_extractor_cfg.get('point_cloud_range', None)
+                voxel_size=roi_extractor_cfg.get('voxel_size', 0.2),
+                point_cloud_range=roi_extractor_cfg.get('point_cloud_range', None),
             )
         else:
             self.roi_extractor = None
+            roi_out_channels = 256
+
+        if bev_roi_iou_head_cfg is not None and self.roi_extractor is not None:
+            self.bev_roi_iou_head = BEVRoIIoUHead(
+                in_dim=roi_out_channels,
+                hidden_dim=bev_roi_iou_head_cfg.get('hidden_dim', 256),
+            )
+        else:
+            self.bev_roi_iou_head = None
     
     def extract_feat(self, batch_inputs_dict: dict, 
                     return_bev: bool = False) -> Tuple[Tensor]:
@@ -108,33 +135,102 @@ class VoxelNetBEVRoI(VoxelNet):
             - roi_features (if return_roi_features=True)
         """
 
-        # Extract features
-        if return_bev_features or self.return_bev_features:
+        # Always need BEV features if the RoI IoU head is active.
+        need_bev = (return_bev_features or self.return_bev_features
+                    or self.bev_roi_iou_head is not None)
+        if need_bev:
             x, bev_features = self.extract_feat(batch_inputs_dict, return_bev=True)
         else:
             x = self.extract_feat(batch_inputs_dict, return_bev=False)
             bev_features = None
-        
-        # Get predictions from bbox_head
-        results_list = self.bbox_head.predict(x, batch_data_samples, **kwargs)
 
-        # Use superclass helper to wrap predictions into Det3DDataSample
+        results_list = self.bbox_head.predict(x, batch_data_samples, **kwargs)
         predictions = self.add_pred_to_datasample(batch_data_samples, results_list)
-        
-        # Add BEV and RoI features to each sample
+
         for i, data_sample in enumerate(predictions):
             if return_bev_features or self.return_bev_features:
-                # bev_features shape: [B, C, H, W]
-                data_sample.bev_features = bev_features[i]  # [C, H, W]
+                data_sample.bev_features = bev_features[i]
+
+            # Post-NMS RoI IoU refinement: override the per-anchor iou_scores_3d with
+            # calibrated scores from the two-stage BEV RoI head.
+            if bev_features is not None and self.bev_roi_iou_head is not None:
+                boxes_3d = data_sample.pred_instances_3d.bboxes_3d
+                if len(boxes_3d) > 0:
+                    roi_feats = self.roi_extractor.extract_roi_features(
+                        bev_features[i], boxes_3d)
+                    data_sample.pred_instances_3d.iou_scores_3d = (
+                        self.bev_roi_iou_head(roi_feats))
+                else:
+                    data_sample.pred_instances_3d.iou_scores_3d = (
+                        boxes_3d.tensor.new_zeros(0))
 
             if return_roi_features and self.roi_extractor is not None:
-                # Extract ROI features for this sample's predictions
                 boxes_3d = data_sample.pred_instances_3d.bboxes_3d
-                roi_features = self.roi_extractor.extract_roi_features(bev_features[i], boxes_3d)
-                data_sample.roi_features = roi_features  # [N, C]
-        
+                roi_features = self.roi_extractor.extract_roi_features(
+                    bev_features[i], boxes_3d)
+                data_sample.roi_features = roi_features
+
         return predictions
-    
+
+    def loss(self, batch_inputs_dict, batch_data_samples, **kwargs):
+        """Standard anchor-head loss plus BEV RoI IoU head supervision (when active)."""
+        if self.bev_roi_iou_head is not None:
+            x, bev_features = self.extract_feat(batch_inputs_dict, return_bev=True)
+        else:
+            x = self.extract_feat(batch_inputs_dict)
+            bev_features = None
+
+        losses = self.bbox_head.loss(x, batch_data_samples, **kwargs)
+
+        if bev_features is not None:
+            losses['loss_bev_roi_iou'] = self._compute_bev_roi_iou_loss(
+                x, bev_features, batch_data_samples)
+
+        return losses
+
+    def _compute_bev_roi_iou_loss(self, x, bev_features, batch_data_samples):
+        """Compute BCE loss for the BEV RoI IoU head on post-NMS proposals.
+
+        The backbone/neck/anchor-head are assumed frozen during the finetune phase,
+        so we run bbox_head.predict() under no_grad and detach BEV features before
+        RoI pooling. Gradients only flow through bev_roi_iou_head parameters.
+        """
+        device = bev_features.device
+
+        with torch.no_grad():
+            results_list = self.bbox_head.predict(x, batch_data_samples)
+
+        total_loss = bev_features.new_zeros(1).squeeze()
+        n_valid = 0
+
+        for i, (inst, sample) in enumerate(zip(results_list, batch_data_samples)):
+            if len(inst.bboxes_3d) == 0:
+                continue
+
+            proposal_boxes = inst.bboxes_3d.tensor[:, :7]
+
+            gt = getattr(sample, 'gt_instances_3d', None)
+            if gt is None or len(gt.bboxes_3d) == 0:
+                iou_targets = proposal_boxes.new_zeros(len(proposal_boxes))
+            else:
+                gt_boxes = gt.bboxes_3d.tensor[:, :7].to(device)
+                iou_mat = bbox_overlaps_nearest_3d(
+                    proposal_boxes, gt_boxes, mode='iou', is_aligned=False)
+                iou_targets = iou_mat.max(dim=1)[0]
+
+            # RoI features from frozen extractor — detach so no grad flows to backbone.
+            roi_feats = self.roi_extractor.extract_roi_features(
+                bev_features[i].detach(), inst.bboxes_3d)
+
+            # Use raw logits + BCEWithLogits to be AMP-safe.
+            logits = self.bev_roi_iou_head.fc(roi_feats).squeeze(-1)
+            total_loss = total_loss + F.binary_cross_entropy_with_logits(
+                logits, iou_targets.clamp(0., 1.))
+            n_valid += 1
+
+        return total_loss / n_valid if n_valid > 0 else total_loss
+
+
 class ROIFeatureExtractor(nn.Module):
     """
     Extract per-object features from BEV feature maps for single-stage detectors.

@@ -72,6 +72,15 @@ val_evaluator = dict(
 test_evaluator = val_evaluator
 
 model = dict(
+    roi_extractor_cfg=dict(
+        in_channels=64,
+        out_channels=256,
+        roi_size=7,
+        voxel_size=0.2,
+        point_cloud_range=[-50.4, -50.4, -5.0, 50.4, 50.4, 3.0]),
+    # Two-stage post-NMS IoU head trained jointly with conv_iou.
+    bev_roi_iou_head_cfg=dict(hidden_dim=256),
+    bbox_head=dict(predict_iou=True),
     test_cfg=dict(
         use_rotate_nms=True,
         nms_across_levels=False,
@@ -79,4 +88,6 @@ model = dict(
         score_thr=0.05,
         min_bbox_size=0,
         nms_pre=100,
-        max_num=50))
+        max_num=50,
+        score_type='cls',
+        score_weights=dict(iou=0.0, cls=1.0)))

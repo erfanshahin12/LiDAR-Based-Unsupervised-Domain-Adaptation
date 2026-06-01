@@ -109,80 +109,37 @@ class MeanTeacher3DDetector(Base3DDetector):
         self._last_param_norm = None
         self._train_iter = 0
 
-        # Periodic pseudo-label store: {lidar_path -> {'gt_boxes': (N,7), 'gt_labels': (N,), 'scores': (N,)}}
-        # Populated by PseudoLabelRefreshHook; empty dict means fall back to per-iteration teacher predict.
+        # {lidar_path → entry}: populated by PseudoLabelRefreshHook;
+        # empty → fall back to per-iteration teacher predictions.
         self.pseudo_label_store: dict = {}
-
-        logger = MMLogger.get_current_instance()
-        logger.info(
-            f'ema_momentum={mean_teacher_cfg.get("ema_momentum", 0.999)}, '
-            f'update_teacher_buffers={mean_teacher_cfg.get("update_teacher_buffers", False)}, '
-            f'eval_use_teacher={mean_teacher_cfg.get("eval_use_teacher", True)}, '
-            f'burn_in_iters={mean_teacher_cfg.get("burn_in_iters", 0)} ')
-
-    # ------------------------------------------------------------------
-    # Load pretrained weights to both student and teacher at initialization
-    # ------------------------------------------------------------------
 
     def init_weights(self):
         super().init_weights()
 
-        if self.pretrained_ckpt is not None:
+        if self.pretrained_ckpt is None:
+            return
 
-            # Keys allowed to be missing from a pretrain checkpoint.  Hybrid thresholding's
-            # IoU head (``bbox_head.conv_iou.*``) is added at adaptation time
-            # and therefore expected to be absent from pretrain w/o IoU head.
-            hybrid_iou_prefix = 'bbox_head.conv_iou.'
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        state_dict = torch.load(self.pretrained_ckpt, map_location=device)
+        state_dict = state_dict.get('state_dict', state_dict)
 
-            def _check_loaded_keys(missing, unexpected):
-                # Guard against silent partial loads in core layers (e.g. num_classes mismatch).
-                critical_prefixes = (
-                    'bbox_head.', 'voxel_encoder.', 'middle_encoder.', 'backbone.', 'neck.')
-                critical_missing    = [
-                    k for k in missing
-                    if k.startswith(critical_prefixes)
-                    and not k.startswith(hybrid_iou_prefix)
-                ]
-                critical_unexpected = [k for k in unexpected if k.startswith(critical_prefixes)]
-                if critical_missing or critical_unexpected:
-                    raise RuntimeError(
-                        f'Pretrained checkpoint architectural mismatch — refusing to train '
-                        f'with randomly-initialised core layers.\n'
-                        f'  missing    (model has, ckpt lacks): {critical_missing}\n'
-                        f'  unexpected (ckpt has, model lacks): {critical_unexpected}\n'
-                        f'Check that num_classes, anchor sizes, and head architecture match '
-                        f'between this config and {self.pretrained_ckpt}.')
-                # Surface (but don't fail on) IoU-head keys so it's
-                # visible in the log that random init was used.
-                hybrid_keys = [k for k in missing if k.startswith(hybrid_iou_prefix)]
-                if hybrid_keys:
-                    MMLogger.get_current_instance().info(
-                        f'  [Hybrid IoU] {len(hybrid_keys)} IoU-head keys absent from '
-                        f'checkpoint — randomly initialised at adaptation time: '
-                        f'{hybrid_keys}')
+        missing, unexpected = self.student.load_state_dict(state_dict, strict=False)
+        self.teacher.load_state_dict(state_dict, strict=False)
 
-            device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-            checkpoint = torch.load(self.pretrained_ckpt, map_location=device)
-            state_dict = checkpoint.get('state_dict', checkpoint)
-            logger = MMLogger.get_current_instance()
+        MMLogger.get_current_instance().info(
+            f'[init_weights] {self.pretrained_ckpt} → student+teacher: '
+            f'missing={len(missing)} unexpected={len(unexpected)}')
 
-            # Load to student
-            missing, unexpected = self.student.load_state_dict(state_dict, strict=False)
-            logger.info(
-                f'Student: pretrained weights loaded from {self.pretrained_ckpt}: '
-                f'{len(missing)} missing keys, {len(unexpected)} unexpected keys')
-            _check_loaded_keys(missing, unexpected)
-
-            # Load to teacher
-            missing, unexpected = self.teacher.load_state_dict(state_dict, strict=False)
-            logger.info(
-                f'Teacher: pretrained weights loaded from {self.pretrained_ckpt}: '
-                f'{len(missing)} missing keys, {len(unexpected)} unexpected keys')
-            _check_loaded_keys(missing, unexpected)
-
-    # ------------------------------------------------------------------
-    # EMA update
-    # ------------------------------------------------------------------
+        # Fail fast on core-layer mismatches (num_classes, anchor config, etc.).
+        critical = ('bbox_head.', 'voxel_encoder.', 'middle_encoder.', 'backbone.', 'neck.')
+        skip = 'bbox_head.conv_iou.'   # IoU head is always newly added
+        bad_missing    = [k for k in missing    if k.startswith(critical) and not k.startswith(skip)]
+        bad_unexpected = [k for k in unexpected if k.startswith(critical)]
+        if bad_missing or bad_unexpected:
+            raise RuntimeError(
+                f'Pretrained checkpoint mismatch in core layers — refusing to train.\n'
+                f'  missing: {bad_missing}\n  unexpected: {bad_unexpected}\n'
+                f'Check num_classes / anchor config vs {self.pretrained_ckpt}.')
 
     @torch.no_grad()
     def ema_update(self):
@@ -219,9 +176,6 @@ class MeanTeacher3DDetector(Base3DDetector):
                 f'[EMA #{self._ema_update_count}] avg param norm: {avg_norm:.4f}{delta}')
             self._last_param_norm = avg_norm
 
-    # ------------------------------------------------------------------
-    # Periodic pseudo-label store management
-    # ------------------------------------------------------------------
 
     def set_pseudo_labels(self, d: dict) -> None:
         """Replace the pseudo-label store with a new dict.
@@ -242,17 +196,11 @@ class MeanTeacher3DDetector(Base3DDetector):
         self.set_pseudo_labels(d)
 
     def _create_pseudo_labels_from_store(self, target_samp_strong, device):
-        """Build pseudo-labeled strong samples directly from the cached store.
+        """Build pseudo-labeled strong samples from the cached store.
 
-        Equivalent to ``_create_pseudo_labels`` but reads boxes from
-        ``pseudo_label_store`` instead of from teacher prediction objects,
-        skipping the intermediate wrapper step.  Canonical-frame boxes are
-        transformed into the strong-augmentation frame via ``_transform_boxes``.
-        Samples missing from the store contribute zero gradient (empty GT).
+        Store boxes are in canonical (weak-aug) frame; they are transformed to
+        the strong-aug frame via ``_transform_boxes``. Missing entries get empty GT.
         """
-        verbose = self.mean_teacher_cfg.get('verbose', False)
-        logger = MMLogger.get_current_instance()
-
         pseudo_labeled_samples = copy.deepcopy(target_samp_strong)
         total_boxes = 0
 
@@ -261,18 +209,13 @@ class MeanTeacher3DDetector(Base3DDetector):
             entry = self.pseudo_label_store.get(key)
 
             if entry is not None and len(entry['gt_boxes']) > 0:
-                boxes_t = torch.from_numpy(
-                    entry['gt_boxes'].astype(np.float32)).to(device)
-                labels_t = torch.from_numpy(
-                    entry['gt_labels'].astype(np.int64)).to(device)
-                scores_t = torch.from_numpy(
-                    entry['scores'].astype(np.float32)).to(device)
-
-                boxes_3d = LiDARInstance3DBoxes(boxes_t)
-                boxes_3d = self._transform_boxes(boxes_3d, samp_strong.metainfo)
+                boxes_t  = torch.from_numpy(entry['gt_boxes'].astype(np.float32)).to(device)
+                labels_t = torch.from_numpy(entry['gt_labels'].astype(np.int64)).to(device)
+                scores_t = torch.from_numpy(entry['scores'].astype(np.float32)).to(device)
+                boxes_3d = self._transform_boxes(
+                    LiDARInstance3DBoxes(boxes_t), samp_strong.metainfo)
             else:
-                boxes_3d = LiDARInstance3DBoxes(
-                    torch.zeros(0, 7, device=device))
+                boxes_3d = LiDARInstance3DBoxes(torch.zeros(0, 7, device=device))
                 labels_t = torch.zeros(0, dtype=torch.long, device=device)
                 scores_t = torch.zeros(0, device=device)
 
@@ -281,20 +224,12 @@ class MeanTeacher3DDetector(Base3DDetector):
             gt.scores_3d = scores_t
             pseudo_samp.gt_instances_3d = gt
 
-        if verbose:
-            logger.info(
-                f'[PseudoStats/store] total_boxes={total_boxes} '
-                f'across {len(pseudo_labeled_samples)} samples')
         if total_boxes == 0:
-            logger.warning(
-                '[PseudoLabels] No pseudo-labels from store '
-                '(all frames missing or empty)')
+            MMLogger.get_current_instance().warning(
+                '[PseudoLabels] store produced 0 boxes (all frames missing or empty)')
 
         return pseudo_labeled_samples
 
-    # ------------------------------------------------------------------
-    # Teacher prediction filtering
-    # ------------------------------------------------------------------
 
     def _hybrid_effective_w_iou(self) -> float:
         """Effective IoU weight in the hybrid pseudo-label score.
@@ -356,251 +291,65 @@ class MeanTeacher3DDetector(Base3DDetector):
         mask = hybrid >= conf_threshold
 
         filtered_pred = copy.copy(teacher_pred)
-        filtered_pred.pred_instances_3d = InstanceData(
+        inst_data = InstanceData(
             bboxes_3d=bboxes[mask],
             scores_3d=hybrid[mask],
             labels_3d=labels[mask],
         )
+        if iou_scores is not None:
+            inst_data.iou_scores_3d = iou_scores[mask]
+        # scores is the pre-hybrid CLS (scores_3d before write-back); preserve for pkl.
+        inst_data.cls_scores_3d = scores[mask]
+        filtered_pred.pred_instances_3d = inst_data
         if hasattr(teacher_pred, 'bev_features'):
             filtered_pred.bev_features = teacher_pred.bev_features
 
         return filtered_pred
 
-    # ------------------------------------------------------------------
-    # Iter-0 sanity diagnostic
-    # ------------------------------------------------------------------
-
-    def _log_output_sanity(self, target_weak_in, target_samp_weak):
-        """One-shot diagnostic at iter 1: trace the full prediction chain for teacher and student.
-
-        Both models are evaluated on the same weak-aug target input. Because
-        PillarFeatureNet (legacy=True) modifies the voxel tensor in-place when
-        computing cluster/voxel-centre offsets, every forward call receives a
-        fresh deep copy of the input so later calls are not corrupted.
-
-        Sections:
-          1. Input stats (voxel count, xyz ranges, intensity range).
-          2. Raw cls-score histogram before NMS (eval mode, isolated copy).
-          3. Post-NMS predictions in eval and train mode (reveals BN instability).
-          Teacher and student should produce identical numbers at iter 1 —
-          any divergence here is a bug in initialization.
-        """
-        logger = MMLogger.get_current_instance()
-        thresholds = [0.1, 0.3, 0.5]
-
-        def _fresh_copy(inp):
-            """Return a deep copy of the preprocessed input dict.
-
-            PillarFeatureNet with legacy=True subtracts voxel-centre offsets
-            directly into the voxel tensor (in-place view assignment).  Every
-            forward call must receive its own copy so that successive calls in
-            this diagnostic do not see accumulated coordinate shifts.
-            """
-            return copy.deepcopy(inp)
-
-        # ── 1. Input statistics — read before any forward modifies the tensor ─
-        try:
-            voxels = target_weak_in['voxels']['voxels']
-            coors  = target_weak_in['voxels']['coors']
-            n_pts  = target_weak_in['voxels']['num_points']
-            total_voxels  = voxels.shape[0]
-            total_points  = int(n_pts.sum().item())
-            pts_flat = []
-            for vi in range(min(total_voxels, 500)):
-                nv = int(n_pts[vi].item())
-                if nv > 0:
-                    pts_flat.append(voxels[vi, :nv, :])
-            if pts_flat:
-                pts = torch.cat(pts_flat, dim=0).cpu()
-                intensity_str = (
-                    f'  intensity=[{pts[:, 3].min():.1f}, {pts[:, 3].max():.1f}]'
-                    if pts.shape[1] >= 4 else '')
-                logger.info(
-                    f'[Sanity iter-1] voxelized input: '
-                    f'total_voxels={total_voxels}  total_points={total_points}  '
-                    f'batch_indices={coors[:, 0].unique().cpu().tolist()}  '
-                    f'x=[{pts[:, 0].min():.1f}, {pts[:, 0].max():.1f}]  '
-                    f'y=[{pts[:, 1].min():.1f}, {pts[:, 1].max():.1f}]  '
-                    f'z=[{pts[:, 2].min():.1f}, {pts[:, 2].max():.1f}]'
-                    + intensity_str)
-            else:
-                logger.warning('[Sanity iter-1] NO voxels (empty input!)')
-        except Exception as exc:
-            logger.warning(f'[Sanity iter-1] could not inspect voxels: {exc}')
-
-        # ── 2. Raw cls-score histogram (eval mode, isolated copy per call) ────
-        def log_cls_scores(model, label):
-            original_mode = model.training
-            try:
-                model.eval()
-                with torch.no_grad():
-                    x = model.extract_feat(_fresh_copy(target_weak_in), return_bev=False)
-                    cls_scores_raw = []
-                    if hasattr(model, 'bbox_head'):
-                        head = model.bbox_head
-                        if hasattr(head, 'forward_single'):
-                            for feat in x:
-                                cls, *_ = head.forward_single(feat)
-                                cls_scores_raw.append(cls.sigmoid().cpu())
-                        else:
-                            outs = head(x)
-                            if isinstance(outs, (list, tuple)) and len(outs) > 0:
-                                if isinstance(outs[0], (list, tuple)):
-                                    for t in outs[0]:
-                                        if isinstance(t, torch.Tensor):
-                                            cls_scores_raw.append(t.sigmoid().cpu())
-                    if cls_scores_raw:
-                        all_cls = torch.cat([c.flatten() for c in cls_scores_raw])
-                        pct_str = '  '.join(
-                            f'p{p}={torch.quantile(all_cls, p/100).item():.4f}'
-                            for p in [50, 75, 90, 95, 99])
-                        above_thresh = {t: int((all_cls >= t).sum()) for t in thresholds}
-                        logger.info(
-                            f'[Sanity {label}] raw cls scores (pre-NMS, {len(all_cls)} anchors): '
-                            f'{pct_str}  '
-                            + '  '.join(f'>={t:.1f}:{n}' for t, n in above_thresh.items()))
-                    else:
-                        logger.warning(f'[Sanity {label}] could not extract raw cls scores')
-            except Exception as exc:
-                logger.warning(f'[Sanity {label}] raw cls score extraction failed: {exc}')
-            finally:
-                model.train(original_mode)
-
-        # ── 3. Post-NMS predictions (isolated copy per mode per model) ────────
-        def log_predictions(model, label):
-            original_mode = model.training
-            for mode_label, use_eval in (('eval', True), ('train', False)):
-                model.eval() if use_eval else model.train()
-                with torch.no_grad():
-                    try:
-                        preds = model.predict(
-                            _fresh_copy(target_weak_in),
-                            copy.deepcopy(target_samp_weak))
-                    except Exception as exc:
-                        logger.warning(f'[Sanity {label}:{mode_label}] predict raised: {exc}')
-                        continue
-                score_lists = [
-                    getattr(p.pred_instances_3d, 'scores_3d', None).detach().cpu()
-                    for p in preds
-                    if getattr(p, 'pred_instances_3d', None) is not None
-                    and getattr(p.pred_instances_3d, 'scores_3d', None) is not None
-                ]
-                if score_lists:
-                    scores = torch.cat(score_lists)
-                    count_str = '  '.join(
-                        f'>={t:.1f}:{int((scores >= t).sum())}' for t in thresholds)
-                    logger.info(
-                        f'[Sanity {label}:{mode_label}] '
-                        f'total_returned={len(scores)}  {count_str}')
-                else:
-                    logger.info(f'[Sanity {label}:{mode_label}] zero predictions returned')
-            model.train(original_mode)
-
-        logger.info('[Sanity iter-1] --- TEACHER ---')
-        log_cls_scores(self.teacher, 'teacher')
-        log_predictions(self.teacher, 'teacher')
-
-        logger.info('[Sanity iter-1] --- STUDENT ---')
-        log_cls_scores(self.student, 'student')
-        log_predictions(self.student, 'student')
-
-        logger.info(
-            '[Sanity iter-1] INTERPRETATION: '
-            'total_voxels~0 → points outside range; check KittiToNuscenes + PointsRangeFilter. '
-            'intensity not in [0,255] → KittiToNuscenes ×255 scaling not applied. '
-            'cls scores all low → pretrained weights not loading or wrong coordinate frame. '
-            'cls scores OK but total_returned=0 → NMS/score_thr too aggressive. '
-            'eval >> train → BN train-mode instability (expected). '
-            'teacher != student at iter-1 → initialization bug.')
-
-    # ------------------------------------------------------------------
-    # InfoNCE contrastive loss
-    # ------------------------------------------------------------------
 
     def contrastive_loss(self, bev_s, bev_t, boxes_t_s, boxes_t,
-                         tau=0.07):
-        """InfoNCE object-level BEV-feature consistency between student and teacher.
+                         all_boxes_t=None, all_scores_t=None,
+                         conf_threshold=0.6, tau=0.07):
+        """Symmetric InfoNCE on RoI-pooled BEV features (CMT-style).
 
-        Features are bilinearly sampled at the box centres.  Only boxes whose
-        centres fall inside the valid BEV area in **both** feature maps are used,
-        and they are aligned by box index before computing the loss.
-
-        Args:
-            bev_s: Student BEV feature map (strong aug) [C, H, W].
-            bev_t: Teacher BEV feature map (weak aug) [C, H, W].
-            boxes_t_s: Teacher boxes in strong-aug space [N, 7].
-            boxes_t: Teacher boxes in weak-aug space [N, 7].
-            tau: InfoNCE temperature.
-
-        Returns:
-            Scalar loss.  Weighting by ``contrastive_weight`` is done by the caller.
+        RoI features replace point-sampled BEV features; low-confidence teacher
+        predictions serve as explicit background negatives in the denominator.
         """
         device = bev_s.device
-        if boxes_t is None or boxes_t.shape[0] == 0:
+        roi_extractor = getattr(self.student, 'roi_extractor', None)
+
+        if roi_extractor is None or boxes_t is None or boxes_t.shape[0] == 0:
             return torch.tensor(0., device=device)
 
-        pc_range = self.mean_teacher_cfg['point_cloud_range']
-        min_x, min_y = pc_range[0], pc_range[1]
-        max_x, max_y = pc_range[3], pc_range[4]
-
-        def sample_bev(bev, boxes):
-            """Bilinear-sample BEV [C,H,W] at box xy-centres.
-
-            Returns (feats [N_valid, C], valid_idx [N_valid]) or (None, None).
-            """
-            norm_x = 2.0 * (boxes[:, 0] - min_x) / (max_x - min_x) - 1.0
-            norm_y = 2.0 * (boxes[:, 1] - min_y) / (max_y - min_y) - 1.0
-            valid_mask = (norm_x > -1.0) & (norm_x < 1.0) & \
-                         (norm_y > -1.0) & (norm_y < 1.0)
-            valid_idx = valid_mask.nonzero(as_tuple=False).squeeze(1)
-            if valid_idx.numel() == 0:
-                return None, None
-            # F.grid_sample: input [1,C,H,W], grid [1,1,N,2] → [1,C,1,N].
-            grid = torch.stack(
-                [norm_x[valid_idx], norm_y[valid_idx]], dim=-1
-            ).unsqueeze(0).unsqueeze(0)
-            feats = F.grid_sample(
-                bev.unsqueeze(0), grid,
-                mode='bilinear', align_corners=True, padding_mode='border'
-            ).squeeze(0).squeeze(1).T  # [N_valid, C]
-            return feats, valid_idx
-
-        F_t, idx_t = sample_bev(bev_t, boxes_t)
-        F_s, idx_s = sample_bev(bev_s, boxes_t_s)
-        if F_t is None or F_s is None:
-            return torch.tensor(0., device=device)
-
-        # Align: build {original_box_index → row} maps then re-index by the
-        # intersection so row i of F_s and F_t correspond to the same box.
-        map_t = {v: i for i, v in enumerate(idx_t.tolist())}
-        map_s = {v: i for i, v in enumerate(idx_s.tolist())}
-        common = sorted(set(map_t) & set(map_s))
-        if not common:
-            return torch.tensor(0., device=device)
-
-        rows_t = torch.tensor([map_t[k] for k in common], device=device)
-        rows_s = torch.tensor([map_s[k] for k in common], device=device)
-        F_t = F.normalize(F_t[rows_t], dim=1)
-        F_s = F.normalize(F_s[rows_s], dim=1)
+        # RoI features: boxes_t and boxes_t_s share the same ordering → F_s[i] ↔ F_t[i].
+        F_s = F.normalize(roi_extractor.extract_roi_features(
+            bev_s, LiDARInstance3DBoxes(boxes_t_s)), dim=1)   # [N, C]
+        F_t = F.normalize(roi_extractor.extract_roi_features(
+            bev_t, LiDARInstance3DBoxes(boxes_t)), dim=1)     # [N, C]
 
         N = F_s.shape[0]
         if N == 0:
             return torch.tensor(0., device=device)
 
-        pos_mask = torch.eye(N, device=device)
+        # Background negatives from low-confidence teacher predictions.
+        F_bg = None
+        if all_boxes_t is not None and all_scores_t is not None:
+            bg_boxes = all_boxes_t[all_scores_t < conf_threshold]
+            if bg_boxes.shape[0] > 0:
+                F_bg = F.normalize(roi_extractor.extract_roi_features(
+                    bev_t, LiDARInstance3DBoxes(bg_boxes)), dim=1)  # [N_bg, C]
 
-        # Symmetric InfoNCE: average s→t and t→s directions
-        sim_st = torch.mm(F_s, F_t.T) / tau
-        loss_st = -(pos_mask * F.log_softmax(sim_st, dim=1)).sum(dim=1).mean()
+        # s→t: student queries against teacher fg (pos) + teacher bg (neg).
+        F_neg = torch.cat([F_t, F_bg], dim=0) if F_bg is not None else F_t
+        pos_st = (F_s * F_t).sum(dim=1) / tau
+        loss_st = -(pos_st - torch.logsumexp(torch.mm(F_s, F_neg.T) / tau, dim=1)).mean()
 
-        sim_ts = torch.mm(F_t, F_s.T) / tau
-        loss_ts = -(pos_mask * F.log_softmax(sim_ts, dim=1)).sum(dim=1).mean()
-        
+        # t→s: teacher fg queries against student fg (fg-only negatives).
+        pos_ts = (F_t * F_s).sum(dim=1) / tau
+        loss_ts = -(pos_ts - torch.logsumexp(torch.mm(F_t, F_s.T) / tau, dim=1)).mean()
+
         return (loss_st + loss_ts) * 0.5
 
-    # ------------------------------------------------------------------
-    # Box transform: weak-aug space → strong-aug space
-    # ------------------------------------------------------------------
 
     def _transform_boxes(self, boxes, metainfo_strong):
         """Apply the strong augmentation transforms recorded in ``metainfo_strong``
@@ -702,9 +451,7 @@ class MeanTeacher3DDetector(Base3DDetector):
         # Use default origin=(0.5,0.5,0): boxes_tensor already has z at bottom-center.
         return LiDARInstance3DBoxes(boxes_tensor, box_dim=boxes_tensor.shape[-1])
 
-    # ------------------------------------------------------------------
     # Pseudo-label construction
-    # ------------------------------------------------------------------
 
     def _create_pseudo_labels(self, teacher_predictions, target_samples_strong):
         """Replace ``gt_instances_3d`` in each strong-aug sample with teacher predictions.
@@ -748,9 +495,7 @@ class MeanTeacher3DDetector(Base3DDetector):
 
         return pseudo_labeled_samples
 
-    # ------------------------------------------------------------------
     # Training loss
-    # ------------------------------------------------------------------
 
     def loss(self, batch_inputs_dict, batch_data_samples):
         """Compute the three-term Mean Teacher loss.
@@ -799,11 +544,6 @@ class MeanTeacher3DDetector(Base3DDetector):
         target_strong_in, target_samp_strong = preprocess(
             batch_inputs_dict['unlabeled']['strong'], batch_data_samples['unlabeled']['strong'])
 
-        # Iter-1 sanity check: verify teacher and student produce identical outputs
-        # on the same weak-augmented input.
-        if self._train_iter == 1:
-            self._log_output_sanity(target_weak_in, target_samp_weak)
-
         # ── TERM 1: Source supervised loss ───────────────────────────
         if w_source > 0:
             _ds_switch(self.student, 'source')
@@ -826,16 +566,15 @@ class MeanTeacher3DDetector(Base3DDetector):
 
         filtered_preds = [self.filter_teacher_predictions(p) for p in teacher_pred]
         if verbose:
-            conf_threshold = self.mean_teacher_cfg.get('conf_threshold', 0.6)
+            conf_thr_log = self.mean_teacher_cfg.get('conf_threshold', 0.6)
             total_before = sum(len(p.pred_instances_3d.scores_3d) for p in teacher_pred)
             total_after  = sum(len(p.pred_instances_3d.scores_3d) for p in filtered_preds)
             per_sample   = [len(p.pred_instances_3d.scores_3d) for p in filtered_preds]
             logger.info(
-                f'[Filter] kept {total_after}/{total_before} boxes across {len(filtered_preds)} samples '
-                f'(thresh={conf_threshold:.2f})  per-sample: {per_sample}')
+                f'[Filter] kept {total_after}/{total_before} boxes across '
+                f'{len(filtered_preds)} samples (thresh={conf_thr_log:.2f})  '
+                f'per-sample: {per_sample}')
 
-        # Transform teacher boxes from weak to strong aug space.
-        # transformed_preds is used for the BEV contrastive loss (boxes_t_s).
         transformed_preds = copy.deepcopy(filtered_preds)
 
         for pred, samp in zip(transformed_preds, target_samp_strong):
@@ -843,98 +582,59 @@ class MeanTeacher3DDetector(Base3DDetector):
                 pred.pred_instances_3d.bboxes_3d = self._transform_boxes(
                     pred.pred_instances_3d.bboxes_3d, samp.metainfo)
 
-        # ── TERMS 2 + 3: Pseudo-label loss and BEV contrastive loss ──────────
-        # Pseudo-label source: use the periodically-refreshed store when
-        # populated (PseudoLabelRefreshHook), otherwise fall back to the
-        # current-iteration teacher predictions (online Mean Teacher).
-        # When BEV contrastive is active we need the student's BEV feature map
-        # from the target-strong pass.  Running student.predict() after
-        # student.loss() would be a *third* forward with a live computation
-        # graph, blowing GPU memory.  Instead, extract features once and feed
-        # them to both bbox_head.loss (pseudo-label) and contrastive_loss.
-
-        if self.pseudo_label_store:         # create pseudo-labels from the cached pseudo-label store
+        # ── TERM 2: Pseudo-label loss ──────────────────────────────────
+        # Pseudo-labels come from the periodically-refreshed store (populated by
+        # PseudoLabelRefreshHook) or fall back to current-iteration teacher preds.
+        if self.pseudo_label_store:
             pseudo_samples = self._create_pseudo_labels_from_store(
                 target_samp_strong, device)
-
-        else:                               # create pseudo-labels from the current teacher predictions
+        else:
             pseudo_samples = self._create_pseudo_labels(
                 transformed_preds, target_samp_strong)
 
-        use_bev = self.mean_teacher_cfg.get('use_bev_consistency', False)
-
+        # Extract student features once — neck features for pseudo-label loss,
+        # BEV features for contrastive loss — avoiding a second forward pass.
         _ds_switch(self.student, 'target')
-        if use_bev and w_cont > 0:
-            # Single forward: get neck features + BEV map in one pass.
-            x_strong, bev_features_student = self.student.extract_feat(
-                target_strong_in, return_bev=True)
-            if w_target > 0:
-                loss_target = self.student.bbox_head.loss(x_strong, pseudo_samples)
-                for key, value in loss_target.items():
-                    if isinstance(value, (list, tuple)):
-                        losses[f'{key}_target'] = [v * w_target for v in value]
-                    else:
-                        losses[f'{key}_target'] = value * w_target
-        else:
-            bev_features_student = None
-            if w_target > 0:
-                loss_target = self.student.loss(target_strong_in, pseudo_samples)
-                for key, value in loss_target.items():
-                    if isinstance(value, (list, tuple)):
-                        losses[f'{key}_target'] = [v * w_target for v in value]
-                    else:
-                        losses[f'{key}_target'] = value * w_target
+        x_strong, bev_features_student = self.student.extract_feat(
+            target_strong_in, return_bev=True)
+
+        if w_target > 0:
+            loss_target = self.student.bbox_head.loss(x_strong, pseudo_samples)
+            for key, value in loss_target.items():
+                if isinstance(value, (list, tuple)):
+                    losses[f'{key}_target'] = [v * w_target for v in value]
+                else:
+                    losses[f'{key}_target'] = value * w_target
 
         # ── TERM 3: BEV contrastive loss ──────────────────────────────
-        if use_bev and w_cont > 0:
-            loss_cont_total = torch.tensor(0., device=device)
-            n_valid = 0
+        loss_cont_total = torch.tensor(0., device=device)
+        n_valid = 0
+        tau = self.mean_teacher_cfg.get('tau', 0.07)
+        conf_thr = self.mean_teacher_cfg.get('conf_threshold', 0.6)
 
-            for i in range(len(filtered_preds)):
-                bev_s = bev_features_student[i] if bev_features_student is not None else None
-                bev_t = getattr(filtered_preds[i], 'bev_features', None)
-                if bev_s is None or bev_t is None:
-                    continue
+        for i in range(len(filtered_preds)):
+            bev_t = getattr(filtered_preds[i], 'bev_features', None)
+            if bev_t is None:
+                continue
+            boxes_t   = filtered_preds[i].pred_instances_3d.bboxes_3d.tensor
+            boxes_t_s = transformed_preds[i].pred_instances_3d.bboxes_3d.tensor
+            if boxes_t.shape[0] == 0:
+                continue
+            loss_i = self.contrastive_loss(
+                bev_features_student[i], bev_t, boxes_t_s, boxes_t,
+                all_boxes_t=teacher_pred[i].pred_instances_3d.bboxes_3d.tensor,
+                all_scores_t=teacher_pred[i].pred_instances_3d.scores_3d,
+                conf_threshold=conf_thr, tau=tau,
+            )
+            loss_cont_total += loss_i
+            n_valid += 1
 
-                boxes_t   = filtered_preds[i].pred_instances_3d.bboxes_3d.tensor
-                boxes_t_s = transformed_preds[i].pred_instances_3d.bboxes_3d.tensor
-                if boxes_t.shape[0] == 0:
-                    continue
-
-                loss_i = self.contrastive_loss(
-                    bev_s, bev_t, boxes_t_s, boxes_t,
-                    tau=self.mean_teacher_cfg.get('tau', 0.07),
-                )
-                loss_cont_total += loss_i
-                n_valid += 1
-
-            losses['loss_contrastive'] = (
-                loss_cont_total / n_valid * w_cont if n_valid > 0
-                else torch.tensor(0., device=device))
-        else:
-            losses['loss_contrastive'] = torch.tensor(0., device=device)
-
-        # ── Debug summary ──────────────────────────────────────────────
-        # if verbose:
-        #     source_loss_total = sum(v for k, v in losses.items()
-        #                             if '_source' in k and isinstance(v, torch.Tensor))
-        #     target_loss_parts = [v for k, v in losses.items()
-        #                           if '_target' in k and isinstance(v, torch.Tensor)]
-        #     target_loss_total = (sum(target_loss_parts) if target_loss_parts
-        #                          else torch.tensor(0., device=device))
-        #     contrastive_loss_total = losses.get(
-        #         'loss_contrastive', torch.tensor(0., device=device))
-        #     logger.info(
-        #         f'[iter {self._train_iter}] '
-        #         f'source_loss={source_loss_total.item():.4f}  '
-        #         f'target_pseudo_loss={target_loss_total.item():.4f}  '
-        #         f'contrastive_loss={contrastive_loss_total.item():.4f}')
+        losses['loss_contrastive'] = (
+            loss_cont_total / n_valid * w_cont if n_valid > 0
+            else torch.tensor(0., device=device))
 
         return {k: v for k, v in losses.items() if not k.startswith('_')}
 
-    # ------------------------------------------------------------------
-    # Inference
-    # ------------------------------------------------------------------
 
     def predict(self, batch_inputs, batch_data_samples,
                 use_teacher=None, **kwargs):
@@ -956,8 +656,7 @@ class MeanTeacher3DDetector(Base3DDetector):
         was_training = subnet.training
         subnet.eval()
         try:
-            # The MT wrapper has no data_preprocessor of its own, so mmengine's
-            # val_step only device-transfers the points.  Voxelize here via the
+            # The MT wrapper has no data_preprocessor of its own, Voxelize here via the
             # subnet's preprocessor before forwarding.
             data = subnet.data_preprocessor(
                 {'inputs': batch_inputs, 'data_samples': batch_data_samples},
