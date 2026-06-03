@@ -343,16 +343,14 @@ model = dict(
             upsample_strides=[1, 2, 4],
             out_channels=[128, 128, 128]),
 
-        # Add RoI feature extractor (matches middle_encoder output: 64ch, 504×504 BEV).
+        # RoI feature extractor for MeanTeacher contrastive/BEV-consistency loss
+        # (matches middle_encoder output: 64ch BEV map).
         roi_extractor_cfg=dict(
             in_channels=64,
             out_channels=256,
             roi_size=7,
             voxel_size=voxel_size[0],
             point_cloud_range=point_cloud_range),
-            
-        # Two-stage post-NMS IoU head trained jointly with conv_iou.
-        bev_roi_iou_head_cfg=dict(hidden_dim=256),
 
         bbox_head=dict(
             type='Anchor3DHead',
@@ -390,14 +388,17 @@ model = dict(
             loss_dir=dict(
                 type='mmdet.CrossEntropyLoss', use_sigmoid=False,
                 loss_weight=0.2),
-            # Per-anchor IoU regression head. Loss is BCE-with-logits
-            # against the actual 3D IoU between decoded prediction and assigned
-            # GT (positives only). Random-init at adaptation time — the
-            # detector's ``filter_teacher_predictions`` runs cls-only filtering
-            # during the ``iou_warmup_iters`` set in mean_teacher_cfg above,
-            # then switches to hybrid scoring once this head is trained up.
+            # Per-anchor IoU quality head: BCE vs true rotated-3D-IoU targets,
+            # balanced across bins [0,0.1) [0.1,0.3) [0.3,0.5) [0.5,1.0].
+            # Pretrained on source domain; loaded from the pretrain checkpoint.
+            # filter_teacher_predictions applies hybrid_w_iou independently of
+            # score_type below.
             predict_iou=True,
-            loss_iou_weight=1.0),
+            loss_iou_weight=1.0,
+            iou_sample_cfg=dict(
+                num_per_img=256,
+                bins=[0.0, 0.1, 0.3, 0.5, 1.0],
+            )),
     
         # model training and testing settings
         train_cfg=dict(
@@ -436,9 +437,11 @@ model = dict(
             min_bbox_size=0,
             nms_pre=1000,
             max_num=500,
-            # Hybrid-IoU ranking at val/test (ST3D POST_PROCESSING.SCORE_TYPE
-            # analog). Independent from mean_teacher_cfg.hybrid_w_iou.
-            score_type='cls',           # NEVER CHANGE to hybrid or iou w/o changing detector
+            # 'cls': NMS uses cls score only; filter_teacher_predictions
+            #        applies IoU weighting afterward via hybrid_w_iou.
+            # 'hybrid': NMS already blends cls+IoU — boxes with high IoU but
+            #           lower cls survive; may improve pseudo-label diversity.
+            score_type='cls',          # 'cls' | 'iou' | 'hybrid'
             score_weights=dict(iou=0.5, cls=0.5))))
 
 # Runtime configs

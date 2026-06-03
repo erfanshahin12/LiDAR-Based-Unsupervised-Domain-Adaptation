@@ -17,7 +17,7 @@ from mmdet3d.models.task_modules import PseudoSampler
 from mmdet3d.models.test_time_augs import merge_aug_bboxes_3d
 from mmdet3d.registry import MODELS, TASK_UTILS
 from mmdet3d.structures import limit_period, xywhr2xyxyr
-from mmdet3d.structures.ops.iou3d_calculator import bbox_overlaps_nearest_3d
+from mmdet3d.structures.ops.iou3d_calculator import bbox_overlaps_3d
 from mmdet3d.utils.typing_utils import (ConfigType, InstanceList,
                                         OptConfigType, OptInstanceList)
 from .base_3d_dense_head import Base3DDenseHead
@@ -83,6 +83,7 @@ class Anchor3DHead(Base3DDenseHead, AnchorTrainMixin):
                      type='mmdet.CrossEntropyLoss', loss_weight=0.2),
                  predict_iou: bool = False,
                  loss_iou_weight: float = 1.0,
+                 iou_sample_cfg: OptConfigType = None,
                  train_cfg: OptConfigType = None,
                  test_cfg: OptConfigType = None,
                  init_cfg: OptConfigType = None) -> None:
@@ -100,6 +101,10 @@ class Anchor3DHead(Base3DDenseHead, AnchorTrainMixin):
         self.dir_limit_offset = dir_limit_offset
         self.predict_iou = predict_iou
         self.loss_iou_weight = loss_iou_weight
+        # Default sampling config: 256 anchors per image split equally across
+        # 4 IoU bins [0,0.1) [0.1,0.3) [0.3,0.5) [0.5,1.0].
+        self.iou_sample_cfg = iou_sample_cfg if iou_sample_cfg is not None \
+            else dict(num_per_img=256, bins=[0.0, 0.1, 0.3, 0.5, 1.0])
         warnings.warn(
             'dir_offset and dir_limit_offset will be depressed and be '
             'incorporated into box coder in the future')
@@ -236,19 +241,168 @@ class Anchor3DHead(Base3DDenseHead, AnchorTrainMixin):
         anchor_list = [multi_level_anchors for _ in range(num_imgs)]
         return anchor_list
 
+    def _compute_iou_targets_level(
+            self,
+            anchors_flat: Tensor,
+            bbox_pred_level: Tensor,
+            batch_gt_instances_3d: list) -> Tensor:
+        """Compute per-anchor true-3D-IoU targets for one feature-map level.
+
+        For every anchor, decodes the predicted box and computes its maximum
+        IoU with all GT boxes in the scene using *rotated* 3D IoU (not the
+        nearest-BEV proxy).  A BEV-center-distance prefilter limits the
+        true-3D-IoU calls to anchors that are geometrically close to at least
+        one GT, keeping the computation tractable on the full feature map.
+
+        Args:
+            anchors_flat (Tensor): ``[B*H*W*A, 7]`` flat anchors for this
+                level (already concatenated across the batch).
+            bbox_pred_level (Tensor): ``[B, A*code_size, H, W]`` raw
+                regression predictions for this level.
+            batch_gt_instances_3d (list): per-image GT instance data.
+
+        Returns:
+            Tensor: ``[B*H*W*A]`` float32 soft IoU targets in ``[0, 1]``.
+        """
+        device = anchors_flat.device
+        num_imgs = len(batch_gt_instances_3d)
+        # anchors_flat may be multi-dim (e.g. [H, W, A, 7] per image,
+        # concatenated along dim-0). Flatten to [B*H*W*A, 7] before decoding.
+        n_anchor_dim = anchors_flat.shape[-1]  # 7
+        n_total = anchors_flat.numel() // n_anchor_dim    # B*H*W*A
+        n_per_img = n_total // num_imgs                   # H*W*A
+        anchors_2d = anchors_flat.float().reshape(n_total, n_anchor_dim)  # [B*N, 7]
+
+        # Decode all predicted boxes for this level (float32 for stability).
+        bbox_pred_flat = bbox_pred_level.float().permute(
+            0, 2, 3, 1).reshape(-1, self.box_code_size)  # [B*H*W*A, code_size]
+        decoded_preds = self.bbox_coder.decode(
+            anchors_2d, bbox_pred_flat)                    # [B*H*W*A, 7]
+
+        iou_targets_list = []
+        for b_idx in range(num_imgs):
+            start = b_idx * n_per_img
+            end = (b_idx + 1) * n_per_img
+            decoded_b = decoded_preds[start:end]            # [N, 7]
+
+            gt_instances = batch_gt_instances_3d[b_idx]
+            has_gt = (hasattr(gt_instances, 'bboxes_3d')
+                      and len(gt_instances.bboxes_3d) > 0)
+            if not has_gt:
+                iou_targets_list.append(decoded_b.new_zeros(n_per_img))
+                continue
+
+            # GT boxes: z at bottom-center (LiDARInstance3DBoxes internal rep).
+            gt_boxes = gt_instances.bboxes_3d.tensor[:, :7].float().to(device)
+
+            # ── BEV-center distance prefilter ──────────────────────────────
+            # Only compute rotated-3D-IoU for anchors near at least one GT.
+            pred_xy = decoded_b[:, :2]    # [N, 2]
+            gt_xy = gt_boxes[:, :2]       # [M, 2]
+            # search radius = half GT diagonal + 2 m margin
+            max_gt_diag = torch.sqrt(
+                (gt_boxes[:, 3] ** 2 + gt_boxes[:, 4] ** 2)
+            ).max().item()
+            search_r = max_gt_diag / 2.0 + 2.0
+
+            dists = torch.cdist(pred_xy, gt_xy)           # [N, M]
+            near_mask = dists.min(dim=1).values < search_r  # [N]
+
+            iou_targets_b = decoded_b.new_zeros(n_per_img)
+            if near_mask.sum() > 0:
+                near_inds = near_mask.nonzero(as_tuple=False).squeeze(1)
+                near_preds = decoded_b[near_inds]          # [K, 7]
+                # True rotated-3D-IoU matrix: [K, M]
+                iou_mat = bbox_overlaps_3d(
+                    near_preds, gt_boxes, mode='iou', coordinate='lidar')
+                max_ious = iou_mat.max(dim=1).values.clamp(0.0, 1.0)
+                iou_targets_b[near_inds] = max_ious
+
+            iou_targets_list.append(iou_targets_b)
+
+        return torch.cat(iou_targets_list)  # [B*N]
+
+    @staticmethod
+    def _balanced_iou_sample(
+            iou_targets: Tensor,
+            pos_inds: Tensor,
+            sample_cfg: dict) -> Tensor:
+        """Return indices of anchors selected for the IoU loss.
+
+        Positives (assigned by the assigner) are always included.  The
+        remaining budget is distributed equally across IoU bins so that the
+        loss sees the full quality spectrum, not just high-scoring positives.
+
+        Args:
+            iou_targets (Tensor): ``[N]`` float, soft IoU targets.
+            pos_inds (Tensor): ``[P]`` long, indices of assigned positives.
+            sample_cfg (dict): keys:
+                * ``num_per_img`` (int) — total non-positive sampling budget.
+                * ``bins`` (list[float]) — monotone bin boundaries, e.g.
+                  ``[0.0, 0.1, 0.3, 0.5, 1.0]``.
+
+        Returns:
+            Tensor: 1-D LongTensor of selected anchor indices.
+        """
+        device = iou_targets.device
+        bins = sample_cfg.get('bins', [0.0, 0.1, 0.3, 0.5, 1.0])
+        num_per_img = sample_cfg.get('num_per_img', 256)
+        N = len(iou_targets)
+
+        # Mark positives so they are excluded from bin sampling.
+        pos_mask = iou_targets.new_zeros(N, dtype=torch.bool)
+        if len(pos_inds) > 0:
+            pos_mask[pos_inds] = True
+
+        all_inds = torch.arange(N, device=device)
+        neg_inds = all_inds[~pos_mask]          # non-positives
+        if len(neg_inds) == 0:
+            return pos_inds
+
+        neg_iou = iou_targets[neg_inds]
+        n_bins = len(bins) - 1
+        quota = max(1, num_per_img // n_bins)
+
+        sampled_parts = []
+        for i in range(n_bins):
+            lo, hi = bins[i], bins[i + 1]
+            # Last bin is inclusive on both ends.
+            in_bin = ((neg_iou >= lo) & (neg_iou < hi)) if i < n_bins - 1 \
+                else ((neg_iou >= lo) & (neg_iou <= hi))
+            bin_inds = neg_inds[in_bin]
+            if len(bin_inds) == 0:
+                continue
+            n_take = min(quota, len(bin_inds))
+            perm = torch.randperm(len(bin_inds), device=device)[:n_take]
+            sampled_parts.append(bin_inds[perm])
+
+        sampled_negs = torch.cat(sampled_parts) if sampled_parts \
+            else neg_inds.new_empty(0)
+
+        parts = []
+        if len(pos_inds) > 0:
+            parts.append(pos_inds)
+        if len(sampled_negs) > 0:
+            parts.append(sampled_negs)
+        return torch.cat(parts) if parts else all_inds.new_empty(0)
+
     def _loss_by_feat_single(self, cls_score: Tensor, bbox_pred: Tensor,
                              dir_cls_pred: Tensor,
                              iou_pred: Optional[Tensor],
-                             anchors: Tensor,
+                             iou_targets: Optional[Tensor],
                              labels: Tensor, label_weights: Tensor,
                              bbox_targets: Tensor, bbox_weights: Tensor,
                              dir_targets: Tensor, dir_weights: Tensor,
                              num_total_samples: int):
         """Calculate loss of single-level results.
 
-        Always 4-tuple in / 4-tuple out for shape consistency under
-        ``multi_apply``: when ``predict_iou`` is False, ``iou_pred`` is
-        passed as None and ``loss_iou`` is returned as None.
+        When ``predict_iou`` is False, ``iou_pred`` and ``iou_targets`` are
+        None and ``loss_iou`` is returned as None — keeping the 4-return-value
+        shape consistent for ``multi_apply``.
+
+        ``iou_targets`` is precomputed by ``loss_by_feat`` using true rotated
+        3D IoU between the decoded predictions and the GT boxes; it covers
+        positives and negatives, enabling balanced per-IoU-bin sampling.
         """
         # classification loss
         if num_total_samples is None:
@@ -276,26 +430,24 @@ class Anchor3DHead(Base3DDenseHead, AnchorTrainMixin):
         pos_bbox_targets = bbox_targets[pos_inds]
         pos_bbox_weights = bbox_weights[pos_inds]
 
-        # ── IoU regression loss. Computed BEFORE add_sin_difference
-        # below mutates pos_bbox_pred / pos_bbox_targets in place. ──
+        # ── IoU regression loss with balanced per-bin sampling ───────────
+        # ``iou_targets`` (precomputed in ``loss_by_feat`` using true rotated
+        # 3D IoU) cover both positives and negatives, enabling training across
+        # the full quality range instead of positives only.
+        # Must be computed BEFORE ``add_sin_difference`` below mutates
+        # ``pos_bbox_pred`` / ``pos_bbox_targets`` in place.
         loss_iou = None
-        if self.predict_iou and iou_pred is not None:
+        if self.predict_iou and iou_pred is not None and iou_targets is not None:
             iou_pred_flat = iou_pred.permute(0, 2, 3, 1).reshape(-1)
-            if num_pos > 0:
-                anchors_flat = anchors.reshape(-1, anchors.shape[-1])
-                pos_anchors = anchors_flat[pos_inds]
-                with torch.no_grad():
-                    decoded_pred = self.bbox_coder.decode(
-                        pos_anchors, pos_bbox_pred)
-                    decoded_gt = self.bbox_coder.decode(
-                        pos_anchors, pos_bbox_targets)
-                    iou_target = bbox_overlaps_nearest_3d(
-                        decoded_pred, decoded_gt,
-                        mode='iou', is_aligned=True,
-                        coordinate='lidar').clamp(0.0, 1.0)
-                pos_iou_pred = iou_pred_flat[pos_inds]
+            # Select a balanced subset across IoU quality bins.
+            # Positives are always included; the rest of the budget is split
+            # equally across [0,0.1) [0.1,0.3) [0.3,0.5) [0.5,1.0].
+            sample_inds = self._balanced_iou_sample(
+                iou_targets, pos_inds, self.iou_sample_cfg)
+            if len(sample_inds) > 0:
                 loss_iou = F.binary_cross_entropy_with_logits(
-                    pos_iou_pred, iou_target,
+                    iou_pred_flat[sample_inds],
+                    iou_targets[sample_inds],
                     reduction='mean') * self.loss_iou_weight
             else:
                 # Zero loss but keep graph connected so DDP sees the param.
@@ -415,21 +567,39 @@ class Anchor3DHead(Base3DDenseHead, AnchorTrainMixin):
         num_total_samples = (
             num_total_pos + num_total_neg if self.sampling else num_total_pos)
 
-        # Build per-level flat anchors (concatenated across batch) so the
-        # hybrid IoU target can be decoded against the matching anchor.
         num_imgs = len(batch_input_metas)
         num_levels = len(cls_scores)
+
+        # Build per-level flat anchors (concatenated across batch) for
+        # decoding in the IoU target computation below.
         mlvl_anchors_flat = [
             torch.cat([anchor_list[b][lvl_idx] for b in range(num_imgs)],
                       dim=0)
             for lvl_idx in range(num_levels)
         ]
 
+        # ── True-3D-IoU target computation (no gradient needed) ───────────
+        # For each level decode all predicted boxes and compute, for every
+        # anchor, the maximum *rotated* 3D IoU with the scene's GT boxes.
+        # These targets are used in ``_loss_by_feat_single`` for balanced
+        # per-IoU-bin sampling — covering positives, near-positives, and
+        # background instead of positives only.
+        if self.predict_iou and iou_preds is not None:
+            with torch.no_grad():
+                mlvl_iou_targets = [
+                    self._compute_iou_targets_level(
+                        mlvl_anchors_flat[lvl_idx],
+                        bbox_preds[lvl_idx],
+                        batch_gt_instances_3d)
+                    for lvl_idx in range(num_levels)
+                ]
+        else:
+            mlvl_iou_targets = [None] * num_levels
+
         iou_preds_input = (
             cast_tensor_type(iou_preds, dst_type=torch.float32)
             if iou_preds is not None else [None] * num_levels)
 
-        # num_total_samples = None
         with amp.autocast(enabled=False):
             losses_cls, losses_bbox, losses_dir, losses_iou = multi_apply(
                 self._loss_by_feat_single,
@@ -437,7 +607,7 @@ class Anchor3DHead(Base3DDenseHead, AnchorTrainMixin):
                 cast_tensor_type(bbox_preds, dst_type=torch.float32),
                 cast_tensor_type(dir_cls_preds, dst_type=torch.float32),
                 iou_preds_input,
-                mlvl_anchors_flat,
+                mlvl_iou_targets,
                 labels_list,
                 label_weights_list,
                 bbox_targets_list,

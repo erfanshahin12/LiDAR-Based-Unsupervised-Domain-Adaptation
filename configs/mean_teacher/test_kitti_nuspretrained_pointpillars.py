@@ -78,8 +78,6 @@ model = dict(
         roi_size=7,
         voxel_size=0.2,
         point_cloud_range=[-50.4, -50.4, -5.0, 50.4, 50.4, 3.0]),
-    # Two-stage post-NMS IoU head trained jointly with conv_iou.
-    bev_roi_iou_head_cfg=dict(hidden_dim=256),
     bbox_head=dict(predict_iou=True),
     test_cfg=dict(
         use_rotate_nms=True,
