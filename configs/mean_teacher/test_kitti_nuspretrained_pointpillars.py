@@ -72,20 +72,24 @@ val_evaluator = dict(
 test_evaluator = val_evaluator
 
 model = dict(
-    roi_extractor_cfg=dict(
-        in_channels=64,
-        out_channels=256,
-        roi_size=7,
-        voxel_size=0.2,
-        point_cloud_range=[-50.4, -50.4, -5.0, 50.4, 50.4, 3.0]),
+    # roi_extractor_cfg intentionally absent: the pretrain checkpoint was
+    # trained without the RoI extractor\
     bbox_head=dict(predict_iou=True),
     test_cfg=dict(
         use_rotate_nms=True,
         nms_across_levels=False,
+        # 0.01: aggressive NMS — avoids multiple detections per car (correct for KITTI AP).
         nms_thr=0.01,
         score_thr=0.05,
         min_bbox_size=0,
-        nms_pre=100,
-        max_num=50,
+        # Match training nms_pre so recall is not artificially capped before NMS.
+        # The nuScenes-range model covers a 100m×100m scene; many anchors can
+        # score above score_thr. nms_pre=100 would silently drop valid detections
+        # before they reach NMS and collapse AP.
+        nms_pre=1000,
+        max_num=200,
+        # Use CLS-only ranking for KITTI AP: gives a clean PR curve without
+        # the IoU head potentially biasing scores on out-of-domain data.
+        # iou_scores_3d is still produced (predict_iou=True) for downstream analysis.
         score_type='cls',
         score_weights=dict(iou=0.0, cls=1.0)))

@@ -65,7 +65,8 @@ class AnchorTrainMixin(object):
 
         (all_labels, all_label_weights, all_bbox_targets, all_bbox_weights,
          all_dir_targets, all_dir_weights, pos_inds_list,
-         neg_inds_list) = multi_apply(
+         neg_inds_list, all_cls_soft_targets,
+         all_quality_weights) = multi_apply(
              self.anchor_target_3d_single,
              anchor_list,
              batch_gt_instances_3d,
@@ -91,9 +92,14 @@ class AnchorTrainMixin(object):
                                              num_level_anchors)
         dir_targets_list = images_to_levels(all_dir_targets, num_level_anchors)
         dir_weights_list = images_to_levels(all_dir_weights, num_level_anchors)
+        cls_soft_targets_list = images_to_levels(
+            all_cls_soft_targets, num_level_anchors)
+        quality_weights_list = images_to_levels(
+            all_quality_weights, num_level_anchors)
         return (labels_list, label_weights_list, bbox_targets_list,
                 bbox_weights_list, dir_targets_list, dir_weights_list,
-                num_total_pos, num_total_neg)
+                num_total_pos, num_total_neg,
+                cls_soft_targets_list, quality_weights_list)
 
     def anchor_target_3d_single(self,
                                 anchors,
@@ -124,7 +130,9 @@ class AnchorTrainMixin(object):
             assert len(self.bbox_assigner) == anchors.size(-3)
             (total_labels, total_label_weights, total_bbox_targets,
              total_bbox_weights, total_dir_targets, total_dir_weights,
-             total_pos_inds, total_neg_inds) = [], [], [], [], [], [], [], []
+             total_pos_inds, total_neg_inds,
+             total_cls_soft_targets, total_quality_weights) = \
+                [], [], [], [], [], [], [], [], [], []
             current_anchor_num = 0
             for i, assigner in enumerate(self.bbox_assigner):
                 current_anchors = anchors[..., i, :, :].reshape(
@@ -137,6 +145,12 @@ class AnchorTrainMixin(object):
                         gt_per_cls]
                     gt_per_cls_instance.bboxes_3d = gt_instance_3d.bboxes_3d[
                         gt_per_cls, :]
+                    # Propagate pseudo-label soft-target metadata if present.
+                    for _field in ('cls_scores_3d', 'iou_scores_3d',
+                                   'quality_weights_3d'):
+                        if hasattr(gt_instance_3d, _field):
+                            setattr(gt_per_cls_instance, _field,
+                                    getattr(gt_instance_3d, _field)[gt_per_cls])
                     anchor_targets = self.anchor_target_single_assigner(
                         assigner, current_anchors, gt_per_cls_instance,
                         gt_instance_ignore, input_meta, num_classes, sampling)
@@ -146,7 +160,8 @@ class AnchorTrainMixin(object):
                         gt_instance_ignore, input_meta, num_classes, sampling)
 
                 (labels, label_weights, bbox_targets, bbox_weights,
-                 dir_targets, dir_weights, pos_inds, neg_inds) = anchor_targets
+                 dir_targets, dir_weights, pos_inds, neg_inds,
+                 cls_soft_targets, quality_weights) = anchor_targets
                 total_labels.append(labels.reshape(feat_size, 1, rot_angles))
                 total_label_weights.append(
                     label_weights.reshape(feat_size, 1, rot_angles))
@@ -162,6 +177,10 @@ class AnchorTrainMixin(object):
                     dir_weights.reshape(feat_size, 1, rot_angles))
                 total_pos_inds.append(pos_inds)
                 total_neg_inds.append(neg_inds)
+                total_cls_soft_targets.append(
+                    cls_soft_targets.reshape(feat_size, 1, rot_angles))
+                total_quality_weights.append(
+                    quality_weights.reshape(feat_size, 1, rot_angles))
 
             total_labels = torch.cat(total_labels, dim=-2).reshape(-1)
             total_label_weights = torch.cat(
@@ -176,9 +195,14 @@ class AnchorTrainMixin(object):
                 total_dir_weights, dim=-2).reshape(-1)
             total_pos_inds = torch.cat(total_pos_inds, dim=0).reshape(-1)
             total_neg_inds = torch.cat(total_neg_inds, dim=0).reshape(-1)
+            total_cls_soft_targets = torch.cat(
+                total_cls_soft_targets, dim=-2).reshape(-1)
+            total_quality_weights = torch.cat(
+                total_quality_weights, dim=-2).reshape(-1)
             return (total_labels, total_label_weights, total_bbox_targets,
                     total_bbox_weights, total_dir_targets, total_dir_weights,
-                    total_pos_inds, total_neg_inds)
+                    total_pos_inds, total_neg_inds,
+                    total_cls_soft_targets, total_quality_weights)
         elif isinstance(self.bbox_assigner, list) and isinstance(
                 anchors, list):
             # class-aware anchors with different feature map sizes
@@ -186,7 +210,9 @@ class AnchorTrainMixin(object):
                 'The number of bbox assigners and anchors should be the same.'
             (total_labels, total_label_weights, total_bbox_targets,
              total_bbox_weights, total_dir_targets, total_dir_weights,
-             total_pos_inds, total_neg_inds) = [], [], [], [], [], [], [], []
+             total_pos_inds, total_neg_inds,
+             total_cls_soft_targets, total_quality_weights) = \
+                [], [], [], [], [], [], [], [], [], []
             current_anchor_num = 0
             for i, assigner in enumerate(self.bbox_assigner):
                 current_anchors = anchors[i]
@@ -198,6 +224,12 @@ class AnchorTrainMixin(object):
                         gt_per_cls]
                     gt_per_cls_instance.bboxes_3d = gt_instance_3d.bboxes_3d[
                         gt_per_cls, :]
+                    # Propagate pseudo-label soft-target metadata if present.
+                    for _field in ('cls_scores_3d', 'iou_scores_3d',
+                                   'quality_weights_3d'):
+                        if hasattr(gt_instance_3d, _field):
+                            setattr(gt_per_cls_instance, _field,
+                                    getattr(gt_instance_3d, _field)[gt_per_cls])
                     anchor_targets = self.anchor_target_single_assigner(
                         assigner, current_anchors, gt_per_cls_instance,
                         gt_instance_ignore, input_meta, num_classes, sampling)
@@ -207,7 +239,8 @@ class AnchorTrainMixin(object):
                         gt_instance_ignore, input_meta, num_classes, sampling)
 
                 (labels, label_weights, bbox_targets, bbox_weights,
-                 dir_targets, dir_weights, pos_inds, neg_inds) = anchor_targets
+                 dir_targets, dir_weights, pos_inds, neg_inds,
+                 cls_soft_targets, quality_weights) = anchor_targets
                 total_labels.append(labels)
                 total_label_weights.append(label_weights)
                 total_bbox_targets.append(
@@ -218,6 +251,8 @@ class AnchorTrainMixin(object):
                 total_dir_weights.append(dir_weights)
                 total_pos_inds.append(pos_inds)
                 total_neg_inds.append(neg_inds)
+                total_cls_soft_targets.append(cls_soft_targets)
+                total_quality_weights.append(quality_weights)
 
             total_labels = torch.cat(total_labels, dim=0)
             total_label_weights = torch.cat(total_label_weights, dim=0)
@@ -227,9 +262,12 @@ class AnchorTrainMixin(object):
             total_dir_weights = torch.cat(total_dir_weights, dim=0)
             total_pos_inds = torch.cat(total_pos_inds, dim=0)
             total_neg_inds = torch.cat(total_neg_inds, dim=0)
+            total_cls_soft_targets = torch.cat(total_cls_soft_targets, dim=0)
+            total_quality_weights = torch.cat(total_quality_weights, dim=0)
             return (total_labels, total_label_weights, total_bbox_targets,
                     total_bbox_weights, total_dir_targets, total_dir_weights,
-                    total_pos_inds, total_neg_inds)
+                    total_pos_inds, total_neg_inds,
+                    total_cls_soft_targets, total_quality_weights)
         else:
             return self.anchor_target_single_assigner(self.bbox_assigner,
                                                       anchors, gt_instance_3d,
@@ -267,6 +305,11 @@ class AnchorTrainMixin(object):
         dir_weights = anchors.new_zeros((anchors.shape[0]), dtype=torch.float)
         labels = anchors.new_zeros(num_valid_anchors, dtype=torch.long)
         label_weights = anchors.new_zeros(num_valid_anchors, dtype=torch.float)
+        # Soft-target tensors for pseudo-label distillation.
+        # Default to 1.0 (= hard-target behaviour for source GT).
+        cls_soft_targets = anchors.new_ones(num_valid_anchors, dtype=torch.float)
+        quality_weights   = anchors.new_ones(num_valid_anchors, dtype=torch.float)
+
         if len(gt_instance_3d.bboxes_3d) > 0:
             if not isinstance(gt_instance_3d.bboxes_3d, torch.Tensor):
                 gt_instance_3d.bboxes_3d = gt_instance_3d.bboxes_3d.tensor.to(
@@ -314,10 +357,21 @@ class AnchorTrainMixin(object):
             else:
                 label_weights[pos_inds] = self.train_cfg.pos_weight
 
+            # Gather per-positive soft targets from pseudo-label metadata.
+            # When the fields are absent (source GT), tensors stay at 1.0.
+            g = sampling_result.pos_assigned_gt_inds
+            if hasattr(gt_instance_3d, 'cls_scores_3d'):
+                cls_soft_targets[pos_inds] = \
+                    gt_instance_3d.cls_scores_3d[g].to(anchors.device)
+            if hasattr(gt_instance_3d, 'quality_weights_3d'):
+                quality_weights[pos_inds] = \
+                    gt_instance_3d.quality_weights_3d[g].to(anchors.device)
+
         if len(neg_inds) > 0:
             label_weights[neg_inds] = 1.0
         return (labels, label_weights, bbox_targets, bbox_weights, dir_targets,
-                dir_weights, pos_inds, neg_inds)
+                dir_weights, pos_inds, neg_inds, cls_soft_targets,
+                quality_weights)
 
 
 def get_direction_target(anchors,

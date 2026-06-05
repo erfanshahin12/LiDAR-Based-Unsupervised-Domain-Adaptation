@@ -20,7 +20,7 @@ metainfo_target = dict(classes=classes_kitti, origin=box_origin_target)
 
 hard_instance_bank_path = './configs/mean_teacher/hard_instance_bank/hard_instance_bank_nuscenes_quantile_kitti_20.pkl'
 # pretrained_ckpt = './work_dirs/baseline_pointpillars_5may/epoch_24.pth'
-pretrained_ckpt = './work_dirs/iou_head_finetune_29may/epoch_6.pth'    # iou head trained separately
+pretrained_ckpt = './work_dirs/pretrain_3jun_iou_head/epoch_24.pth'
 
 point_cloud_range = [-50.40, -50.40, -5, 50.40, 50.40, 3]
 input_modality = dict(use_lidar=True, use_camera=False)
@@ -300,8 +300,32 @@ model = dict(
                      # of student iterations; before that it falls back to cls-only.
                      # Setting ``hybrid_w_iou=0`` disables hybrid scoring.
                      conf_threshold=0.1,
-                     hybrid_w_iou=0.5,
+                     hybrid_w_iou=0,
                      iou_warmup_iters=0,
+                     # IoU-head distillation on target: student IoU logits are
+                     # trained to match the teacher's on the same strongly-augmented
+                     # KITTI scene (no pseudo-label boxes, no localization noise).
+                     # suppress_target_iou_loss drops loss_iou from TERM 2 when
+                     # distillation is active, avoiding the noisy feedback loop.
+                     iou_distill_weight=0.5,
+                     iou_distill_warmup_iters=1000,
+                     suppress_target_iou_loss=True,
+                     # ── Quality-weighted pseudo-label distillation ──────────
+                     # Feature-level IoU distillation BCE is weighted by the
+                     # teacher's own IoU map so high-quality regions dominate.
+                     iou_distill_quality_weight=True,
+                     # Per-pseudo-box soft-target distillation.
+                     # All flags default to True; set individual flags False
+                     # to ablate each component independently.
+                     pseudo_loss_cfg=dict(
+                         use_soft_cls_targets=True,     # soft BCE instead of hard focal for pseudo positives
+                         cls_score_weight=0.8,          # weight of cls score in hybrid quality
+                         iou_score_weight=0.2,          # weight of IoU score in hybrid quality
+                         min_quality_weight=0.0,        # floor for quality weight (0 = no floor)
+                         normalize_quality_weights=False,  # normalize quality across batch
+                         weight_bbox_by_quality=True,   # scale bbox regression loss by quality
+                         weight_dir_by_quality=True,    # scale dir classification loss by quality
+                     ),
                  ),
     pretrained_ckpt=pretrained_ckpt,
 
@@ -390,11 +414,12 @@ model = dict(
                 loss_weight=0.2),
             # Per-anchor IoU quality head: BCE vs true rotated-3D-IoU targets,
             # balanced across bins [0,0.1) [0.1,0.3) [0.3,0.5) [0.5,1.0].
+            # num_per_img:  total number of non-positive anchors drawn from all bins combined
             # Pretrained on source domain; loaded from the pretrain checkpoint.
             # filter_teacher_predictions applies hybrid_w_iou independently of
             # score_type below.
             predict_iou=True,
-            loss_iou_weight=1.0,
+            loss_iou_weight=0.5,
             iou_sample_cfg=dict(
                 num_per_img=256,
                 bins=[0.0, 0.1, 0.3, 0.5, 1.0],
@@ -433,16 +458,16 @@ model = dict(
             use_rotate_nms=True,
             nms_across_levels=False,
             nms_thr=0.01,
-            score_thr=0.1,
+            score_thr=0.05,
             min_bbox_size=0,
             nms_pre=1000,
-            max_num=500,
+            max_num=200,
             # 'cls': NMS uses cls score only; filter_teacher_predictions
             #        applies IoU weighting afterward via hybrid_w_iou.
             # 'hybrid': NMS already blends cls+IoU — boxes with high IoU but
             #           lower cls survive; may improve pseudo-label diversity.
             score_type='cls',          # 'cls' | 'iou' | 'hybrid'
-            score_weights=dict(iou=0.5, cls=0.5))))
+            score_weights=dict(iou=0.0, cls=1.0))))
 
 # Runtime configs
 # Hooks
@@ -454,7 +479,7 @@ custom_hooks = [
     dict(type='MeanTeacherHook', interval=1),
     dict(
         type='PseudoLabelRefreshHook',
-        interval=2,             # re-run teacher every 2 epochs
+        interval=1,             # re-run teacher every # epochs
         update_at_epochs=(0,),  # always refresh before epoch 0 starts
         ps_batch_size=8,
         ps_num_workers=6,
@@ -464,10 +489,10 @@ custom_hooks = [
         #   IoU  >= iou_thr   (0.0 = disabled)
         #   CLS  >= cls_thr   (0.0 = disabled)
         # IoU = post-NMS RoI IoU head score; CLS = test_cfg ranking score.
-        hybrid_thr=0.35,
+        hybrid_thr=0,
         iou_weight=0.5,
-        iou_thr=0.15,
-        cls_thr=0.15,
+        iou_thr=0.6,
+        cls_thr=0.2,
         # Broad candidate floor: conf_threshold is temporarily set to this during
         # the refresh inference pass so filter_teacher_predictions passes the full
         # NMS-survivor pool through; the three constraints above do the real cut.
@@ -479,7 +504,7 @@ custom_hooks = [
 ]
 
 # Scheduler and optimizer config
-train_cfg = dict(type='EpochBasedTrainLoop', max_epochs=5, val_interval=2)
+train_cfg = dict(type='EpochBasedTrainLoop', max_epochs=7, val_interval=2)
 
 # Gradient accumulation with 8 steps to achieve effective batch size of 32 (8 x 4)
 optim_wrapper = dict(type='AmpOptimWrapper',

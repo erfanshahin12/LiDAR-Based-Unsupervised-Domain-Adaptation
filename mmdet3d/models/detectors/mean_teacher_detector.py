@@ -177,6 +177,71 @@ class MeanTeacher3DDetector(Base3DDetector):
             self._last_param_norm = avg_norm
 
 
+    # ------------------------------------------------------------------
+    # Pseudo-label quality metadata helpers
+    # ------------------------------------------------------------------
+
+    def _pseudo_loss_cfg(self) -> dict:
+        """Return pseudo_loss_cfg with defaults filled in."""
+        defaults = dict(
+            use_soft_cls_targets=True,
+            cls_score_weight=0.5,
+            iou_score_weight=0.5,
+            min_quality_weight=0.0,
+            normalize_quality_weights=False,
+            weight_bbox_by_quality=True,
+            weight_dir_by_quality=True,
+        )
+        cfg = self.mean_teacher_cfg.get('pseudo_loss_cfg', {})
+        return {**defaults, **cfg}
+
+    def _attach_pseudo_meta(self, gt, cls_scores_t, iou_scores_t, device):
+        """Attach soft-target metadata to a pseudo GT InstanceData.
+
+        Computes a hybrid quality weight from cls and IoU scores, then
+        attaches ``cls_scores_3d``, ``iou_scores_3d``, and
+        ``quality_weights_3d`` to ``gt`` according to ``pseudo_loss_cfg``.
+        Empty-box batches receive zero-length tensors so downstream code
+        can always rely on the fields being present.
+
+        Args:
+            gt: InstanceData whose ``bboxes_3d`` is already set.
+            cls_scores_t: float32 Tensor [N] of teacher cls scores.
+            iou_scores_t: float32 Tensor [N] of teacher IoU scores.
+            device: torch device.
+        """
+        pcfg = self._pseudo_loss_cfg()
+        w_cls = float(pcfg['cls_score_weight'])
+        w_iou = float(pcfg['iou_score_weight'])
+        min_q  = float(pcfg['min_quality_weight'])
+        norm_q = bool(pcfg['normalize_quality_weights'])
+
+        if cls_scores_t is None:
+            cls_scores_t = iou_scores_t  # fall back
+
+        # Ensure tensors on the right device
+        cls_t = cls_scores_t.to(device=device, dtype=torch.float32)
+        iou_t = iou_scores_t.to(device=device, dtype=torch.float32)
+
+        quality = w_cls * cls_t + w_iou * iou_t
+        quality = quality.clamp(min=min_q)
+        if norm_q and quality.numel() > 0 and quality.max() > 0:
+            quality = quality / quality.max()
+
+        # Attach metadata selectively so downstream code can detect which
+        # features are active via hasattr().
+        # - cls_scores_3d present ↔ head will use soft-BCE for pseudo positives
+        # - quality_weights_3d present ↔ head will scale bbox/dir weights
+        # iou_scores_3d is always attached for reference / future use.
+        if pcfg.get('use_soft_cls_targets', True):
+            gt.cls_scores_3d = cls_t
+        gt.iou_scores_3d = iou_t
+        attach_quality = (pcfg.get('weight_bbox_by_quality', True)
+                          or pcfg.get('weight_dir_by_quality', True)
+                          or pcfg.get('use_soft_cls_targets', True))
+        if attach_quality:
+            gt.quality_weights_3d = quality
+
     def set_pseudo_labels(self, d: dict) -> None:
         """Replace the pseudo-label store with a new dict.
 
@@ -214,14 +279,25 @@ class MeanTeacher3DDetector(Base3DDetector):
                 scores_t = torch.from_numpy(entry['scores'].astype(np.float32)).to(device)
                 boxes_3d = self._transform_boxes(
                     LiDARInstance3DBoxes(boxes_t), samp_strong.metainfo)
+
+                # Soft-target metadata from the refresh store
+                iou_np  = entry.get('iou_scores')
+                cls_np  = entry.get('cls_scores')
+                iou_t = (torch.from_numpy(iou_np.astype(np.float32))
+                         if iou_np is not None else scores_t)
+                cls_t = (torch.from_numpy(cls_np.astype(np.float32))
+                         if cls_np is not None else scores_t)
             else:
                 boxes_3d = LiDARInstance3DBoxes(torch.zeros(0, 7, device=device))
                 labels_t = torch.zeros(0, dtype=torch.long, device=device)
                 scores_t = torch.zeros(0, device=device)
+                iou_t    = torch.zeros(0, device=device)
+                cls_t    = torch.zeros(0, device=device)
 
             total_boxes += len(boxes_3d)
             gt = InstanceData(bboxes_3d=boxes_3d, labels_3d=labels_t)
             gt.scores_3d = scores_t
+            self._attach_pseudo_meta(gt, cls_t, iou_t, device)
             pseudo_samp.gt_instances_3d = gt
 
         if total_boxes == 0:
@@ -251,6 +327,71 @@ class MeanTeacher3DDetector(Base3DDetector):
         if self._train_iter < warmup:
             return 0.0
         return target
+
+    def _iou_distill_weight(self) -> float:
+        """Effective weight for the IoU-head distillation loss on target.
+
+        Returns 0 until ``_train_iter`` passes ``iou_distill_warmup_iters``
+        (gives the EMA teacher time to partially adapt before its KITTI IoU
+        estimates are used as distillation targets), then the configured
+        ``iou_distill_weight``.  0 (default) disables distillation entirely.
+        """
+        w = float(self.mean_teacher_cfg.get('iou_distill_weight', 0.0))
+        if w <= 0.0:
+            return 0.0
+        warmup = int(self.mean_teacher_cfg.get('iou_distill_warmup_iters', 0))
+        return 0.0 if self._train_iter < warmup else w
+
+    def _compute_iou_distill_loss(self, x_student, x_teacher_strong):
+        """BCE distillation: student IoU logits → teacher IoU logits.
+
+        Both student and teacher see the same strongly-augmented KITTI scene
+        so anchor (h, w) correspondence is exact.  No pseudo-label boxes are
+        involved — the loss is purely feature-level quality consistency that
+        adapts the IoU head (and the backbone/neck) to KITTI's point density
+        and sensor characteristics.
+
+        Args:
+            x_student: Neck features from the student on strong-aug target.
+            x_teacher_strong: Neck features from the teacher on strong-aug
+                target (computed under ``torch.no_grad()``).
+
+        Returns:
+            Scalar loss tensor.
+        """
+        if not getattr(self.student.bbox_head, 'predict_iou', False):
+            return torch.tensor(0., device=x_student[0].device)
+
+        # student forward on x_student (second pass through head convs;
+        # gradients accumulate correctly with those from bbox_head.loss()).
+        student_outs = self.student.bbox_head.forward(x_student)
+        with torch.no_grad():
+            teacher_outs = self.teacher.bbox_head.forward(x_teacher_strong)
+
+        # predict_iou=True → forward returns (cls_list, bbox_list, dir_list, iou_list)
+        if len(student_outs) < 4:
+            return torch.tensor(0., device=x_student[0].device)
+
+        quality_weight = self.mean_teacher_cfg.get('iou_distill_quality_weight', False)
+        device = x_student[0].device
+        total = torch.tensor(0., device=device)
+        n = 0
+        for s_iou, t_iou in zip(student_outs[3], teacher_outs[3]):
+            soft = t_iou.detach().sigmoid()
+            if quality_weight:
+                # Weight each anchor's BCE loss by the teacher's own IoU
+                # quality at that location: high-confidence regions dominate
+                # the distillation gradient.
+                per_elem = F.binary_cross_entropy_with_logits(
+                    s_iou.float(), soft.float(), reduction='none')
+                # soft is in [0,1]; use it as per-element weight.
+                denom = soft.sum().clamp(min=1.0)
+                total += (per_elem * soft).sum() / denom
+            else:
+                total += F.binary_cross_entropy_with_logits(
+                    s_iou.float(), soft.float(), reduction='mean')
+            n += 1
+        return total / max(n, 1)
 
     def filter_teacher_predictions(self, teacher_pred):
         """Keep only high-confidence teacher detections for pseudo-labelling.
@@ -479,6 +620,19 @@ class MeanTeacher3DDetector(Base3DDetector):
             gt = InstanceData(bboxes_3d=boxes, labels_3d=labels)
             if scores is not None:
                 gt.scores_3d = scores
+
+            # Attach soft-target metadata produced by filter_teacher_predictions.
+            # filter_teacher_predictions stores raw cls in cls_scores_3d and the
+            # raw IoU head score in iou_scores_3d; use them as quality signals.
+            device = labels.device
+            iou_t = getattr(instance, 'iou_scores_3d', scores)
+            cls_t = getattr(instance, 'cls_scores_3d', scores)
+            if iou_t is None:
+                iou_t = scores if scores is not None else torch.zeros(0, device=device)
+            if cls_t is None:
+                cls_t = scores if scores is not None else torch.zeros(0, device=device)
+            self._attach_pseudo_meta(gt, cls_t, iou_t, device)
+
             sample_strong.gt_instances_3d = gt
 
         if verbose:
@@ -598,13 +752,37 @@ class MeanTeacher3DDetector(Base3DDetector):
         x_strong, bev_features_student = self.student.extract_feat(
             target_strong_in, return_bev=True)
 
+        # Effective distill weight (0 during warmup or when disabled).
+        w_iou_distill = self._iou_distill_weight()
+
         if w_target > 0:
             loss_target = self.student.bbox_head.loss(x_strong, pseudo_samples)
+            # When IoU distillation is active, suppress the pseudo-label IoU
+            # loss: distillation provides a cleaner KITTI adaptation signal and
+            # training the IoU head on noisy pseudo-label localization would
+            # corrupt it via the circular dependency with filter_teacher_predictions.
+            if w_iou_distill > 0 and self.mean_teacher_cfg.get(
+                    'suppress_target_iou_loss', True):
+                loss_target.pop('loss_iou', None)
             for key, value in loss_target.items():
                 if isinstance(value, (list, tuple)):
                     losses[f'{key}_target'] = [v * w_target for v in value]
                 else:
                     losses[f'{key}_target'] = value * w_target
+
+        # ── TERM 4: IoU head distillation on target ───────────────────
+        # Teacher and student both process the strongly-augmented KITTI scene
+        # (identical voxelization → exact anchor-to-anchor alignment).
+        # BCE(student_iou_logit, sigmoid(teacher_iou_logit)) adapts the IoU head
+        # to KITTI's point density and object characteristics without relying on
+        # pseudo-label box localization.
+        if w_iou_distill > 0:
+            _ds_switch(self.teacher, 'target')
+            with torch.no_grad():
+                x_teacher_strong = self.teacher.extract_feat(target_strong_in)
+            loss_iou_distill = self._compute_iou_distill_loss(
+                x_strong, x_teacher_strong)
+            losses['loss_iou_distill'] = loss_iou_distill * w_iou_distill
 
         # ── TERM 3: BEV contrastive loss ──────────────────────────────
         loss_cont_total = torch.tensor(0., device=device)

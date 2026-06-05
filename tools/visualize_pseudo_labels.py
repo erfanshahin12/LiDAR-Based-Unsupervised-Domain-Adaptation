@@ -183,23 +183,57 @@ def load_points_nus(bin_path: str) -> np.ndarray:
 
 # ── Baseline inference ─────────────────────────────────────────────────────────
 
+def _apply_kitti_test_cfg(head, overrides: dict) -> dict:
+    """Override test_cfg keys and return originals for later restoration."""
+    saved = {k: head.test_cfg.get(k) for k in overrides}
+    for k, v in overrides.items():
+        head.test_cfg[k] = v
+    return saved
+
+
+def _restore_test_cfg(head, saved: dict) -> None:
+    for k, v in saved.items():
+        if v is None:
+            head.test_cfg.pop(k, None)
+        else:
+            head.test_cfg[k] = v
+
+
+# KITTI test-config inference settings (test_kitti_nuspretrained_pointpillars.py).
+# Applied to every baseline inference call so the box pool is identical to
+# what tools/test.py would produce on KITTI.
+_KITTI_TEST_CFG = dict(
+    score_type='cls',                        # scores_3d = raw sigmoid CLS
+    score_weights=dict(iou=0.0, cls=1.0),    # consistent with score_type='cls'
+    nms_thr=0.01,                            # tight — suppress duplicate FPs
+    score_thr=0.05,
+    nms_pre=1000,
+    max_num=200,
+)
+
+
 def run_baseline(model, pts_nus: np.ndarray, device: str,
                  hybrid_thr: float, iou_weight: float,
                  min_cls_thr: float = 0.0,
                  min_iou_thr: float = 0.0,
                  ) -> tuple[np.ndarray, np.ndarray, np.ndarray,
                             np.ndarray | None, np.ndarray]:
-    """Run baseline VoxelNetBEVRoI on a single scene.
+    """Run baseline on a single scene and apply threshold filtering.
 
-    Pattern mirrors PseudoLabelRefreshHook._run_teacher_inference.
+    The test_cfg is overridden with _KITTI_TEST_CFG (matching
+    test_kitti_nuspretrained_pointpillars.py) so that inference is consistent
+    with KITTI evaluation regardless of which training config was loaded.
+    Specifically, score_type='cls' guarantees that scores_3d is the raw
+    classification sigmoid — not the hybrid blend — so hybrid can be computed
+    explicitly from raw components below.
 
-    Three independent constraints are combined:
-      hybrid = iou_weight*IoU + (1-iou_weight)*CLS >= hybrid_thr
-      CLS  >= min_cls_thr   (0.0 = off)
-      IoU  >= min_iou_thr   (0.0 = off)
+    Three independent constraints:
+      hybrid = iou_weight*iou_scores + (1-iou_weight)*cls_scores >= hybrid_thr
+      cls_scores >= min_cls_thr   (0.0 = off)
+      iou_scores >= min_iou_thr   (0.0 = off)
 
-    Returns (boxes (K,7), hybrid (K,), labels (K,), iou_scores (K,)|None, cls_scores (K,))
-    in nuScenes frame.
+    Returns (boxes (K,7), hybrid (K,), labels (K,), iou_scores (K,)|None,
+             cls_scores (K,)) in nuScenes frame.
     """
     pts_tensor = torch.from_numpy(pts_nus).float()
     sample = Det3DDataSample()
@@ -207,24 +241,34 @@ def run_baseline(model, pts_nus: np.ndarray, device: str,
         'box_type_3d': LiDARInstance3DBoxes,
         'box_mode_3d': Box3DMode.LIDAR,
     })
-    with torch.no_grad():
-        data = model.data_preprocessor(
-            {'inputs': {'points': [pts_tensor]},
-             'data_samples': [sample]},
-            training=False)
-        pred_list = model.predict(data['inputs'], data['data_samples'])
+
+    head = model.bbox_head
+    saved = _apply_kitti_test_cfg(head, _KITTI_TEST_CFG)
+    try:
+        with torch.no_grad():
+            data = model.data_preprocessor(
+                {'inputs': {'points': [pts_tensor]},
+                 'data_samples': [sample]},
+                training=False)
+            pred_list = model.predict(data['inputs'], data['data_samples'])
+    finally:
+        _restore_test_cfg(head, saved)
+
     pred = pred_list[0]
     inst = pred.pred_instances_3d
+    # score_type='cls' guarantees scores_3d is raw CLS.
     cls_scores = inst.scores_3d.cpu().numpy()
-    boxes = inst.bboxes_3d.tensor.cpu().numpy()[:, :7]
+    boxes  = inst.bboxes_3d.tensor.cpu().numpy()[:, :7]
     labels = inst.labels_3d.cpu().numpy()
     iou_sc = getattr(inst, 'iou_scores_3d', None)
+    # iou_scores_3d is the raw sigmoid of conv_iou (always separate from scores_3d).
     iou_scores = iou_sc.cpu().numpy() if iou_sc is not None else None
 
+    # Hybrid computed explicitly from raw components — matches filter_teacher_predictions.
     if iou_scores is not None and iou_weight > 0:
         hybrid = iou_weight * iou_scores + (1.0 - iou_weight) * cls_scores
     else:
-        hybrid = cls_scores
+        hybrid = cls_scores.copy()
 
     mask = hybrid >= hybrid_thr
     if iou_scores is not None and min_iou_thr > 0:
@@ -239,9 +283,10 @@ def run_baseline(model, pts_nus: np.ndarray, device: str,
 
 def run_baseline_raw(model, pts_nus: np.ndarray, device: str,
                      ) -> tuple[np.ndarray, np.ndarray, np.ndarray | None, np.ndarray]:
-    """Return ALL post-NMS boxes with no additional filtering.
+    """Return all post-NMS boxes with no additional threshold filtering.
 
-    The model's test_cfg score_thr is the only implicit floor (e.g. CLS >= 0.1).
+    Applies the same _KITTI_TEST_CFG overrides as run_baseline so the box pool
+    is consistent (score_type='cls', nms_thr=0.01, etc.).
     Returns (boxes (K,7), cls_scores (K,), iou_scores (K,)|None, labels (K,)).
     Used by --dump-raw-preds to build a cache for threshold sweeping.
     """
@@ -251,19 +296,26 @@ def run_baseline_raw(model, pts_nus: np.ndarray, device: str,
         'box_type_3d': LiDARInstance3DBoxes,
         'box_mode_3d': Box3DMode.LIDAR,
     })
-    with torch.no_grad():
-        data = model.data_preprocessor(
-            {'inputs': {'points': [pts_tensor]},
-             'data_samples': [sample]},
-            training=False)
-        pred_list = model.predict(data['inputs'], data['data_samples'])
+
+    head = model.bbox_head
+    saved = _apply_kitti_test_cfg(head, _KITTI_TEST_CFG)
+    try:
+        with torch.no_grad():
+            data = model.data_preprocessor(
+                {'inputs': {'points': [pts_tensor]},
+                 'data_samples': [sample]},
+                training=False)
+            pred_list = model.predict(data['inputs'], data['data_samples'])
+    finally:
+        _restore_test_cfg(head, saved)
+
     pred = pred_list[0]
     inst = pred.pred_instances_3d
-    cls_s = inst.scores_3d.cpu().numpy()
-    boxes = inst.bboxes_3d.tensor.cpu().numpy()[:, :7]
+    cls_s = inst.scores_3d.cpu().numpy()   # raw CLS (score_type='cls')
+    boxes  = inst.bboxes_3d.tensor.cpu().numpy()[:, :7]
     labels = inst.labels_3d.cpu().numpy()
     iou_sc = getattr(inst, 'iou_scores_3d', None)
-    iou_s = iou_sc.cpu().numpy() if iou_sc is not None else None
+    iou_s  = iou_sc.cpu().numpy() if iou_sc is not None else None
     return boxes, cls_s, iou_s, labels
 
 
@@ -520,9 +572,6 @@ def parse_args():
     g.add_argument('--min-iou-thr', type=float, default=0.0,
                    help='Minimum raw IoU head score floor applied independently of hybrid '
                         '(0.0 = off)')
-    g.add_argument('--pkl-iou-weight', type=float, default=None,
-                   help='IoU weight used when generating the pkl. When set, raw CLS is '
-                        'recovered as (hybrid - w*IoU)/(1-w) for the score histogram.')
     g.add_argument('--sweep-iou-weights', default='0.5,0.6,0.7,0.8',
                    help='Comma-separated iou_weight values for --sweep-from-cache.')
     g.add_argument('--sweep-hybrid-thrs', default='0.30,0.35,0.40,0.45,0.50',
@@ -963,6 +1012,11 @@ def main():
               f'from {args.ps_label_pkl}')
 
     # ── Score distribution histogram (from pkl if available) ──
+    # pkl structure (written by PseudoLabelRefreshHook):
+    #   'scores'     → hybrid quality score (w*iou + (1-w)*cls) used for filtering
+    #   'cls_scores' → raw CLS: the teacher's scores_3d before hybrid composition;
+    #                  equals sigmoid(CLS logit) when teacher uses score_type='cls'
+    #   'iou_scores' → raw sigmoid of conv_iou (iou_scores_3d from bbox_head.predict)
     if args.score_hist and ps_labels:
         os.makedirs(args.out_dir, exist_ok=True)
         _cls_s, _iou_s = [], []
@@ -972,27 +1026,17 @@ def main():
                 continue
             raw_cls = v.get('cls_scores')
             if raw_cls is not None:
+                # Raw CLS stored directly — the standard path with the new model.
                 _cls_s.extend(raw_cls.tolist())
                 _has_stored_cls = True
             else:
-                _cls_s.extend(v['scores'].tolist())  # hybrid fallback
-            _raw_iou = v.get('iou_scores')
-            if _raw_iou is not None:
-                _iou_s.extend(_raw_iou.tolist())
+                # Fallback: pkl predates cls_scores key; use the hybrid score.
+                _cls_s.extend(v['scores'].tolist())
+            raw_iou = v.get('iou_scores')
+            if raw_iou is not None:
+                _iou_s.extend(raw_iou.tolist())
 
-        if _has_stored_cls:
-            _score1_label = 'CLS score'
-        elif (args.pkl_iou_weight is not None and args.pkl_iou_weight < 1.0
-              and len(_iou_s) == len(_cls_s) and len(_iou_s) > 0):
-            # Recover CLS: hybrid = w*IoU + (1-w)*CLS  →  CLS = (hybrid - w*IoU)/(1-w)
-            _hybrid = np.asarray(_cls_s, dtype=np.float32)
-            _iou_arr = np.asarray(_iou_s, dtype=np.float32)
-            _w = args.pkl_iou_weight
-            _cls_s = np.clip((_hybrid - _w * _iou_arr) / (1.0 - _w), 0.0, 1.0).tolist()
-            _score1_label = 'CLS score (recovered)'
-        else:
-            _score1_label = 'Hybrid score'
-
+        _score1_label = 'CLS score' if _has_stored_cls else 'Hybrid score'
         _n_pkl_with = sum(1 for v in ps_labels.values() if len(v['scores']) > 0)
         plot_score_distributions(
             _cls_s, _iou_s,
@@ -1050,7 +1094,7 @@ def main():
     # ── Per-scene loop ──
     for key in selected:
         scene_id = os.path.splitext(os.path.basename(key))[0]
-        print(f'\nScene {scene_id}')
+        # print(f'\nScene {scene_id}')
 
         if not os.path.isfile(key):
             print(f'  WARN: bin file not found at {key!r}, skipping.')
@@ -1067,8 +1111,8 @@ def main():
             gt_boxes_nus = gt_boxes_to_nus(
                 gt_info['cam_boxes'], gt_info['lidar2cam'])
             gt_labels = gt_info['labels']
-            print(f'  GT:     {len(gt_boxes_nus)} boxes '
-                  f'({(gt_labels==gt_car_label).sum()} Car)')
+            # print(f'  GT:     {len(gt_boxes_nus)} boxes '
+            #       f'({(gt_labels==gt_car_label).sum()} Car)')
 
         # Pseudo-labels (empty when no pkl was loaded)
         ps_entry = ps_labels.get(key, {'gt_boxes': np.zeros((0, 7), dtype=np.float32),
@@ -1076,8 +1120,8 @@ def main():
                                        'scores': np.zeros(0, dtype=np.float32)})
         ps_boxes = ps_entry['gt_boxes']
         ps_scores = ps_entry['scores']
-        if ps_labels:
-            print(f'  Pseudo: {len(ps_boxes)} boxes')
+        # if ps_labels:
+            # print(f'  Pseudo: {len(ps_boxes)} boxes')
 
         # Baseline
         bl_boxes, bl_scores, bl_labels, bl_iou_scores, bl_cls_scores = (
@@ -1090,7 +1134,7 @@ def main():
             thr_info = (f'hybrid≥{args.hybrid_thr}, w={args.iou_weight}'
                         + (f', cls≥{args.min_cls_thr}' if args.min_cls_thr > 0 else '')
                         + (f', iou≥{args.min_iou_thr}' if args.min_iou_thr > 0 else ''))
-            print(f'  Baseline: {len(bl_boxes)} boxes ({thr_info})')
+            # print(f'  Baseline: {len(bl_boxes)} boxes ({thr_info})')
             if len(bl_scores) > 0:
                 bl_all_scores.extend(bl_scores.tolist())
                 bl_all_cls.extend(bl_cls_scores.tolist())
@@ -1105,7 +1149,7 @@ def main():
         if args.stats_only:
             ps_labels_arr = ps_entry.get('gt_labels', np.zeros(len(ps_boxes), dtype=np.int64))
             ps_car_boxes = ps_boxes[ps_labels_arr == pred_car_label]
-            print(f'  GT Car={len(gt_car)}  Pseudo Car={len(ps_car_boxes)}/{len(ps_boxes)}')
+            # print(f'  GT Car={len(gt_car)}  Pseudo Car={len(ps_car_boxes)}/{len(ps_boxes)}')
             for thr_key, thr_val in (('0.25', 0.25), ('0.50', 0.50)):
                 ps_tp, ps_fp, ps_fn = match_boxes(ps_car_boxes, gt_car, thr_val)
                 stats['pseudo'][thr_key]['tp'] += ps_tp

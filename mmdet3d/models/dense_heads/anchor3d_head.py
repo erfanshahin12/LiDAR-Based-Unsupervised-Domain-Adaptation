@@ -393,7 +393,11 @@ class Anchor3DHead(Base3DDenseHead, AnchorTrainMixin):
                              labels: Tensor, label_weights: Tensor,
                              bbox_targets: Tensor, bbox_weights: Tensor,
                              dir_targets: Tensor, dir_weights: Tensor,
-                             num_total_samples: int):
+                             cls_soft_targets: Tensor,
+                             quality_weights: Tensor,
+                             num_total_samples: int,
+                             use_soft_cls: bool = False,
+                             use_quality: bool = False):
         """Calculate loss of single-level results.
 
         When ``predict_iou`` is False, ``iou_pred`` and ``iou_targets`` are
@@ -410,9 +414,40 @@ class Anchor3DHead(Base3DDenseHead, AnchorTrainMixin):
         labels = labels.reshape(-1)
         label_weights = label_weights.reshape(-1)
         cls_score = cls_score.permute(0, 2, 3, 1).reshape(-1, self.num_classes)
+        cls_soft_targets = cls_soft_targets.reshape(-1)
+        quality_weights   = quality_weights.reshape(-1)
         assert labels.max().item() <= self.num_classes
-        loss_cls = self.loss_cls(
-            cls_score, labels, label_weights, avg_factor=num_total_samples)
+
+        bg_class_ind = self.num_classes
+        pos_inds = ((labels >= 0)
+                    & (labels < bg_class_ind)).nonzero(
+                        as_tuple=False).reshape(-1)
+
+        if use_soft_cls and len(pos_inds) > 0:
+            # ── Soft-BCE for pseudo positives ─────────────────────────────
+            # Zero out focal-loss weight at positives so they are excluded
+            # from the hard-label path. Negatives / background keep focal.
+            label_weights_hard = label_weights.clone()
+            label_weights_hard[pos_inds] = 0.0
+            loss_cls = self.loss_cls(
+                cls_score, labels, label_weights_hard,
+                avg_factor=num_total_samples)
+
+            # Soft BCE: student cls logit at assigned class vs teacher cls score.
+            # cls_score[pos, label[pos]] gives the logit for the correct class.
+            pos_labels = labels[pos_inds]                       # [P]
+            pos_logits = cls_score[pos_inds, pos_labels]        # [P]
+            pos_targets = cls_soft_targets[pos_inds]            # [P]
+            pos_qw      = quality_weights[pos_inds]             # [P]
+            loss_cls_soft = F.binary_cross_entropy_with_logits(
+                pos_logits, pos_targets,
+                weight=pos_qw,
+                reduction='sum') / max(num_total_samples, 1)
+            loss_cls_soft = loss_cls_soft * self.loss_cls.loss_weight
+            loss_cls = loss_cls + loss_cls_soft
+        else:
+            loss_cls = self.loss_cls(
+                cls_score, labels, label_weights, avg_factor=num_total_samples)
 
         # regression loss
         bbox_pred = bbox_pred.permute(0, 2, 3,
@@ -420,10 +455,6 @@ class Anchor3DHead(Base3DDenseHead, AnchorTrainMixin):
         bbox_targets = bbox_targets.reshape(-1, self.box_code_size)
         bbox_weights = bbox_weights.reshape(-1, self.box_code_size)
 
-        bg_class_ind = self.num_classes
-        pos_inds = ((labels >= 0)
-                    & (labels < bg_class_ind)).nonzero(
-                        as_tuple=False).reshape(-1)
         num_pos = len(pos_inds)
 
         pos_bbox_pred = bbox_pred[pos_inds]
@@ -467,6 +498,18 @@ class Anchor3DHead(Base3DDenseHead, AnchorTrainMixin):
             if code_weight:
                 pos_bbox_weights = pos_bbox_weights * bbox_weights.new_tensor(
                     code_weight)
+
+            # ── Quality-weighted bbox / dir for pseudo-label positives ────
+            # Multiplying weights by the hybrid quality score means that
+            # low-confidence pseudo boxes contribute a smaller gradient than
+            # high-confidence ones.  Source GT quality_weights are all 1.0,
+            # so this is a strict no-op on the source path.
+            if use_quality:
+                pos_quality = quality_weights[pos_inds]             # [P]
+                pos_bbox_weights = pos_bbox_weights * pos_quality.unsqueeze(-1)
+                if self.use_direction_classifier:
+                    pos_dir_weights = pos_dir_weights * pos_quality
+
             if self.diff_rad_by_sin:
                 pos_bbox_pred, pos_bbox_targets = self.add_sin_difference(
                     pos_bbox_pred, pos_bbox_targets)
@@ -563,9 +606,17 @@ class Anchor3DHead(Base3DDenseHead, AnchorTrainMixin):
             return None
         (labels_list, label_weights_list, bbox_targets_list, bbox_weights_list,
          dir_targets_list, dir_weights_list, num_total_pos,
-         num_total_neg) = cls_reg_targets
+         num_total_neg, cls_soft_targets_list,
+         quality_weights_list) = cls_reg_targets
         num_total_samples = (
             num_total_pos + num_total_neg if self.sampling else num_total_pos)
+
+        # Detect whether this is a pseudo-label batch (any GT carries metadata).
+        # These bools propagate per-call so the source path is never affected.
+        use_soft_cls = any(
+            hasattr(g, 'cls_scores_3d') for g in batch_gt_instances_3d)
+        use_quality  = any(
+            hasattr(g, 'quality_weights_3d') for g in batch_gt_instances_3d)
 
         num_imgs = len(batch_input_metas)
         num_levels = len(cls_scores)
@@ -614,7 +665,11 @@ class Anchor3DHead(Base3DDenseHead, AnchorTrainMixin):
                 bbox_weights_list,
                 dir_targets_list,
                 dir_weights_list,
-                num_total_samples=num_total_samples)
+                cls_soft_targets_list,
+                quality_weights_list,
+                num_total_samples=num_total_samples,
+                use_soft_cls=use_soft_cls,
+                use_quality=use_quality)
         out = dict(
             loss_cls=losses_cls, loss_bbox=losses_bbox, loss_dir=losses_dir)
         if self.predict_iou:
