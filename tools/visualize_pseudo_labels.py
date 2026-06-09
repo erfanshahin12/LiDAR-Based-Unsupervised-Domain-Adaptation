@@ -47,6 +47,12 @@ import matplotlib.pyplot as plt
 import numpy as np
 import torch
 
+try:
+    import plotly.graph_objects as go
+    _PLOTLY_OK = True
+except ImportError:
+    _PLOTLY_OK = False
+
 # ── MMDet3D imports ────────────────────────────────────────────────────────────
 from mmengine.config import Config
 from mmdet3d.structures import (
@@ -67,6 +73,32 @@ KITTI_CAT = {
 
 # ── BEV IoU helpers ────────────────────────────────────────────────────────────
 
+def gt_iou_per_pred(pred_boxes: np.ndarray, gt_boxes: np.ndarray,
+                    mode: str = '3d') -> np.ndarray:
+    """Best IoU of each prediction against any GT box.
+
+    Args:
+        pred_boxes: (K, 7) float32 predicted boxes in nuScenes frame.
+        gt_boxes:   (M, 7) float32 GT Car boxes in nuScenes frame.
+        mode:       '3d' → full 3D IoU via LiDARInstance3DBoxes.overlaps;
+                    'bev' → BEV IoU via bev_iou_matrix.
+
+    Returns:
+        (K,) float32 — max IoU of each prediction vs any GT box; 0 when no GT.
+    """
+    if len(pred_boxes) == 0:
+        return np.zeros(0, dtype=np.float32)
+    if len(gt_boxes) == 0:
+        return np.zeros(len(pred_boxes), dtype=np.float32)
+    if mode == 'bev':
+        iou = bev_iou_matrix(pred_boxes, gt_boxes)           # (K, M)
+    else:
+        p = LiDARInstance3DBoxes(torch.from_numpy(pred_boxes))
+        g = LiDARInstance3DBoxes(torch.from_numpy(gt_boxes))
+        iou = LiDARInstance3DBoxes.overlaps(p, g).cpu().numpy()  # (K, M)
+    return iou.max(axis=1).astype(np.float32)
+
+
 def bev_iou_matrix(a: np.ndarray, b: np.ndarray) -> np.ndarray:
     """BEV IoU between every pair of boxes in a (M,7) and b (N,7).
     Returns (M, N) float32; zeros if either array is empty."""
@@ -82,6 +114,101 @@ def bev_iou_matrix(a: np.ndarray, b: np.ndarray) -> np.ndarray:
     # bev overlap
     iou2d = box_iou_rotated(boxes1_bev, boxes2_bev).cpu().numpy()
     return iou2d
+
+
+def count_points_in_boxes(pts_nus: np.ndarray, ps_boxes: np.ndarray) -> np.ndarray:
+    """Count LiDAR points inside each pseudo-label box (CPU, pure numpy).
+
+    Args:
+        pts_nus: (M, 4) float32 point cloud in nuScenes frame [x,y,z,intensity].
+        ps_boxes: (K, 7) float32 boxes in nuScenes frame [x,y,z,l,w,h,yaw],
+                  z is bottom-center (LiDARInstance3DBoxes internal convention).
+
+    Returns:
+        (K,) int32 array — number of points inside each box.
+    """
+    if len(ps_boxes) == 0 or len(pts_nus) == 0:
+        return np.zeros(len(ps_boxes), dtype=np.int32)
+    from mmdet3d.structures.ops.box_np_ops import points_in_rbbox
+    # points_in_rbbox: (N_pts, K_boxes) bool; origin=(0.5,0.5,0) matches
+    # LiDARInstance3DBoxes convention where z is stored at bottom-center.
+    in_box = points_in_rbbox(pts_nus[:, :3], ps_boxes, z_axis=2,
+                              origin=(0.5, 0.5, 0))
+    return in_box.sum(axis=0).astype(np.int32)
+
+
+def select_scene_keep_mask(scores: np.ndarray,
+                           keep_frac: float | None = None,
+                           min_floor: float = 0.0,
+                           fallback_k: int = 0,
+                           floor_before: bool = False) -> np.ndarray:
+    """Per-scene keep-fraction selection. Returns a boolean mask over ``scores``.
+
+    The three-step scheme:
+      1. **Keep-fraction (primary):** keep the top ``ceil(keep_frac × N)``
+         highest-scoring boxes, where N is the candidate pool size (all boxes,
+         or above-floor boxes when ``floor_before=True``).
+         When ``keep_frac`` is None or ≥ 1 this step is skipped.
+      2. **Floor (guard):** drop surviving boxes with ``score < min_floor``.
+         Skipped when ``min_floor <= 0``.
+      3. **Fallback (coverage):** if fewer than ``fallback_k`` boxes remain,
+         restore the scene's top-``min(fallback_k, N)`` raw boxes by score,
+         ignoring ``min_floor``.  ``fallback_k=0`` disables the fallback.
+
+    The default ordering is fraction-first, floor-as-guard (``floor_before=False``).
+    Set ``floor_before=True`` to apply the floor before computing the fraction
+    (the fraction denominator then excludes below-floor boxes).
+
+    Args:
+        scores:      1-D float array of per-box ranking scores (higher = better).
+        keep_frac:   Fraction in (0, 1) of boxes to keep.  None / ≥1 = no cut.
+        min_floor:   Absolute score floor.  0.0 = off.
+        fallback_k:  Minimum surviving boxes per scene.  0 = off.
+        floor_before: Order flag — see docstring above.
+
+    Returns:
+        Boolean keep-mask of shape ``(len(scores),)``.
+    """
+    n = len(scores)
+    if n == 0:
+        return np.zeros(0, dtype=bool)
+
+    mask = np.ones(n, dtype=bool)            # start: keep everything
+    order = np.argsort(scores)[::-1]         # indices sorted best → worst
+
+    use_frac = keep_frac is not None and keep_frac < 1.0
+
+    if floor_before:
+        # Order A: floor first, then fraction over the surviving pool
+        if min_floor > 0:
+            mask = scores >= min_floor
+        if use_frac:
+            n_pool = int(mask.sum())
+            keep_n = int(np.ceil(keep_frac * n_pool)) if n_pool > 0 else 0
+            # Among the above-floor candidates, keep the top keep_n
+            above_floor_ordered = [i for i in order if mask[i]]
+            new_mask = np.zeros(n, dtype=bool)
+            for i in above_floor_ordered[:keep_n]:
+                new_mask[i] = True
+            mask = new_mask
+    else:
+        # Order B (default): fraction first, then floor as guard
+        if use_frac:
+            keep_n = int(np.ceil(keep_frac * n))
+            mask = np.zeros(n, dtype=bool)
+            for i in order[:keep_n]:
+                mask[i] = True
+        if min_floor > 0:
+            mask = mask & (scores >= min_floor)
+
+    # Fallback: restore top-k raw boxes if coverage is lost
+    if fallback_k > 0 and int(mask.sum()) < fallback_k:
+        restore_n = min(fallback_k, n)
+        mask = np.zeros(n, dtype=bool)
+        for i in order[:restore_n]:
+            mask[i] = True
+
+    return mask
 
 
 def match_boxes(pred: np.ndarray, gt: np.ndarray,
@@ -183,8 +310,34 @@ def load_points_nus(bin_path: str) -> np.ndarray:
 
 # ── Baseline inference ─────────────────────────────────────────────────────────
 
+def _resolve_bbox_head(model):
+    """Return the bbox_head used during predict().
+
+    VoxelNet/VoxelNetBEVRoI expose it at the top level as bbox_head;
+    CenterPoint / CenterPointBEVRoI use pts_bbox_head;
+    MeanTeacher3DDetector nests it under .teacher (used by predict() by default).
+    """
+    head = getattr(model, 'bbox_head', None)
+    if head is None:
+        head = getattr(model, 'pts_bbox_head', None)   # CenterPoint family
+    if head is None:
+        # MeanTeacher3DDetector: predict() uses teacher by default
+        head = model.teacher.bbox_head
+    return head
+
+
 def _apply_kitti_test_cfg(head, overrides: dict) -> dict:
-    """Override test_cfg keys and return originals for later restoration."""
+    """Override test_cfg keys and return originals for later restoration.
+
+    CenterHead does not have 'score_type' in its test_cfg (it uses a different
+    key layout: nms_type, post_max_size, min_radius, …).  In that case we leave
+    the test_cfg completely untouched — the loaded KITTI test config already
+    contains the correct CenterPoint settings.  An empty saved dict is returned
+    so _restore_test_cfg is a no-op.
+    """
+    if 'score_type' not in head.test_cfg:
+        # CenterHead or other non-VoxelNet head — do not apply VoxelNet overrides
+        return {}
     saved = {k: head.test_cfg.get(k) for k in overrides}
     for k, v in overrides.items():
         head.test_cfg[k] = v
@@ -216,6 +369,11 @@ def run_baseline(model, pts_nus: np.ndarray, device: str,
                  hybrid_thr: float, iou_weight: float,
                  min_cls_thr: float = 0.0,
                  min_iou_thr: float = 0.0,
+                 # ── per-scene keep-fraction scheme (optional) ──────────────
+                 keep_frac: float | None = None,
+                 min_floor: float = 0.0,
+                 fallback_k: int = 1,
+                 floor_before: bool = False,
                  ) -> tuple[np.ndarray, np.ndarray, np.ndarray,
                             np.ndarray | None, np.ndarray]:
     """Run baseline on a single scene and apply threshold filtering.
@@ -227,10 +385,16 @@ def run_baseline(model, pts_nus: np.ndarray, device: str,
     classification sigmoid — not the hybrid blend — so hybrid can be computed
     explicitly from raw components below.
 
-    Three independent constraints:
-      hybrid = iou_weight*iou_scores + (1-iou_weight)*cls_scores >= hybrid_thr
-      cls_scores >= min_cls_thr   (0.0 = off)
-      iou_scores >= min_iou_thr   (0.0 = off)
+    **When ``keep_frac`` is None (default):** hard-threshold mode.
+      Three independent constraints applied to the hybrid score:
+        hybrid = iou_weight*iou_scores + (1-iou_weight)*cls_scores >= hybrid_thr
+        cls_scores >= min_cls_thr   (0.0 = off)
+        iou_scores >= min_iou_thr   (0.0 = off)
+
+    **When ``keep_frac`` is set:** per-scene keep-fraction mode.
+      Applies ``select_scene_keep_mask`` over the hybrid score;
+      ``hybrid_thr / min_cls_thr / min_iou_thr`` are ignored.
+      See ``select_scene_keep_mask`` for the three-step logic.
 
     Returns (boxes (K,7), hybrid (K,), labels (K,), iou_scores (K,)|None,
              cls_scores (K,)) in nuScenes frame.
@@ -242,7 +406,7 @@ def run_baseline(model, pts_nus: np.ndarray, device: str,
         'box_mode_3d': Box3DMode.LIDAR,
     })
 
-    head = model.bbox_head
+    head = _resolve_bbox_head(model)
     saved = _apply_kitti_test_cfg(head, _KITTI_TEST_CFG)
     try:
         with torch.no_grad():
@@ -270,11 +434,20 @@ def run_baseline(model, pts_nus: np.ndarray, device: str,
     else:
         hybrid = cls_scores.copy()
 
-    mask = hybrid >= hybrid_thr
-    if iou_scores is not None and min_iou_thr > 0:
-        mask = mask & (iou_scores >= min_iou_thr)
-    if min_cls_thr > 0:
-        mask = mask & (cls_scores >= min_cls_thr)
+    if keep_frac is not None:
+        # ── Per-scene keep-fraction scheme ───────────────────────────────────
+        mask = select_scene_keep_mask(hybrid,
+                                      keep_frac=keep_frac,
+                                      min_floor=min_floor,
+                                      fallback_k=fallback_k,
+                                      floor_before=floor_before)
+    else:
+        # ── Legacy hard-threshold scheme ─────────────────────────────────────
+        mask = hybrid >= hybrid_thr
+        if iou_scores is not None and min_iou_thr > 0:
+            mask = mask & (iou_scores >= min_iou_thr)
+        if min_cls_thr > 0:
+            mask = mask & (cls_scores >= min_cls_thr)
 
     return (boxes[mask], hybrid[mask], labels[mask],
             iou_scores[mask] if iou_scores is not None else None,
@@ -297,7 +470,7 @@ def run_baseline_raw(model, pts_nus: np.ndarray, device: str,
         'box_mode_3d': Box3DMode.LIDAR,
     })
 
-    head = model.bbox_head
+    head = _resolve_bbox_head(model)
     saved = _apply_kitti_test_cfg(head, _KITTI_TEST_CFG)
     try:
         with torch.no_grad():
@@ -573,16 +746,57 @@ def parse_args():
                    help='Minimum raw IoU head score floor applied independently of hybrid '
                         '(0.0 = off)')
     g.add_argument('--sweep-iou-weights', default='0.5,0.6,0.7,0.8',
-                   help='Comma-separated iou_weight values for --sweep-from-cache.')
+                   help='Comma-separated iou_weight values for --sweep-from-cache '
+                        '(legacy hybrid-thr mode, ignored when --sweep-keep-fracs is set).')
     g.add_argument('--sweep-hybrid-thrs', default='0.30,0.35,0.40,0.45,0.50',
-                   help='Comma-separated hybrid_thr values for --sweep-from-cache.')
+                   help='Comma-separated hybrid_thr values for --sweep-from-cache '
+                        '(legacy mode, ignored when --sweep-keep-fracs is set).')
     g.add_argument('--sweep-floors', default='0.10,0.15,0.20,0.25,0.30',
                    help='Comma-separated symmetric floor values (min_cls=min_iou) '
-                        'for --sweep-from-cache.')
+                        'for --sweep-from-cache (legacy mode, ignored when '
+                        '--sweep-keep-fracs is set).')
     g.add_argument('--sweep-cov-target', type=float, default=0.85,
-                   help='Coverage target for penalised score in sweep (default 0.85).')
+                   help='Coverage target for penalised score in legacy sweep (default 0.85).')
     g.add_argument('--sweep-top-n', type=int, default=20,
                    help='Number of top results to display in sweep table.')
+    # ── Keep-fraction sweep axes (new mode) ──────────────────────────────────
+    g.add_argument('--sweep-keep-fracs', default=None,
+                   help='Comma-separated keep_frac values for --sweep-from-cache '
+                        '(e.g. "0.2,0.3,0.4,0.5"). Setting this activates the '
+                        'per-scene keep-fraction sweep instead of the legacy mode.')
+    g.add_argument('--sweep-min-floors', default='0.0,0.1,0.2,0.3',
+                   help='Comma-separated min_floor values for the keep-frac sweep.')
+    g.add_argument('--sweep-fallback-ks', default='0,1,3',
+                   help='Comma-separated fallback_k integer values for the keep-frac sweep.')
+    g.add_argument('--sweep-min-pt-counts', default='0',
+                   help='Comma-separated minimum interior point count values for the '
+                        'keep-frac sweep (e.g. "0,3,5"). 0 = no filter. Requires '
+                        '--kitti-info so the velodyne_reduced bin files can be located.')
+    # ── Per-scene keep-fraction thresholding ─────────────────────────────────
+    g.add_argument('--keep-frac', type=float, default=None,
+                   help='Activate per-scene keep-fraction scheme: keep the top '
+                        'ceil(keep_frac × N) highest-scoring boxes per scene. '
+                        'When set, --hybrid-thr / --min-cls-thr / --min-iou-thr '
+                        'are ignored (use --min-floor and --fallback-k instead).')
+    g.add_argument('--min-floor', type=float, default=0.0,
+                   help='Absolute score floor used with --keep-frac: drop '
+                        'surviving boxes whose score < min_floor (0.0 = off).')
+    g.add_argument('--fallback-k', type=int, default=1,
+                   help='If fewer than this many boxes survive --keep-frac + '
+                        '--min-floor, restore the top-k raw boxes (ignoring the '
+                        'floor) to prevent empty scenes. 0 = off. Default 1.')
+    g.add_argument('--floor-before', action='store_true',
+                   help='Apply --min-floor before computing the keep-fraction '
+                        '(denominator = above-floor count). Default is '
+                        'fraction-first (floor acts as a guard afterwards).')
+
+    g.add_argument('--gt-iou', action='store_true',
+                   help='Replace the model IoU-head axis with actual GT-box IoU '
+                        '(best overlap of each prediction vs GT Car boxes). '
+                        'Required for models without an IoU head, e.g. CenterPoint.')
+    g.add_argument('--gt-iou-mode', choices=['3d', 'bev', 'both'], default='both',
+                   help='IoU type for --gt-iou: 3d (full volume), bev (bird\'s-eye-view), '
+                        'or both (two extra panels).')
 
     # ── Output & sampling ─────────────────────────────────────────────────────
     g = p.add_argument_group('Output & sampling')
@@ -598,6 +812,11 @@ def parse_args():
                    help='Show only Car GT boxes (hide Pedestrian/Cyclist)')
     g.add_argument('--score-hist', action='store_true',
                    help='Save score distribution histogram to <out-dir>/score_distributions.png')
+    g.add_argument('--points-analysis', action='store_true',
+                   help='Compute interior point counts for every PS-label box and save '
+                        'points_histogram.png + points_iou_cls_scatter.html to --out-dir. '
+                        'Requires --ps-label-pkl. --no-baseline is fine (no GPU needed). '
+                        'Iterates all pkl entries regardless of --num-scenes.')
     g.add_argument('--dump-raw-preds', metavar='PATH', default=None,
                    help='Run inference on all scenes and save raw (unfiltered) predictions '
                         'to PATH as a pkl cache for use with --sweep-from-cache. '
@@ -608,6 +827,144 @@ def parse_args():
                         'Early exit after printing the sweep table.')
 
     return p.parse_args()
+
+
+def plot_points_histogram(pt_counts: np.ndarray, out_path: str,
+                          title: str = 'Interior point count per PS-box') -> None:
+    """Save a dark-theme histogram of per-box interior point counts.
+
+    Uses log-spaced bins so the heavy tail is visible without squashing the
+    sparse end.  Vertical lines mark mean and median; text annotations give
+    the fraction of boxes in key sparsity bands.
+    """
+    counts = np.asarray(pt_counts, dtype=np.float32)
+    n = len(counts)
+    fig, ax = plt.subplots(figsize=(10, 5))
+    fig.patch.set_facecolor('#0a0a0a')
+    ax.set_facecolor('#111111')
+    ax.tick_params(colors='white')
+    for spine in ax.spines.values():
+        spine.set_edgecolor('#444444')
+
+    # Log-spaced bins: 0 placed at leftmost edge, rest log-spaced
+    max_val = max(int(counts.max()), 1)
+    log_edges = np.unique(np.concatenate([
+        [0, 1],
+        np.logspace(0, np.log10(max_val + 1), 50).astype(int),
+    ])).astype(float)
+    ax.hist(counts, bins=log_edges, color='#4db8ff', alpha=0.85, edgecolor='none')
+    ax.set_xscale('symlog', linthresh=1)
+
+    med = float(np.median(counts))
+    mean = float(counts.mean())
+    ax.axvline(med,  color='white',  linestyle='--', linewidth=1.2,
+               label=f'median={med:.0f}')
+    ax.axvline(mean, color='yellow', linestyle=':',  linewidth=1.2,
+               label=f'mean={mean:.1f}')
+
+    f0   = 100.0 * (counts == 0).mean()
+    f5   = 100.0 * (counts <= 5).mean()
+    f20  = 100.0 * (counts <= 20).mean()
+    stats_str = (f'n={n}\n'
+                 f'0 pts:  {f0:.1f}%\n'
+                 f'≤5 pts: {f5:.1f}%\n'
+                 f'≤20 pts:{f20:.1f}%')
+    ax.text(0.98, 0.97, stats_str, transform=ax.transAxes,
+            color='white', fontsize=9, va='top', ha='right',
+            bbox=dict(facecolor='#222222', alpha=0.8, pad=4, linewidth=0))
+
+    ax.set_title(title, color='white', fontsize=12, pad=8)
+    ax.set_xlabel('Points inside box (log scale)', color='white', fontsize=10)
+    ax.set_ylabel('Box count', color='white', fontsize=10)
+    ax.legend(fontsize=9, facecolor='#222222', edgecolor='white', labelcolor='white')
+
+    plt.tight_layout()
+    plt.savefig(out_path, dpi=150, bbox_inches='tight', facecolor='#0a0a0a')
+    plt.close(fig)
+    print(f'Points histogram saved → {out_path}')
+
+
+def plot_iou_cls_pts_3d_scatter(pt_counts: np.ndarray,
+                                 gt_ious: np.ndarray,
+                                 cls_scores: np.ndarray,
+                                 out_path: str,
+                                 title: str = 'PS-box quality: CLS × GT-IoU × Point count'
+                                 ) -> None:
+    """Save an interactive 3D scatter plot as a standalone HTML file (Plotly).
+
+    Axes:
+        x = CLS score (teacher classification confidence)
+        y = GT 3D IoU  (actual overlap with nearest GT Car box; 0 = FP)
+        z = log₁₀(pt_count + 1)  (log-normalised interior point count)
+
+    Colour encodes raw pt_count (Viridis scale).  The HTML uses CDN-hosted
+    Plotly.js so the file is small enough to download and open locally in a
+    browser.
+    """
+    if not _PLOTLY_OK:
+        print('plot_iou_cls_pts_3d_scatter: plotly not installed — skipping HTML. '
+              'Install with: pip install plotly')
+        return
+
+    pt  = np.asarray(pt_counts,  dtype=np.float32)
+    iou = np.asarray(gt_ious,    dtype=np.float32)
+    cls = np.asarray(cls_scores, dtype=np.float32)
+    z   = np.log10(pt + 1)
+
+    fig = go.Figure(data=[go.Scatter3d(
+        x=cls, y=iou, z=z,
+        mode='markers',
+        marker=dict(
+            size=3,
+            color=pt,
+            colorscale='Viridis',
+            opacity=0.6,
+            colorbar=dict(
+                title=dict(text='Points in box', font=dict(color='white')),
+                tickfont=dict(color='white'),
+            ),
+        ),
+        hovertemplate=(
+            'CLS: %{x:.3f}<br>'
+            'GT IoU: %{y:.3f}<br>'
+            'log₁₀(pts+1): %{z:.2f}<br>'
+            '<extra></extra>'
+        ),
+    )])
+
+    axis_style = dict(
+        backgroundcolor='#111111',
+        gridcolor='#333333',
+        showbackground=True,
+        tickfont=dict(color='white'),
+        title_font=dict(color='white'),
+        zerolinecolor='#555555',
+    )
+    fig.update_layout(
+        title=dict(text=title, font=dict(color='white', size=14)),
+        paper_bgcolor='#0a0a0a',
+        scene=dict(
+            xaxis=dict(**axis_style, title='CLS score'),
+            yaxis=dict(**axis_style, title='GT 3D IoU'),
+            zaxis=dict(**axis_style, title='log₁₀(pt_count+1)'),
+            bgcolor='#111111',
+        ),
+        margin=dict(l=0, r=0, b=0, t=40),
+        font=dict(color='white'),
+    )
+
+    fig.write_html(out_path, include_plotlyjs='cdn')
+    print(f'3D scatter saved → {out_path}')
+
+    # Pearson correlations
+    n = len(pt)
+    if n > 1:
+        r_cls_iou = float(np.corrcoef(cls, iou)[0, 1])
+        r_cls_pt  = float(np.corrcoef(cls, z)[0, 1])
+        r_iou_pt  = float(np.corrcoef(iou, z)[0, 1])
+        print(f'  Pearson r(CLS, GT-IoU)         = {r_cls_iou:.4f}')
+        print(f'  Pearson r(CLS, log-pt_count)   = {r_cls_pt:.4f}')
+        print(f'  Pearson r(GT-IoU, log-pt_count)= {r_iou_pt:.4f}')
 
 
 def _check_augmentation_warning(mt_config_path: str) -> None:
@@ -689,27 +1046,40 @@ def _pred_car_label(baseline_model, ps_labels: dict) -> int:
 def plot_score_distributions(cls_scores, iou_scores, out_path: str,
                              title: str = 'Pseudo-label score distributions',
                              score1_label: str = 'CLS score',
+                             iou_label: str = 'IoU score',
+                             iou2_scores=None,
+                             iou2_label: str = 'IoU2 score',
                              thresholds: dict | None = None,
                              scene_stats: tuple[int, int] = (0, 0)) -> None:
     """Save a histogram of score distributions.
 
+    Supports up to two IoU axes (e.g. 3D IoU and BEV IoU simultaneously).
+    Each IoU axis generates one histogram panel + one CLS-vs-IoU hexbin panel.
+
     Args:
-        cls_scores: list or array of the first score (CLS or hybrid)
-        iou_scores: list or array of IoU scores (may be empty)
-        out_path: path for the output PNG
-        title: figure suptitle
-        score1_label: label for the first score axis
-        thresholds: optional dict with keys min_cls, min_iou, hybrid_thr, iou_weight.
+        cls_scores:   list or array of the first score (CLS or hybrid).
+        iou_scores:   list or array for the primary IoU axis (may be empty).
+        out_path:     path for the output PNG.
+        title:        figure suptitle.
+        score1_label: label for the CLS axis.
+        iou_label:    label for the primary IoU axis.
+        iou2_scores:  optional second IoU array (e.g. BEV when iou_scores is 3D).
+        iou2_label:   label for the second IoU axis.
+        thresholds:   optional dict with keys min_cls, min_iou, hybrid_thr, iou_weight.
             When provided, draws constraint lines on the histograms and hexbin.
         scene_stats: (n_with_boxes, n_total) for scene coverage reporting.
     """
     cls = np.asarray(cls_scores, dtype=np.float32)
-    has_iou = len(iou_scores) > 0
-    iou = np.asarray(iou_scores, dtype=np.float32) if has_iou else None
 
-    # Layout: [CLS hist] [IoU hist] [CLS vs IoU joint] when both scores exist,
-    # otherwise just [CLS hist].
-    n_plots = 3 if has_iou else 1
+    # Build list of (array, label) for each IoU axis that has data
+    iou_panels = []
+    if len(iou_scores) > 0:
+        iou_panels.append((np.asarray(iou_scores, dtype=np.float32), iou_label))
+    if iou2_scores is not None and len(iou2_scores) > 0:
+        iou_panels.append((np.asarray(iou2_scores, dtype=np.float32), iou2_label))
+
+    # Layout: [CLS hist] + per IoU axis: [IoU hist] [CLS vs IoU hexbin]
+    n_plots = 1 + 2 * len(iou_panels)
     fig, axes = plt.subplots(1, n_plots, figsize=(7 * n_plots, 5))
     fig.patch.set_facecolor('#0a0a0a')
     if n_plots == 1:
@@ -742,52 +1112,58 @@ def plot_score_distributions(cls_scores, iou_scores, out_path: str,
                 color='white', fontsize=8, va='top',
                 bbox=dict(facecolor='#222222', alpha=0.7, pad=3, linewidth=0))
 
+    def _hexbin(ax, x, y, y_label, thr=None):
+        """CLS (x) vs IoU (y) joint hexbin panel."""
+        thr = thr or {}
+        hb = ax.hexbin(x, y, gridsize=30, cmap='plasma',
+                       extent=[0, 1, 0, 1], mincnt=1)
+        cb = fig.colorbar(hb, ax=ax, pad=0.02)
+        cb.ax.tick_params(colors='white', labelsize=7)
+        cb.outline.set_edgecolor('#444444')
+        corr = float(np.corrcoef(x, y)[0, 1])
+        ax.set_title(f'{score1_label} vs {y_label}  (r={corr:.3f})',
+                     color='white', fontsize=11)
+        ax.set_xlabel(score1_label, color='white', fontsize=9)
+        ax.set_ylabel(y_label, color='white', fontsize=9)
+        ax.set_xlim(0, 1)
+        ax.set_ylim(0, 1)
+        ax.plot([0, 1], [0, 1], color='white', linestyle=':', linewidth=0.8,
+                alpha=0.5, label=f'{score1_label} = {y_label}')
+        # Constraint overlays (relevant only for the model-IoU-head case)
+        min_cls = thr.get('min_cls', 0.0)
+        min_iou = thr.get('min_iou', 0.0)
+        ht = thr.get('hybrid_thr', 0.0)
+        w = thr.get('iou_weight', 0.0)
+        if min_cls > 0:
+            ax.axvline(min_cls, color='cyan', linestyle='--',
+                       linewidth=1.0, alpha=0.85, label=f'min CLS={min_cls:.2f}')
+        if min_iou > 0:
+            ax.axhline(min_iou, color='lime', linestyle='--',
+                       linewidth=1.0, alpha=0.85, label=f'min IoU={min_iou:.2f}')
+        if ht > 0 and w > 0:
+            cx = np.linspace(0.0, 1.0, 300)
+            iy = (ht - (1.0 - w) * cx) / w
+            vis = (iy >= 0) & (iy <= 1)
+            ax.plot(cx[vis], iy[vis], color='orange', linewidth=1.2,
+                    alpha=0.85, label=f'hybrid≥{ht:.2f} (w={w})')
+        ax.legend(fontsize=7, facecolor='#222222',
+                  edgecolor='white', labelcolor='white')
+        return corr
+
     thr = thresholds or {}
     _hist(axes[0], cls, '#4db8ff', f'{score1_label} distribution',
           vline=thr.get('min_cls'))
-    if has_iou:
-        _hist(axes[1], iou, '#ff7f50', 'IoU score distribution',
-              vline=thr.get('min_iou'))
 
-        # Joint hexbin — meaningful only when score1 is raw CLS, not hybrid
-        hb = axes[2].hexbin(cls, iou, gridsize=30, cmap='plasma',
-                            extent=[0, 1, 0, 1], mincnt=1)
-        cb = fig.colorbar(hb, ax=axes[2], pad=0.02)
-        cb.ax.tick_params(colors='white', labelsize=7)
-        cb.outline.set_edgecolor('#444444')
-        corr = float(np.corrcoef(cls, iou)[0, 1])
-        axes[2].set_title(f'{score1_label} vs IoU  (r={corr:.3f})',
-                          color='white', fontsize=11)
-        axes[2].set_xlabel(score1_label, color='white', fontsize=9)
-        axes[2].set_ylabel('IoU score', color='white', fontsize=9)
-        axes[2].set_xlim(0, 1)
-        axes[2].set_ylim(0, 1)
-        # Diagonal reference: perfect CLS=IoU agreement
-        axes[2].plot([0, 1], [0, 1], color='white', linestyle=':', linewidth=0.8,
-                     alpha=0.5, label='CLS = IoU')
-        # Constraint overlays — draw the elbow boundary when thresholds are set
-        if thr:
-            min_cls = thr.get('min_cls', 0.0)
-            min_iou = thr.get('min_iou', 0.0)
-            ht = thr.get('hybrid_thr', 0.0)
-            w = thr.get('iou_weight', 0.0)
-            if min_cls > 0:
-                axes[2].axvline(min_cls, color='cyan', linestyle='--',
-                                linewidth=1.0, alpha=0.85,
-                                label=f'min CLS={min_cls:.2f}')
-            if min_iou > 0:
-                axes[2].axhline(min_iou, color='lime', linestyle='--',
-                                linewidth=1.0, alpha=0.85,
-                                label=f'min IoU={min_iou:.2f}')
-            if ht > 0 and w > 0:
-                # hybrid = w*iou + (1-w)*cls = ht  →  iou = (ht - (1-w)*cls) / w
-                cx = np.linspace(0.0, 1.0, 300)
-                iy = (ht - (1.0 - w) * cx) / w
-                vis = (iy >= 0) & (iy <= 1)
-                axes[2].plot(cx[vis], iy[vis], color='orange', linewidth=1.2,
-                             alpha=0.85, label=f'hybrid≥{ht:.2f} (w={w})')
-        axes[2].legend(fontsize=7, facecolor='#222222',
-                       edgecolor='white', labelcolor='white')
+    # IoU panel colours — first axis coral, second axis green
+    iou_colours = ['#ff7f50', '#7fff7f']
+    corr_list = []
+    for panel_idx, (iou_arr, lbl) in enumerate(iou_panels):
+        ax_hist = axes[1 + panel_idx * 2]
+        ax_hex  = axes[2 + panel_idx * 2]
+        _hist(ax_hist, iou_arr, iou_colours[panel_idx % 2], f'{lbl} distribution',
+              vline=thr.get('min_iou') if panel_idx == 0 else None)
+        corr = _hexbin(ax_hex, cls, iou_arr, lbl, thr=thr if panel_idx == 0 else {})
+        corr_list.append((lbl, corr))
 
     fig.suptitle(title, color='white', fontsize=12, y=1.01)
     plt.tight_layout()
@@ -797,7 +1173,8 @@ def plot_score_distributions(cls_scores, iou_scores, out_path: str,
 
     # Text summary
     print(f'\n=== Score distributions ({len(cls)} boxes) ===')
-    for name, data in [(score1_label, cls)] + ([('IoU', iou)] if has_iou else []):
+    all_series = [(score1_label, cls)] + [(lbl, arr) for arr, lbl in iou_panels]
+    for name, data in all_series:
         print(f'\n  {name}:  min={data.min():.3f}  max={data.max():.3f}  '
               f'mean={data.mean():.3f}  median={np.median(data):.3f}  std={data.std():.3f}')
         bins_e = [0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0]
@@ -805,8 +1182,9 @@ def plot_score_distributions(cls_scores, iou_scores, out_path: str,
         for lo, hi, c in zip(bins_e, bins_e[1:], counts):
             bar = '█' * int(c / max(counts) * 30)
             print(f'    [{lo:.1f}-{hi:.1f}]: {c:6d}  {bar}')
-    if has_iou:
-        print(f'\n  Pearson r(CLS, IoU) = {corr:.4f}')
+    if corr_list:
+        for lbl, r in corr_list:
+            print(f'\n  Pearson r({score1_label}, {lbl}) = {r:.4f}')
     else:
         print('\n  IoU scores not available — joint plot skipped.')
     n_with, n_total = scene_stats
@@ -825,7 +1203,14 @@ def _dump_raw_predictions(args) -> None:
 
     from mmdet3d.apis import init_model
     print(f'Loading baseline model: {args.baseline_ckpt}')
-    model = init_model(args.baseline_config, args.baseline_ckpt, device=args.device)
+    _cfg = Config.fromfile(args.baseline_config)
+    if not hasattr(_cfg, 'class_names'):
+        try:
+            _cfg.class_names = list(
+                _cfg.train_dataloader.dataset.metainfo.get('classes', ['Car']))
+        except Exception:
+            _cfg.class_names = ['Car']
+    model = init_model(_cfg, args.baseline_ckpt, device=args.device)
     model.eval()
 
     print(f'Loading KITTI GT from {args.kitti_info}...')
@@ -874,34 +1259,183 @@ def _dump_raw_predictions(args) -> None:
     print(f'\nCache saved → {args.dump_raw_preds}  ({len(scenes)} scenes)')
 
 
+def _f05(p: float, r: float) -> float:
+    """F-score with β=0.5 (weights precision twice as much as recall)."""
+    denom = 0.25 * p + r
+    return 1.25 * p * r / denom if denom > 0 else 0.0
+
+
 def _sweep_thresholds(args) -> None:
-    """Load raw-prediction cache and sweep threshold combinations."""
+    """Load raw-prediction cache and sweep threshold combinations.
+
+    Two modes, selected by whether ``--sweep-keep-fracs`` is provided:
+
+    * **Keep-fraction mode** (new): sweeps ``keep_frac × min_floor × fallback_k``
+      using ``select_scene_keep_mask`` per scene.  CSV columns:
+      ``keep_frac, min_floor, fallback_k, precision, recall, f05``.
+
+    * **Legacy hybrid-thr mode**: sweeps ``iou_weight × hybrid_thr × floor``.
+      CSV columns: ``iou_w, floor, hybrid_thr, precision, recall, f05,
+      coverage, n_boxes, score``.
+    """
     print(f'Loading cache: {args.sweep_from_cache}')
     with open(args.sweep_from_cache, 'rb') as f:
         cache = pickle.load(f)
 
-    scenes = cache['scenes']
-    pred_car_label = cache['pred_car_label']
+    if 'scenes' in cache:
+        # raw_preds cache written by --dump-raw-preds
+        scenes         = cache['scenes']
+        pred_car_label = cache['pred_car_label']
+    else:
+        # PS-label pkl (ps_label_eN.pkl) — convert to the common scene-list format
+        kitti_info = getattr(args, 'kitti_info', None)
+        if kitti_info is None:
+            print('ERROR: --kitti-info is required when sweeping a PS-label pkl '
+                  '(needed to load GT car boxes).')
+            return
+        print(f'  PS-label pkl detected — loading GT from {kitti_info}...')
+        gt_lookup, gt_car_label = build_gt_lookup(kitti_info)
+        pred_car_label = 0  # single-class Car model
+        scenes = []
+        for key, entry in cache.items():
+            if not isinstance(entry, dict) or 'gt_boxes' not in entry:
+                continue
+            scene_id = os.path.splitext(os.path.basename(key))[0]
+            gt_info  = gt_lookup.get(scene_id)
+            if gt_info is not None and len(gt_info['cam_boxes']) > 0:
+                gt_all  = gt_boxes_to_nus(gt_info['cam_boxes'], gt_info['lidar2cam'])
+                gt_car  = gt_all[gt_info['labels'] == gt_car_label]
+            else:
+                gt_car = np.zeros((0, 7), dtype=np.float32)
+            scenes.append({
+                'scene_id':    scene_id,
+                '_bin_path':   key,   # full path for point-count loading
+                'boxes':       entry['gt_boxes'],
+                'cls_scores':  entry.get('cls_scores', entry['scores']),
+                'iou_scores':  entry.get('iou_scores'),
+                'labels':      entry.get('gt_labels',
+                                         np.zeros(len(entry['gt_boxes']),
+                                                  dtype=np.int64)),
+                'gt_car_boxes': gt_car,
+            })
+        print(f'  Converted: {len(scenes)} scenes with PS boxes')
+
     n_total = len(scenes)
     print(f'  {n_total} scenes, pred_car_label={pred_car_label}')
 
-    iou_weights   = _parse_floats(args.sweep_iou_weights)
-    hybrid_thrs   = _parse_floats(args.sweep_hybrid_thrs)
-    floors        = _parse_floats(args.sweep_floors)
-    cov_target    = args.sweep_cov_target
-    top_n         = args.sweep_top_n
-    n_combos      = len(iou_weights) * len(hybrid_thrs) * len(floors)
-    print(f'  Sweeping {n_combos} combinations '
+    csv_path = args.sweep_from_cache.replace('.pkl', '_sweep.csv')
+
+    # ── Keep-fraction sweep (new mode) ────────────────────────────────────────
+    if args.sweep_keep_fracs is not None:
+        keep_fracs   = _parse_floats(args.sweep_keep_fracs)
+        min_floors   = _parse_floats(args.sweep_min_floors)
+        fallback_ks  = [int(x) for x in args.sweep_fallback_ks.split(',')]
+        min_pt_counts = [int(x) for x in
+                         getattr(args, 'sweep_min_pt_counts', '0').split(',')]
+
+        # ── Pre-compute per-box interior point counts (one pass) ──────────────
+        need_pt = any(m > 0 for m in min_pt_counts)
+        if need_pt:
+            kitti_info = getattr(args, 'kitti_info', None)
+            if kitti_info is None:
+                print('WARNING: --kitti-info required for --sweep-min-pt-counts > 0. '
+                      'Dropping point count filter.')
+                min_pt_counts = [0]
+                need_pt = False
+            else:
+                velodyne_dir = os.path.join(os.path.dirname(kitti_info),
+                                            'training', 'velodyne_reduced')
+                print(f'Pre-computing point counts for {n_total} scenes '
+                      f'(velodyne_dir={velodyne_dir})...')
+                for sc in scenes:
+                    bin_path = sc.get('_bin_path') or os.path.join(
+                        velodyne_dir, sc['scene_id'] + '.bin')
+                    if os.path.isfile(bin_path):
+                        pts_nus = load_points_nus(bin_path)
+                        boxes_f32 = sc['boxes'].astype(np.float32)
+                        sc['pt_counts'] = count_points_in_boxes(pts_nus, boxes_f32)
+                    else:
+                        sc['pt_counts'] = np.zeros(len(sc['boxes']), dtype=np.int32)
+                print('  Done.\n')
+
+        n_combos = (len(keep_fracs) * len(min_floors)
+                    * len(fallback_ks) * len(min_pt_counts))
+        print(f'  Keep-fraction sweep: {n_combos} combinations '
+              f'({len(keep_fracs)} keep_frac × {len(min_floors)} min_floor × '
+              f'{len(fallback_ks)} fallback_k × '
+              f'{len(min_pt_counts)} min_pt_count)...\n')
+
+        results = []   # (f05, p50, r50, kf, fl, fk, min_pt)
+        for kf in keep_fracs:
+            for fl in min_floors:
+                for fk in fallback_ks:
+                    for min_pt in min_pt_counts:
+                        tp50 = fp50 = fn50 = 0
+                        for sc in scenes:
+                            cls_s  = sc['cls_scores']
+                            iou_s  = sc.get('iou_scores')
+                            boxes  = sc['boxes']
+                            labels = sc['labels']
+                            gt_car = sc['gt_car_boxes']
+
+                            hybrid = (cls_s if iou_s is None
+                                      else 0.5 * iou_s + 0.5 * cls_s)
+
+                            mask = select_scene_keep_mask(hybrid,
+                                                          keep_frac=kf,
+                                                          min_floor=fl,
+                                                          fallback_k=fk)
+                            if min_pt > 0 and 'pt_counts' in sc:
+                                mask = mask & (sc['pt_counts'] >= min_pt)
+
+                            car_mask = mask & (labels == pred_car_label)
+                            pred_car = boxes[car_mask]
+
+                            t, f_p, f_n = match_boxes(pred_car, gt_car, 0.50)
+                            tp50 += t; fp50 += f_p; fn50 += f_n
+
+                        p50 = tp50 / (tp50 + fp50) if (tp50 + fp50) > 0 else 0.0
+                        r50 = tp50 / (tp50 + fn50) if (tp50 + fn50) > 0 else 0.0
+                        results.append((_f05(p50, r50), p50, r50,
+                                        kf, fl, fk, min_pt))
+
+        results.sort(reverse=True)
+        top_n = args.sweep_top_n
+        hdr = (f'{"Rank":>4}  {"keep_frac":>9}  {"min_floor":>9}  '
+               f'{"fallback_k":>10}  {"min_pts":>7}  '
+               f'{"P@0.5":>6}  {"R@0.5":>6}  {"F_β0.5":>6}')
+        sep = '─' * len(hdr)
+        print(f'=== Keep-fraction sweep — top {top_n} of {n_combos} by F_β=0.5 ===')
+        print(sep)
+        print(hdr)
+        print(sep)
+        for rank, (f, p, r, kf, fl, fk, mp) in enumerate(results[:top_n], 1):
+            print(f'{rank:>4}  {kf:>9.3f}  {fl:>9.3f}  {fk:>10d}  '
+                  f'{mp:>7d}  {p:>6.3f}  {r:>6.3f}  {f:>6.3f}')
+        print(sep)
+
+        with open(csv_path, 'w') as fout:
+            fout.write('keep_frac,min_floor,fallback_k,min_pt_count,'
+                       'precision,recall,f05\n')
+            for f, p, r, kf, fl, fk, mp in results:
+                fout.write(f'{kf},{fl},{fk},{mp},{p:.4f},{r:.4f},{f:.4f}\n')
+        print(f'\nFull sweep results saved → {csv_path}')
+        return
+
+    # ── Legacy hybrid-thr sweep ───────────────────────────────────────────────
+    iou_weights = _parse_floats(args.sweep_iou_weights)
+    hybrid_thrs = _parse_floats(args.sweep_hybrid_thrs)
+    floors      = _parse_floats(args.sweep_floors)
+    cov_target  = args.sweep_cov_target
+    top_n       = args.sweep_top_n
+    n_combos    = len(iou_weights) * len(hybrid_thrs) * len(floors)
+    print(f'  Legacy hybrid-thr sweep: {n_combos} combinations '
           f'({len(iou_weights)} iou_w × {len(hybrid_thrs)} hybrid_thr × '
           f'{len(floors)} floor)...\n')
 
-    # Reference point from current args (highlighted in table)
     ref = (round(args.iou_weight, 4),
            round(args.hybrid_thr, 4),
            round(min(args.min_cls_thr, args.min_iou_thr), 4))
-
-    def _f05(p, r):
-        return 1.25 * p * r / (0.25 * p + r) if (0.25 * p + r) > 0 else 0.0
 
     results = []
     for w in iou_weights:
@@ -912,9 +1446,9 @@ def _sweep_thresholds(args) -> None:
                 n_with = 0
                 total_boxes = 0
                 for sc in scenes:
-                    cls_s = sc['cls_scores']
-                    iou_s = sc.get('iou_scores')
-                    boxes = sc['boxes']
+                    cls_s  = sc['cls_scores']
+                    iou_s  = sc.get('iou_scores')
+                    boxes  = sc['boxes']
                     labels = sc['labels']
                     gt_car = sc['gt_car_boxes']
 
@@ -937,23 +1471,22 @@ def _sweep_thresholds(args) -> None:
                     t, f_p, f_n = match_boxes(pred_car, gt_car, 0.50)
                     tp50 += t; fp50 += f_p; fn50 += f_n
 
-                p50 = tp50 / (tp50 + fp50) if (tp50 + fp50) > 0 else 0.0
-                r50 = tp50 / (tp50 + fn50) if (tp50 + fn50) > 0 else 0.0
-                cov = n_with / n_total if n_total > 0 else 0.0
-                f = _f05(p50, r50)
+                p50  = tp50 / (tp50 + fp50) if (tp50 + fp50) > 0 else 0.0
+                r50  = tp50 / (tp50 + fn50) if (tp50 + fn50) > 0 else 0.0
+                cov  = n_with / n_total if n_total > 0 else 0.0
+                f    = _f05(p50, r50)
                 score = f * min(1.0, cov / cov_target)
-                results.append((score, f, p50, r50, cov,
-                                 total_boxes, w, ht, fl))
+                results.append((score, f, p50, r50, cov, total_boxes, w, ht, fl))
 
     results.sort(reverse=True)
     shown = results[:top_n]
 
     hdr = (f'{"Rank":>4}  {"iou_w":>5}  {"floor":>5}  {"hybrid":>6}  '
-           f'{"P@0.5":>6}  {"R@0.5":>6}  {"F_0.5":>5}  '
+           f'{"P@0.5":>6}  {"R@0.5":>6}  {"F_β0.5":>6}  '
            f'{"Cov%":>5}  {"Boxes":>6}  {"Score":>6}')
     sep = '─' * len(hdr)
-    print(f'=== Threshold sweep — top {top_n} of {n_combos} by '
-          f'F_0.5 × cov_factor (cov_target={cov_target:.0%}) ===')
+    print(f'=== Legacy sweep — top {top_n} of {n_combos} by '
+          f'F_β=0.5 × cov_factor (cov_target={cov_target:.0%}) ===')
     print(f'  (model test_cfg score_thr is an implicit CLS floor not shown here)')
     print(sep)
     print(hdr)
@@ -961,12 +1494,10 @@ def _sweep_thresholds(args) -> None:
     for rank, (score, f, p, r, cov, nb, w, ht, fl) in enumerate(shown, 1):
         marker = ' ←' if (round(w,4), round(ht,4), round(fl,4)) == ref else ''
         print(f'{rank:>4}  {w:>5.2f}  {fl:>5.2f}  {ht:>6.3f}  '
-              f'{p:>6.3f}  {r:>6.3f}  {f:>5.3f}  '
+              f'{p:>6.3f}  {r:>6.3f}  {f:>6.3f}  '
               f'{cov*100:>5.1f}  {nb:>6}  {score:>6.3f}{marker}')
     print(sep)
 
-    # CSV export alongside the cache
-    csv_path = args.sweep_from_cache.replace('.pkl', '_sweep.csv')
     with open(csv_path, 'w') as fout:
         fout.write('iou_w,floor,hybrid_thr,precision,recall,f05,'
                    'coverage,n_boxes,score\n')
@@ -1055,6 +1586,84 @@ def main():
     print(f'Loading KITTI GT from {args.kitti_info}...')
     gt_lookup, gt_car_label = build_gt_lookup(args.kitti_info)
 
+    # ── Points analysis: interior point counts per PS-box ─────────────────────
+    if getattr(args, 'points_analysis', False) and ps_labels:
+        os.makedirs(args.out_dir, exist_ok=True)
+        all_pt_counts: list = []
+        all_gt_ious:   list = []
+        all_cls_scores: list = []
+        # Validate pkl format — must be a PS-label store (ps_label_eN.pkl),
+        # not a raw-preds cache written by --dump-raw-preds.
+        _sample = next(iter(ps_labels.values()))
+        if not isinstance(_sample, dict) or 'gt_boxes' not in _sample:
+            print('ERROR: --points-analysis requires a PS-label pkl (ps_label_eN.pkl) '
+                  'with per-scene gt_boxes entries.\n'
+                  '  Got a different format — possibly a --dump-raw-preds cache.\n'
+                  '  Pass a ps_label_e*.pkl from <work_dir>/<timestamp>/ps_labels/ instead.')
+            return
+
+        n_scenes_done = 0
+        all_ps_keys = [k for k, v in ps_labels.items() if len(v.get('gt_boxes', [])) > 0]
+        print(f'Points analysis: processing {len(all_ps_keys)} scenes with PS boxes...')
+        for key in all_ps_keys:
+            ps_entry = ps_labels[key]
+            ps_boxes  = ps_entry['gt_boxes']          # (K, 7)
+            cls_s     = ps_entry.get('cls_scores',
+                                     ps_entry['scores'])  # (K,) fallback
+            if len(ps_boxes) == 0:
+                continue
+            if not os.path.isfile(key):
+                continue
+            pts_nus = load_points_nus(key)
+            pt_counts = count_points_in_boxes(pts_nus, ps_boxes)
+
+            # GT IoU per PS-box
+            gt_info = gt_lookup.get(os.path.splitext(os.path.basename(key))[0])
+            if gt_info is not None and len(gt_info['cam_boxes']) > 0:
+                gt_all = gt_boxes_to_nus(gt_info['cam_boxes'], gt_info['lidar2cam'])
+                gt_car = gt_all[gt_info['labels'] == gt_car_label]
+            else:
+                gt_car = np.zeros((0, 7), dtype=np.float32)
+            ious = gt_iou_per_pred(ps_boxes, gt_car, mode='3d')
+
+            all_pt_counts.append(pt_counts)
+            all_gt_ious.append(ious)
+            all_cls_scores.append(cls_s)
+            n_scenes_done += 1
+            if n_scenes_done % 500 == 0:
+                print(f'  ... {n_scenes_done}/{len(all_ps_keys)} scenes done')
+
+        if all_pt_counts:
+            pt_arr  = np.concatenate(all_pt_counts)
+            iou_arr = np.concatenate(all_gt_ious)
+            cls_arr = np.concatenate(all_cls_scores)
+
+            print(f'\n=== Points-in-box summary ({n_scenes_done} scenes, '
+                  f'{len(pt_arr)} boxes) ===')
+            print(f'  pt_count:  min={pt_arr.min()}  max={pt_arr.max()}  '
+                  f'mean={pt_arr.mean():.1f}  median={np.median(pt_arr):.0f}')
+            print(f'  0 pts:   {100*(pt_arr==0).mean():.1f}%  '
+                  f'≤5 pts: {100*(pt_arr<=5).mean():.1f}%  '
+                  f'≤20 pts: {100*(pt_arr<=20).mean():.1f}%')
+            print(f'  gt_iou:    mean={iou_arr.mean():.3f}  '
+                  f'median={np.median(iou_arr):.3f}  '
+                  f'>0.5: {100*(iou_arr>0.5).mean():.1f}%  '
+                  f'>0.25: {100*(iou_arr>0.25).mean():.1f}%')
+
+            pkl_stem = os.path.splitext(os.path.basename(args.ps_label_pkl))[0]
+            plot_points_histogram(
+                pt_arr,
+                os.path.join(args.out_dir, f'points_histogram_{pkl_stem}.png'),
+                title=f'Interior point count per PS-box  [{pkl_stem}]  '
+                      f'({n_scenes_done} scenes, {len(pt_arr)} boxes)')
+            plot_iou_cls_pts_3d_scatter(
+                pt_arr, iou_arr, cls_arr,
+                os.path.join(args.out_dir, f'points_iou_cls_scatter_{pkl_stem}.html'),
+                title=f'PS-box quality: CLS × GT-IoU × Point count  [{pkl_stem}]')
+        else:
+            print('Points analysis: no scenes with valid data found.')
+        return  # early exit — don't run the BEV rendering loop
+
     # ── Scene selection: from pkl keys, or bin paths derived from gt_lookup ──
     if ps_labels:
         available = list(ps_labels.keys())
@@ -1072,8 +1681,17 @@ def main():
     if not args.no_baseline:
         from mmdet3d.apis import init_model
         print(f'Loading baseline model: {args.baseline_ckpt}')
-        baseline_model = init_model(
-            args.baseline_config, args.baseline_ckpt, device=args.device)
+        # init_model falls back to config.class_names when the checkpoint meta
+        # lacks 'dataset_meta' (common for custom MT checkpoints).  Inject it
+        # from the train dataset metainfo so init_model doesn't crash.
+        _cfg = Config.fromfile(args.baseline_config)
+        if not hasattr(_cfg, 'class_names'):
+            try:
+                _cfg.class_names = list(
+                    _cfg.train_dataloader.dataset.metainfo.get('classes', ['Car']))
+            except Exception:
+                _cfg.class_names = ['Car']
+        baseline_model = init_model(_cfg, args.baseline_ckpt, device=args.device)
         baseline_model.eval()
         print('Baseline model ready.')
 
@@ -1089,6 +1707,8 @@ def main():
     bl_all_scores: list = []
     bl_all_iou: list = []
     bl_all_cls: list = []
+    bl_all_giou_3d: list = []   # actual GT 3D IoU per prediction
+    bl_all_giou_bev: list = []  # actual GT BEV IoU per prediction
     bl_scenes_with_boxes: int = 0
 
     # ── Per-scene loop ──
@@ -1130,10 +1750,20 @@ def main():
             bl_boxes, bl_scores, bl_labels, bl_iou_scores, bl_cls_scores = run_baseline(
                 baseline_model, pts_nus, args.device,
                 args.hybrid_thr, args.iou_weight,
-                args.min_cls_thr, args.min_iou_thr)
-            thr_info = (f'hybrid≥{args.hybrid_thr}, w={args.iou_weight}'
-                        + (f', cls≥{args.min_cls_thr}' if args.min_cls_thr > 0 else '')
-                        + (f', iou≥{args.min_iou_thr}' if args.min_iou_thr > 0 else ''))
+                args.min_cls_thr, args.min_iou_thr,
+                keep_frac=args.keep_frac,
+                min_floor=args.min_floor,
+                fallback_k=args.fallback_k,
+                floor_before=args.floor_before)
+            if args.keep_frac is not None:
+                thr_info = (f'keep_frac={args.keep_frac}'
+                            + (f', floor≥{args.min_floor}' if args.min_floor > 0 else '')
+                            + (f', fallback_k={args.fallback_k}' if args.fallback_k > 0 else '')
+                            + (' [floor-before]' if args.floor_before else ''))
+            else:
+                thr_info = (f'hybrid≥{args.hybrid_thr}, w={args.iou_weight}'
+                            + (f', cls≥{args.min_cls_thr}' if args.min_cls_thr > 0 else '')
+                            + (f', iou≥{args.min_iou_thr}' if args.min_iou_thr > 0 else ''))
             # print(f'  Baseline: {len(bl_boxes)} boxes ({thr_info})')
             if len(bl_scores) > 0:
                 bl_all_scores.extend(bl_scores.tolist())
@@ -1141,6 +1771,20 @@ def main():
                 if bl_iou_scores is not None:
                     bl_all_iou.extend(bl_iou_scores.tolist())
                 bl_scenes_with_boxes += 1
+                # Actual GT IoU per prediction (for --gt-iou mode)
+                if getattr(args, 'gt_iou', False):
+                    # gt_car is built a few lines below; compute it here early
+                    _gt_car = (gt_boxes_nus[gt_labels == gt_car_label]
+                               if len(gt_labels) > 0
+                               else np.zeros((0, 7), dtype=np.float32))
+                    _pred_boxes = bl_boxes  # already filtered by threshold
+                    mode = getattr(args, 'gt_iou_mode', 'both')
+                    if mode in ('3d', 'both'):
+                        bl_all_giou_3d.extend(
+                            gt_iou_per_pred(_pred_boxes, _gt_car, mode='3d').tolist())
+                    if mode in ('bev', 'both'):
+                        bl_all_giou_bev.extend(
+                            gt_iou_per_pred(_pred_boxes, _gt_car, mode='bev').tolist())
 
         # Stats or render
         gt_car = (gt_boxes_nus[gt_labels == gt_car_label]
@@ -1199,20 +1843,57 @@ def main():
     if args.score_hist and not ps_labels:
         os.makedirs(args.out_dir, exist_ok=True)
         if bl_all_cls:
-            plot_score_distributions(
-                bl_all_cls, bl_all_iou,
-                os.path.join(args.out_dir, 'score_distributions.png'),
-                title='Baseline score distributions',
-                score1_label='CLS score',
-                thresholds=dict(
+            _use_gt_iou = getattr(args, 'gt_iou', False)
+            _gt_iou_mode = getattr(args, 'gt_iou_mode', 'both')
+            # Build a human-readable title that names the active filtering scheme.
+            if args.keep_frac is not None:
+                _scheme_str = f'keep_frac={args.keep_frac}'
+                if args.min_floor > 0:
+                    _scheme_str += f', floor≥{args.min_floor}'
+                if args.fallback_k > 0:
+                    _scheme_str += f', fallback_k={args.fallback_k}'
+                if args.floor_before:
+                    _scheme_str += ' [floor-before]'
+                _hist_title_base = f'Baseline: per-scene keep-fraction ({_scheme_str})'
+                # Threshold overlay: show only the floor line (the hybrid/iou
+                # constraint lines would be misleading for the new scheme).
+                _thr_dict = dict(min_cls=args.min_floor) if args.min_floor > 0 else None
+            else:
+                _hist_title_base = 'Baseline score distributions'
+                _thr_dict = dict(
                     min_cls=args.min_cls_thr,
                     min_iou=args.min_iou_thr,
                     hybrid_thr=args.hybrid_thr,
-                    iou_weight=args.iou_weight),
-                scene_stats=(bl_scenes_with_boxes, n))
+                    iou_weight=args.iou_weight)
+            if _use_gt_iou:
+                # First IoU axis: 3D GT IoU (or BEV if mode='bev')
+                _iou1       = bl_all_giou_3d if _gt_iou_mode in ('3d', 'both') else bl_all_giou_bev
+                _iou1_label = 'GT 3D IoU'    if _gt_iou_mode in ('3d', 'both') else 'GT BEV IoU'
+                # Second IoU axis: BEV GT IoU (only when mode='both')
+                _iou2       = bl_all_giou_bev if _gt_iou_mode == 'both' else None
+                _iou2_label = 'GT BEV IoU'   if _gt_iou_mode == 'both' else ''
+                plot_score_distributions(
+                    bl_all_cls, _iou1,
+                    os.path.join(args.out_dir, 'score_distributions.png'),
+                    title=f'{_hist_title_base} — CLS vs GT IoU',
+                    score1_label='CLS score',
+                    iou_label=_iou1_label,
+                    iou2_scores=_iou2,
+                    iou2_label=_iou2_label,
+                    thresholds=_thr_dict,
+                    scene_stats=(bl_scenes_with_boxes, n))
+            else:
+                plot_score_distributions(
+                    bl_all_cls, bl_all_iou,
+                    os.path.join(args.out_dir, 'score_distributions.png'),
+                    title=_hist_title_base,
+                    score1_label='CLS score',
+                    thresholds=_thr_dict,
+                    scene_stats=(bl_scenes_with_boxes, n))
         else:
             print('--score-hist: no baseline scores collected '
-                  '(add --baseline-config/--baseline-ckpt or lower --hybrid-thr).')
+                  '(add --baseline-config/--baseline-ckpt or lower --hybrid-thr / '
+                  '--keep-frac).')
 
 
 if __name__ == '__main__':

@@ -84,8 +84,13 @@ class CenterPointBEVRoI(CenterPoint):
         return x
 
 
+    @property
+    def bbox_head(self):
+        """Alias so MeanTeacher3DDetector can call student.bbox_head uniformly."""
+        return self.pts_bbox_head
+
     def extract_feat(self, batch_inputs_dict: dict,
-                     batch_input_metas: List[dict],
+                     batch_input_metas: List[dict] = None,
                      return_bev: bool = False) -> tuple:
         """Extract features from images and points.
 

@@ -483,23 +483,21 @@ custom_hooks = [
         update_at_epochs=(0,),  # always refresh before epoch 0 starts
         ps_batch_size=8,
         ps_num_workers=6,
-        # Three-constraint filter applied to teacher predictions at each refresh.
-        # Mirrors tools/visualize_pseudo_labels.py::run_baseline:
-        #   hybrid = iou_weight * IoU + (1 - iou_weight) * CLS >= hybrid_thr
-        #   IoU  >= iou_thr   (0.0 = disabled)
-        #   CLS  >= cls_thr   (0.0 = disabled)
-        # IoU = post-NMS RoI IoU head score; CLS = test_cfg ranking score.
-        hybrid_thr=0,
-        iou_weight=0.5,
-        iou_thr=0.6,
-        cls_thr=0.2,
-        # Broad candidate floor: conf_threshold is temporarily set to this during
-        # the refresh inference pass so filter_teacher_predictions passes the full
-        # NMS-survivor pool through; the three constraints above do the real cut.
+        # Per-scene keep-fraction: keep top 25% by CLS score per scene.
+        # iou_weight=0 → cls-only ranking for now (even though this checkpoint
+        # has an IoU head, we use cls scores for consistency with CenterPoint).
+        # All hard floors disabled (0.0) — the fraction cut is epoch-invariant.
+        # coverage_gate_drop=0.30 → skip store update if coverage drops >30%.
+        # (IoU head still trains normally via iou_distill_weight in mean_teacher_cfg.)
+        keep_frac=0.25,
+        iou_weight=0,
+        iou_thr=0.0,
+        cls_thr=0.0,
+        hybrid_thr=0.0,
+        coverage_gate_drop=0.30,
         ps_min_score=0.05,
-        # Top-1 fallback: scenes with 0 boxes after filtering keep their
-        # highest-hybrid candidate to avoid empty-GT scenes during training.
         use_top1_fallback=False,
+        min_pts=5,
     ),
 ]
 

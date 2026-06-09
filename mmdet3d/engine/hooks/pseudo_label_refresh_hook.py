@@ -29,36 +29,41 @@ class PseudoLabelRefreshHook(Hook):
 
     Every ``interval`` epochs (and at the epochs listed in ``update_at_epochs``)
     the teacher model is run in eval mode over the full unlabeled target split.
-    Predictions are filtered using a three-constraint scheme and saved to disk as
-    ``<work_dir>/ps_labels/ps_label_e{epoch}.pkl``.  The detector's in-memory
-    ``pseudo_label_store`` is updated so the student can use the refreshed labels
-    for the next training interval.
+    Predictions are filtered using a per-scene keep-fraction scheme and saved to
+    disk as ``<work_dir>/ps_labels/ps_label_e{epoch}.pkl``.  The detector's
+    in-memory ``pseudo_label_store`` is updated so the student can use the
+    refreshed labels for the next training interval.
 
     On training start the hook checks for existing pkl files from prior runs and
     loads the most recent one whose epoch ≤ ``runner.epoch``.
 
-    Three-constraint filtering
-    ~~~~~~~~~~~~~~~~~~~~~~~~~~
-    The same scheme used in ``tools/visualize_pseudo_labels.py::run_baseline``:
+    Keep-fraction filtering
+    ~~~~~~~~~~~~~~~~~~~~~~~
+    Per scene, rank all candidate boxes by
+    ``rank = iou_weight * IoU + (1 - iou_weight) * CLS``
+    (reduces to CLS when ``iou_weight=0``) and keep the top
+    ``ceil(keep_frac * N)`` boxes.  ``ceil`` guarantees ≥1 box per non-empty
+    scene; the fraction-based selection is epoch-invariant because it depends
+    on rank, not absolute score magnitude.
 
-    1. **Hybrid floor** (primary): ``iou_weight * IoU + (1 - iou_weight) * CLS
-       >= hybrid_thr``.  When ``iou_weight=0`` this reduces to ``CLS >= hybrid_thr``.
-    2. **IoU floor** (independent): ``IoU >= iou_thr``.  Set ``iou_thr=0`` to
-       disable.
-    3. **CLS floor** (independent): ``CLS >= cls_thr``.  Set ``cls_thr=0`` to
-       disable.
-
-    All three constraints must be satisfied simultaneously.  ``CLS`` here is the
-    ``scores_3d`` from the detector's NMS output (the test_cfg ranking score).
-    ``IoU`` is the post-NMS RoI IoU head score (``iou_scores_3d``).
+    Optional hard guards (active only when > 0):
+    ``rank >= hybrid_thr``, ``IoU >= iou_thr``, ``CLS >= cls_thr``.
 
     During the refresh inference pass, ``mean_teacher_cfg['conf_threshold']`` is
     temporarily lowered to ``ps_min_score`` so the detector's
     ``filter_teacher_predictions`` acts as a broad pre-floor, passing through the
     full candidate set (all NMS survivors scoring ≥ ps_min_score).  The
-    three-constraint filter is then applied here in the hook on the raw scores.
+    keep-fraction filter is then applied here in the hook on the raw scores.
     After inference the original ``conf_threshold`` is restored so the online
     store-empty training path continues to use the configured cutoff.
+
+    Coverage gate
+    ~~~~~~~~~~~~~
+    After each refresh, if the new scene coverage drops more than
+    ``coverage_gate_drop`` (fraction) relative to the previously accepted
+    coverage, the new labels are **discarded** and the existing store is kept.
+    This prevents a degenerate teacher (real confidence collapse) from poisoning
+    training.  The first refresh (epoch 0) is always accepted.
 
     Args:
         interval (int): Refresh every this many epochs. Default: 1.
@@ -71,23 +76,34 @@ class PseudoLabelRefreshHook(Hook):
             Default: 8.
         ps_num_workers (int): Dataloader workers for the inference pass.
             Default: 6.
-        hybrid_thr (float): Minimum hybrid score to keep a pseudo-box.
-            ``hybrid = iou_weight * IoU + (1 - iou_weight) * CLS``.
-            Default: 0.3.
-        iou_weight (float): IoU weight in the hybrid score [0, 1].
-            0 = CLS-only hybrid.  Default: 0.5.
-        iou_thr (float): Minimum raw RoI-IoU score (independent constraint).
+        keep_frac (float): Fraction of candidate boxes to keep per scene
+            (``ceil(keep_frac * N)`` top-ranked boxes).  1.0 = keep all.
+            Default: 0.25.
+        coverage_gate_drop (float): Maximum fractional drop in scene coverage
+            before the refresh is rejected.  0.30 = reject if coverage falls
+            >30% relative to the previous accepted value.  Default: 0.30.
+        hybrid_thr (float): Optional minimum ranking-score guard applied after
+            the keep-fraction cut.  0.0 = disabled.  Default: 0.0.
+        iou_weight (float): IoU weight in the ranking score [0, 1].
+            0 = CLS-only ranking.  Default: 0.0.
+        iou_thr (float): Optional minimum raw RoI-IoU score guard.
             0.0 = disabled.  Default: 0.0.
-        cls_thr (float): Minimum raw CLS score (independent constraint).
+        cls_thr (float): Optional minimum raw CLS score guard.
             0.0 = disabled.  Default: 0.0.
         ps_min_score (float): Broad threshold used during teacher inference to
             collect the candidate pool (temporarily overrides
             ``mean_teacher_cfg['conf_threshold']``).  Should be ≤
             ``test_cfg.score_thr`` (0.1 by default), acting as the absolute
             lower bound on candidates.  Default: 0.05.
-        use_top1_fallback (bool): If True, scenes with zero boxes above the
-            three-constraint thresholds keep their top-1 candidate (ranked by
-            hybrid score) as a pseudo-label.  Default: True.
+        use_top1_fallback (bool): If True, scenes with zero boxes after the
+            keep-fraction filter keep their top-1 candidate as a pseudo-label.
+            Rarely needed since ``ceil`` already prevents empty scenes when N>0.
+            Default: True.
+        min_pts (int): Minimum number of LiDAR points that must fall inside a
+            pseudo-label box for it to be kept.  Applied as a hard guard after
+            the keep-fraction cut (same as ``cls_thr``/``iou_thr``).  Boxes
+            with fewer than ``min_pts`` interior points are discarded regardless
+            of their ranking score.  0 disables the filter.  Default: 5.
     """
 
     def __init__(
@@ -97,26 +113,33 @@ class PseudoLabelRefreshHook(Hook):
         ps_label_subdir: str = 'ps_labels',
         ps_batch_size: int = 8,
         ps_num_workers: int = 6,
-        hybrid_thr: float = 0.3,
-        iou_weight: float = 0.5,
+        keep_frac: float = 0.25,
+        coverage_gate_drop: float = 0.30,
+        hybrid_thr: float = 0.0,
+        iou_weight: float = 0.0,
         iou_thr: float = 0.0,
         cls_thr: float = 0.0,
         ps_min_score: float = 0.05,
         use_top1_fallback: bool = True,
+        min_pts: int = 5,
     ) -> None:
         self.interval = interval
         self.update_at_epochs = list(update_at_epochs)
         self.ps_label_subdir = ps_label_subdir
         self.ps_batch_size = ps_batch_size
         self.ps_num_workers = ps_num_workers
+        self.keep_frac = keep_frac
+        self.coverage_gate_drop = coverage_gate_drop
         self.hybrid_thr = hybrid_thr
         self.iou_weight = iou_weight
         self.iou_thr = iou_thr
         self.cls_thr = cls_thr
         self.ps_min_score = ps_min_score
         self.use_top1_fallback = use_top1_fallback
+        self.min_pts = min_pts
 
         self._ps_loader: Optional[DataLoader] = None
+        self._prev_coverage: Optional[float] = None
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -191,6 +214,18 @@ class PseudoLabelRefreshHook(Hook):
                 f'[PseudoLabelRefreshHook] Loading pseudo labels from {best_path}')
             model.load_pseudo_labels_from_pkl(best_path)
 
+    @staticmethod
+    def _scene_coverage(labels: dict):
+        """Compute scene coverage statistics.
+
+        Returns:
+            (n_covered, n_scenes, fraction)
+        """
+        n_scenes = len(labels)
+        n_covered = sum(1 for v in labels.values() if len(v['gt_labels']) > 0)
+        frac = n_covered / max(n_scenes, 1)
+        return n_covered, n_scenes, frac
+
     # ------------------------------------------------------------------
     # Hook callbacks
     # ------------------------------------------------------------------
@@ -222,7 +257,7 @@ class PseudoLabelRefreshHook(Hook):
 
         # Temporarily lower conf_threshold so filter_teacher_predictions acts as
         # a broad pre-floor (ps_min_score), passing raw candidates through.  The
-        # three-constraint filter applied below does the real quality cut.
+        # keep-fraction filter applied below does the real quality cut.
         # try/finally guarantees the original threshold is restored even if
         # inference raises, so the online store-empty training path is never
         # left using ps_min_score as its quality cutoff.
@@ -243,16 +278,36 @@ class PseudoLabelRefreshHook(Hook):
             else:
                 new_labels = {}
 
-        # Apply three-constraint filter and optional top-1 fallback on rank 0.
+        # Apply keep-fraction filter, optional top-1 fallback, and coverage
+        # gate on rank 0.
+        accepted = True
+        cov_new = 0.0
         if rank == 0:
             raw_labels = new_labels
             new_labels = self._apply_three_constraint_filter(new_labels, logger)
             if self.use_top1_fallback:
                 new_labels = self._top1_fallback(new_labels, raw_labels, logger)
 
-        # Rank 0 writes the pkl; all ranks update the model store.
+            _, _, cov_new = self._scene_coverage(new_labels)
+            prev_str = (f'{self._prev_coverage:.3f}'
+                        if self._prev_coverage is not None else 'N/A')
+            logger.info(
+                f'[PseudoLabelRefreshHook] Coverage: prev={prev_str} '
+                f'new={cov_new:.3f}')
+            if (self._prev_coverage is not None
+                    and cov_new < (1.0 - self.coverage_gate_drop)
+                    * self._prev_coverage):
+                logger.warning(
+                    f'[PseudoLabelRefreshHook] Coverage gate tripped: '
+                    f'new coverage {cov_new:.3f} < '
+                    f'{1.0 - self.coverage_gate_drop:.2f} × '
+                    f'prev {self._prev_coverage:.3f}. '
+                    f'Skipping store update — keeping existing pseudo-labels.')
+                accepted = False
+
+        # Rank 0 writes the pkl when accepted.
         ps_dir = self._ps_dir(runner)
-        if rank == 0:
+        if rank == 0 and accepted:
             os.makedirs(ps_dir, exist_ok=True)
             pkl_path = os.path.join(ps_dir, f'ps_label_e{epoch}.pkl')
             with open(pkl_path, 'wb') as f:
@@ -262,17 +317,23 @@ class PseudoLabelRefreshHook(Hook):
                 f'to {pkl_path}')
 
         if world_size > 1:
-            # Broadcast the filtered dict to non-zero ranks.
+            # Broadcast the filtered dict and the accepted flag to non-zero ranks.
+            # If the gate tripped, payload is None so all ranks skip the update.
             import torch.distributed as dist
             if rank == 0:
-                dist.broadcast_object_list([new_labels], src=0)
+                payload = new_labels if accepted else None
+                dist.broadcast_object_list([payload, accepted], src=0)
             else:
-                container = [None]
+                container = [None, None]
                 dist.broadcast_object_list(container, src=0)
                 new_labels = container[0]
+                accepted = container[1]
 
-        model.set_pseudo_labels(new_labels)
-        self._log_ps_stats(new_labels, logger)
+        if accepted:
+            model.set_pseudo_labels(new_labels)
+            if rank == 0:
+                self._prev_coverage = cov_new
+            self._log_ps_stats(new_labels, logger)
 
     # ------------------------------------------------------------------
     # Teacher inference pass
@@ -284,12 +345,12 @@ class PseudoLabelRefreshHook(Hook):
         ``mean_teacher_cfg['conf_threshold']`` is expected to already be lowered
         to ``ps_min_score`` by the caller so that ``filter_teacher_predictions``
         acts only as a broad pre-floor.  Raw ``iou_scores`` and ``cls_scores``
-        are preserved in the output dict for the three-constraint filter.
+        are preserved in the output dict for the keep-fraction filter.
         """
         if getattr(model, 'mean_teacher_cfg', {}).get('use_dsnorm', False):
             from mmdet3d.models.layers.dsnorm import set_ds_target
-            model.teacher.apply(set_ds_target)
-        model.teacher.eval()
+            model.student.apply(set_ds_target)
+        model.student.eval()
         new_labels: dict = {}
         total_pos = 0
 
@@ -297,16 +358,27 @@ class PseudoLabelRefreshHook(Hook):
             batch_inputs = batch['inputs']
             batch_data_samples = batch['data_samples']
 
-            # Voxelize via the teacher's own data_preprocessor.
+            # Save raw xyz before voxelization for interior-point counting.
+            # Each element is (M_i, C) on CPU; we only need the first 3 dims.
+            if self.min_pts > 0:
+                pts_raw = [
+                    (p.numpy() if isinstance(p, torch.Tensor) else np.asarray(p))[:, :3]
+                    for p in batch_inputs['points']
+                ]
+            else:
+                pts_raw = [None] * len(batch_data_samples)
+
+            # Voxelize via the student's own data_preprocessor.
             with torch.no_grad():
-                data = model.teacher.data_preprocessor(
+                data = model.student.data_preprocessor(
                     {'inputs': batch_inputs,
                      'data_samples': batch_data_samples},
                     training=False)
-                pred_list = model.teacher.predict(
+                pred_list = model.student.predict(
                     data['inputs'], data['data_samples'])
 
-            for data_sample, pred in zip(batch_data_samples, pred_list):
+            for data_sample, pred, pts_xyz in zip(
+                    batch_data_samples, pred_list, pts_raw):
                 key = data_sample.metainfo.get('lidar_path')
                 if key is None:
                     continue
@@ -322,6 +394,15 @@ class PseudoLabelRefreshHook(Hook):
                 iou_t    = getattr(inst, 'iou_scores_3d', None)
                 cls_t    = getattr(inst, 'cls_scores_3d', None)
 
+                # Interior point count per box (used by min_pts guard).
+                if pts_xyz is not None and len(boxes_t) > 0 and len(pts_xyz) > 0:
+                    from mmdet3d.structures.ops.box_np_ops import points_in_rbbox
+                    in_box = points_in_rbbox(pts_xyz, boxes_t, z_axis=2,
+                                             origin=(0.5, 0.5, 0))
+                    pt_counts = in_box.sum(axis=0).astype(np.int32)
+                else:
+                    pt_counts = np.zeros(len(boxes_t), dtype=np.int32)
+
                 new_labels[key] = {
                     'gt_boxes':  boxes_t.astype(np.float32),
                     'gt_labels': labels_t.astype(np.int64),
@@ -330,10 +411,11 @@ class PseudoLabelRefreshHook(Hook):
                                   if iou_t is not None else scores_t.astype(np.float32),
                     'cls_scores': cls_t.cpu().numpy().astype(np.float32)
                                   if cls_t is not None else None,
+                    'pt_counts': pt_counts,
                 }
                 total_pos += len(labels_t)
 
-        model.teacher.train()
+        model.student.train()
         logger.info(
             f'[PseudoLabelRefreshHook] Collected {total_pos} candidate '
             f'pseudo-boxes across {len(new_labels)} frames '
@@ -341,23 +423,26 @@ class PseudoLabelRefreshHook(Hook):
         return new_labels
 
     # ------------------------------------------------------------------
-    # Three-constraint filter
+    # Keep-fraction filter
     # ------------------------------------------------------------------
 
     def _apply_three_constraint_filter(self, new_labels: dict, logger) -> dict:
-        """Filter pseudo-boxes with three independent constraints.
+        """Filter pseudo-boxes with per-scene keep-fraction selection.
 
-        Mirrors ``tools/visualize_pseudo_labels.run_baseline`` exactly:
+        Primary selection: keep the top ``ceil(keep_frac * N)`` boxes per scene,
+        ranked by
+        ``rank = iou_weight * IoU + (1 - iou_weight) * CLS``
+        (reduces to CLS when ``iou_weight=0``).  ``ceil`` guarantees ≥1 box
+        whenever the scene has any candidate.
 
-          hybrid = iou_weight * IoU + (1 - iou_weight) * CLS >= hybrid_thr
-          IoU  >= iou_thr   (when iou_thr > 0)
-          CLS  >= cls_thr   (when cls_thr > 0)
+        Optional hard guards applied after the fraction cut (active when > 0):
+          ``rank >= hybrid_thr``, ``IoU >= iou_thr``, ``CLS >= cls_thr``.
 
         ``CLS`` is ``cls_scores`` (raw ``scores_3d`` ranking score preserved by
         ``filter_teacher_predictions``).  ``IoU`` is ``iou_scores`` (post-NMS
-        RoI IoU head score).  The stored ``scores`` field is set to the hybrid
-        value so ``_create_pseudo_labels_from_store`` and the visualizer
-        histogram see the pseudo-label quality score.
+        RoI IoU head score).  The stored ``scores`` field is set to the ranking
+        score so ``_create_pseudo_labels_from_store`` and downstream paths see
+        the pseudo-label quality score consistently.
 
         Args:
             new_labels: Candidate dict from ``_run_teacher_inference``.
@@ -371,42 +456,72 @@ class PseudoLabelRefreshHook(Hook):
         total_after  = 0
 
         for key, entry in new_labels.items():
-            cls_sc = entry.get('cls_scores')
-            iou_sc = entry['iou_scores']
+            cls_sc   = entry.get('cls_scores')
+            iou_sc   = entry['iou_scores']
+            pt_cnts  = entry.get('pt_counts')   # may be None if min_pts=0
 
-            # Fallback: if raw cls_scores were not stored, use scores (hybrid).
+            # Fallback: if raw cls_scores were not stored, use scores.
             if cls_sc is None:
                 cls_sc = entry['scores']
 
-            # Hybrid score — mirrors run_baseline:224-225.
+            # Ranking score — cls-only when iou_weight=0 (default).
             if self.iou_weight > 0:
-                hybrid = self.iou_weight * iou_sc + (1.0 - self.iou_weight) * cls_sc
+                rank = self.iou_weight * iou_sc + (1.0 - self.iou_weight) * cls_sc
             else:
-                hybrid = cls_sc
+                rank = cls_sc
 
-            # Build the combined mask — mirrors run_baseline:229-233.
-            mask = hybrid >= self.hybrid_thr
+            n = len(rank)
+            total_before += n
+
+            if n == 0:
+                # Empty scene: pass through unchanged.
+                filtered[key] = {
+                    'gt_boxes':   entry['gt_boxes'],
+                    'gt_labels':  entry['gt_labels'],
+                    'scores':     rank,
+                    'iou_scores': iou_sc,
+                    'cls_scores': cls_sc,
+                    'pt_counts':  pt_cnts,
+                }
+                continue
+
+            # Per-scene keep-fraction: top ceil(keep_frac * N) by ranking score.
+            if self.keep_frac is not None and self.keep_frac < 1.0:
+                k = int(np.ceil(self.keep_frac * n))
+                order = np.argsort(rank)[::-1]
+                top_k_idx = order[:k]
+                mask = np.zeros(n, dtype=bool)
+                mask[top_k_idx] = True
+            else:
+                mask = np.ones(n, dtype=bool)
+
+            # Optional hard guards (backward-compat; disabled when set to 0.0).
+            if self.hybrid_thr > 0:
+                mask = mask & (rank >= self.hybrid_thr)
             if self.iou_thr > 0:
                 mask = mask & (iou_sc >= self.iou_thr)
             if self.cls_thr > 0:
                 mask = mask & (cls_sc >= self.cls_thr)
+            if self.min_pts > 0 and pt_cnts is not None:
+                mask = mask & (pt_cnts >= self.min_pts)
 
-            total_before += len(mask)
-            total_after  += int(mask.sum())
+            total_after += int(mask.sum())
 
             filtered[key] = {
                 'gt_boxes':   entry['gt_boxes'][mask],
                 'gt_labels':  entry['gt_labels'][mask],
-                'scores':     hybrid[mask],   # hybrid quality score for store
+                'scores':     rank[mask],    # ranking score for store
                 'iou_scores': iou_sc[mask],
                 'cls_scores': cls_sc[mask],
+                'pt_counts':  pt_cnts[mask] if pt_cnts is not None else None,
             }
 
         logger.info(
-            f'[PseudoLabelRefreshHook] Three-constraint filter: '
+            f'[PseudoLabelRefreshHook] Keep-fraction filter: '
             f'kept {total_after}/{total_before} boxes '
-            f'(hybrid_thr={self.hybrid_thr}, iou_weight={self.iou_weight}, '
-            f'iou_thr={self.iou_thr}, cls_thr={self.cls_thr})')
+            f'(keep_frac={self.keep_frac}, iou_weight={self.iou_weight}, '
+            f'hybrid_thr={self.hybrid_thr}, iou_thr={self.iou_thr}, '
+            f'cls_thr={self.cls_thr}, min_pts={self.min_pts})')
         return filtered
 
     @staticmethod

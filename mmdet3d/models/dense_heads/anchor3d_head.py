@@ -82,6 +82,7 @@ class Anchor3DHead(Base3DDenseHead, AnchorTrainMixin):
                  loss_dir: ConfigType = dict(
                      type='mmdet.CrossEntropyLoss', loss_weight=0.2),
                  predict_iou: bool = False,
+                 roi_extractor_cfg: OptConfigType = None,
                  loss_iou_weight: float = 1.0,
                  iou_sample_cfg: OptConfigType = None,
                  train_cfg: OptConfigType = None,
@@ -100,6 +101,11 @@ class Anchor3DHead(Base3DDenseHead, AnchorTrainMixin):
         self.dir_offset = dir_offset
         self.dir_limit_offset = dir_limit_offset
         self.predict_iou = predict_iou
+        self.roi_extractor_cfg = roi_extractor_cfg
+        # IoU MLP is active only when both the flag and an extractor config
+        # are provided.  predict_iou=True alone (legacy configs without
+        # roi_extractor_cfg) leaves the head in a no-op state.
+        self.has_iou_mlp = predict_iou and (roi_extractor_cfg is not None)
         self.loss_iou_weight = loss_iou_weight
         # Default sampling config: 256 anchors per image split equally across
         # 4 IoU bins [0,0.1) [0.1,0.3) [0.3,0.5) [0.5,1.0].
@@ -164,36 +170,46 @@ class Anchor3DHead(Base3DDenseHead, AnchorTrainMixin):
         if self.use_direction_classifier:
             self.conv_dir_cls = nn.Conv2d(self.feat_channels,
                                           self.num_anchors * 2, 1)
-        if self.predict_iou:
-            # Per-anchor IoU regression head. Predicts a logit per
-            # anchor that is sigmoided into an estimated 3D IoU
-            # between the decoded prediction and its assigned GT.
-            self.conv_iou = nn.Conv2d(self.feat_channels, self.num_anchors, 1)
+        if self.has_iou_mlp:
+            # Two-stage RoI IoU head: a ROIFeatureExtractor pools a
+            # rotation-aware 7×7 BEV crop at each sampled decoded-box location,
+            # and iou_mlp maps the resulting per-box descriptor to a scalar IoU
+            # logit.  Lazy import avoids a hard detector→dense_head dependency.
+            from mmdet3d.models.detectors.voxelnet_bev_roi import (
+                ROIFeatureExtractor)
+            roi_out_ch = self.roi_extractor_cfg.get('out_channels', 128)
+            self.iou_roi_extractor = ROIFeatureExtractor(
+                in_channels=self.roi_extractor_cfg.get('in_channels', 64),
+                out_channels=roi_out_ch,
+                roi_size=self.roi_extractor_cfg.get('roi_size', 7),
+                voxel_size=self.roi_extractor_cfg.get('voxel_size', 0.2),
+                point_cloud_range=self.roi_extractor_cfg.get(
+                    'point_cloud_range'),
+            )
+            self.iou_mlp = nn.Sequential(
+                nn.Linear(roi_out_ch, roi_out_ch),
+                nn.ReLU(inplace=True),
+                nn.Linear(roi_out_ch, 1),
+            )
 
     def forward_single(self, x: Tensor) -> Tuple[Tensor, ...]:
         """Forward function on a single-scale feature map.
 
-        When ``predict_iou`` is True, returns a 4-tuple ``(cls_score,
-        bbox_pred, dir_cls_pred, iou_pred)``; otherwise the original
-        3-tuple ``(cls_score, bbox_pred, dir_cls_pred)``.  ``iou_pred`` has
-        shape ``[B, num_anchors, H, W]`` — one logit per anchor location.
+        Returns ``(cls_score, bbox_pred, dir_cls_pred)``.  IoU quality
+        estimation is now done post-NMS by ``iou_mlp`` on RoI features and
+        does not produce a per-anchor dense output here.
         """
         cls_score = self.conv_cls(x)
         bbox_pred = self.conv_reg(x)
         dir_cls_pred = None
         if self.use_direction_classifier:
             dir_cls_pred = self.conv_dir_cls(x)
-        if self.predict_iou:
-            iou_pred = self.conv_iou(x)
-            return cls_score, bbox_pred, dir_cls_pred, iou_pred
         return cls_score, bbox_pred, dir_cls_pred
 
     def forward(self, x: Tuple[Tensor]) -> Tuple[List[Tensor], ...]:
         """Forward pass.
 
-        Returns a tuple of per-level lists matching ``forward_single``'s
-        return arity: 3 lists when ``predict_iou`` is False, 4 lists when
-        True (the last being ``iou_preds``).
+        Returns a tuple of 3 per-level lists: cls_scores, bbox_preds, dir_cls_preds.
         """
         return multi_apply(self.forward_single, x)
 
@@ -388,8 +404,6 @@ class Anchor3DHead(Base3DDenseHead, AnchorTrainMixin):
 
     def _loss_by_feat_single(self, cls_score: Tensor, bbox_pred: Tensor,
                              dir_cls_pred: Tensor,
-                             iou_pred: Optional[Tensor],
-                             iou_targets: Optional[Tensor],
                              labels: Tensor, label_weights: Tensor,
                              bbox_targets: Tensor, bbox_weights: Tensor,
                              dir_targets: Tensor, dir_weights: Tensor,
@@ -398,15 +412,10 @@ class Anchor3DHead(Base3DDenseHead, AnchorTrainMixin):
                              num_total_samples: int,
                              use_soft_cls: bool = False,
                              use_quality: bool = False):
-        """Calculate loss of single-level results.
+        """Calculate cls/bbox/dir loss for a single feature-map level.
 
-        When ``predict_iou`` is False, ``iou_pred`` and ``iou_targets`` are
-        None and ``loss_iou`` is returned as None — keeping the 4-return-value
-        shape consistent for ``multi_apply``.
-
-        ``iou_targets`` is precomputed by ``loss_by_feat`` using true rotated
-        3D IoU between the decoded predictions and the GT boxes; it covers
-        positives and negatives, enabling balanced per-IoU-bin sampling.
+        IoU loss is computed separately in ``_iou_mlp_loss`` because it
+        requires the BEV feature map (not available per-level here).
         """
         # classification loss
         if num_total_samples is None:
@@ -461,29 +470,6 @@ class Anchor3DHead(Base3DDenseHead, AnchorTrainMixin):
         pos_bbox_targets = bbox_targets[pos_inds]
         pos_bbox_weights = bbox_weights[pos_inds]
 
-        # ── IoU regression loss with balanced per-bin sampling ───────────
-        # ``iou_targets`` (precomputed in ``loss_by_feat`` using true rotated
-        # 3D IoU) cover both positives and negatives, enabling training across
-        # the full quality range instead of positives only.
-        # Must be computed BEFORE ``add_sin_difference`` below mutates
-        # ``pos_bbox_pred`` / ``pos_bbox_targets`` in place.
-        loss_iou = None
-        if self.predict_iou and iou_pred is not None and iou_targets is not None:
-            iou_pred_flat = iou_pred.permute(0, 2, 3, 1).reshape(-1)
-            # Select a balanced subset across IoU quality bins.
-            # Positives are always included; the rest of the budget is split
-            # equally across [0,0.1) [0.1,0.3) [0.3,0.5) [0.5,1.0].
-            sample_inds = self._balanced_iou_sample(
-                iou_targets, pos_inds, self.iou_sample_cfg)
-            if len(sample_inds) > 0:
-                loss_iou = F.binary_cross_entropy_with_logits(
-                    iou_pred_flat[sample_inds],
-                    iou_targets[sample_inds],
-                    reduction='mean') * self.loss_iou_weight
-            else:
-                # Zero loss but keep graph connected so DDP sees the param.
-                loss_iou = iou_pred_flat.sum() * 0.0
-
         # dir loss
         if self.use_direction_classifier:
             dir_cls_pred = dir_cls_pred.permute(0, 2, 3, 1).reshape(-1, 2)
@@ -532,7 +518,86 @@ class Anchor3DHead(Base3DDenseHead, AnchorTrainMixin):
             if self.use_direction_classifier:
                 loss_dir = pos_dir_cls_pred.sum()
 
-        return loss_cls, loss_bbox, loss_dir, loss_iou
+        return loss_cls, loss_bbox, loss_dir
+
+    def _iou_mlp_loss(self,
+                      bbox_preds: List[Tensor],
+                      mlvl_anchors_flat: List[Tensor],
+                      mlvl_iou_targets: List[Tensor],
+                      labels_list: List[Tensor],
+                      bev_features: List[Tensor],
+                      num_imgs: int) -> Optional[Tensor]:
+        """Compute the balanced-bin BCE IoU loss for the RoI-based iou_mlp.
+
+        For every level and every image, a balanced subset of anchor indices
+        is selected (same ``_balanced_iou_sample`` as before), the
+        corresponding decoded boxes are passed through the rotation-aware
+        ``iou_roi_extractor``, and the resulting per-box descriptors are
+        scored by ``iou_mlp``.
+
+        Args:
+            bbox_preds: Per-level ``[B, A*code_size, H, W]`` regression preds.
+            mlvl_anchors_flat: Per-level ``[B*H*W*A, 7]`` flat anchors.
+            mlvl_iou_targets: Per-level ``[B*H*W*A]`` true-3D-IoU targets.
+            labels_list: Per-level ``[B, H*W*A]`` anchor labels.
+            bev_features: Per-image ``[C, H_bev, W_bev]`` BEV feature maps.
+            num_imgs: Batch size.
+
+        Returns:
+            Scalar IoU loss tensor, or None if no valid samples were found.
+        """
+        num_levels = len(bbox_preds)
+        total_loss = None
+        n_samples = 0
+
+        for lvl_idx in range(num_levels):
+            anchors_flat = mlvl_anchors_flat[lvl_idx]   # [B*N, 7]
+            iou_targets_lvl = mlvl_iou_targets[lvl_idx] # [B*N]
+            labels_flat = labels_list[lvl_idx].reshape(-1)  # [B*N]
+            n_per_img = anchors_flat.shape[0] // num_imgs
+
+            for b_idx in range(num_imgs):
+                s = b_idx * n_per_img
+                e = s + n_per_img
+                anchors_b = anchors_flat[s:e]            # [N, 7]
+                iou_tgts_b = iou_targets_lvl[s:e]        # [N]
+                labels_b = labels_flat[s:e]              # [N]
+
+                # Positive anchors (assigned by bbox_assigner)
+                pos_inds = (
+                    (labels_b >= 0) & (labels_b < self.num_classes)
+                ).nonzero(as_tuple=False).squeeze(1)
+
+                sample_inds = self._balanced_iou_sample(
+                    iou_tgts_b, pos_inds, self.iou_sample_cfg)
+                if len(sample_inds) == 0:
+                    continue
+
+                # Decode sampled anchor predictions (no gradient through boxes)
+                bbox_pred_b = (bbox_preds[lvl_idx][b_idx]
+                               .permute(1, 2, 0)
+                               .reshape(-1, self.box_code_size))
+                decoded_b = self.bbox_coder.decode(
+                    anchors_b.float(),
+                    bbox_pred_b.float().detach())         # [N, 7]
+                sampled_boxes = decoded_b[sample_inds]   # [K, 7]
+                sampled_tgts = iou_tgts_b[sample_inds]  # [K]
+
+                # RoI features → iou_mlp → logit
+                roi_feats = self.iou_roi_extractor.extract_roi_features(
+                    bev_features[b_idx], sampled_boxes)  # [K, out_ch]
+                iou_logits = self.iou_mlp(roi_feats).squeeze(-1).float()  # [K]
+
+                loss = F.binary_cross_entropy_with_logits(
+                    iou_logits, sampled_tgts,
+                    reduction='sum') * self.loss_iou_weight
+
+                total_loss = loss if total_loss is None else total_loss + loss
+                n_samples += len(sample_inds)
+
+        if total_loss is None:
+            return None
+        return total_loss / max(n_samples, 1)
 
     @staticmethod
     def add_sin_difference(boxes1: Tensor, boxes2: Tensor) -> tuple:
@@ -575,18 +640,13 @@ class Anchor3DHead(Base3DDenseHead, AnchorTrainMixin):
         When ``predict_iou`` is True, the returned dict also has
         ``loss_iou`` (per-level list).
         """
-        if self.predict_iou:
-            iou_preds = args[0]
-            batch_gt_instances_3d = args[1]
-            batch_input_metas = args[2]
-            batch_gt_instances_ignore = args[3] if len(args) > 3 else \
-                kwargs.get('batch_gt_instances_ignore', None)
-        else:
-            iou_preds = None
-            batch_gt_instances_3d = args[0]
-            batch_input_metas = args[1]
-            batch_gt_instances_ignore = args[2] if len(args) > 2 else \
-                kwargs.get('batch_gt_instances_ignore', None)
+        # forward() now always returns (cls, bbox, dir) — no dense iou_preds.
+        # BEV features for the RoI IoU head arrive via kwarg from VoxelNetBEVRoI.
+        bev_features = kwargs.pop('bev_features', None)
+        batch_gt_instances_3d = args[0]
+        batch_input_metas = args[1]
+        batch_gt_instances_ignore = args[2] if len(args) > 2 else \
+            kwargs.get('batch_gt_instances_ignore', None)
         featmap_sizes = [featmap.size()[-2:] for featmap in cls_scores]
         assert len(featmap_sizes) == self.prior_generator.num_levels
         device = cls_scores[0].device
@@ -632,10 +692,9 @@ class Anchor3DHead(Base3DDenseHead, AnchorTrainMixin):
         # ── True-3D-IoU target computation (no gradient needed) ───────────
         # For each level decode all predicted boxes and compute, for every
         # anchor, the maximum *rotated* 3D IoU with the scene's GT boxes.
-        # These targets are used in ``_loss_by_feat_single`` for balanced
-        # per-IoU-bin sampling — covering positives, near-positives, and
-        # background instead of positives only.
-        if self.predict_iou and iou_preds is not None:
+        # These flat targets are shared by both the _loss_by_feat_single
+        # (unused slot — kept for potential future use) and _iou_mlp_loss.
+        if self.has_iou_mlp and bev_features is not None:
             with torch.no_grad():
                 mlvl_iou_targets = [
                     self._compute_iou_targets_level(
@@ -645,20 +704,14 @@ class Anchor3DHead(Base3DDenseHead, AnchorTrainMixin):
                     for lvl_idx in range(num_levels)
                 ]
         else:
-            mlvl_iou_targets = [None] * num_levels
-
-        iou_preds_input = (
-            cast_tensor_type(iou_preds, dst_type=torch.float32)
-            if iou_preds is not None else [None] * num_levels)
+            mlvl_iou_targets = None
 
         with amp.autocast(enabled=False):
-            losses_cls, losses_bbox, losses_dir, losses_iou = multi_apply(
+            losses_cls, losses_bbox, losses_dir = multi_apply(
                 self._loss_by_feat_single,
                 cast_tensor_type(cls_scores, dst_type=torch.float32),
                 cast_tensor_type(bbox_preds, dst_type=torch.float32),
                 cast_tensor_type(dir_cls_preds, dst_type=torch.float32),
-                iou_preds_input,
-                mlvl_iou_targets,
                 labels_list,
                 label_weights_list,
                 bbox_targets_list,
@@ -672,188 +725,78 @@ class Anchor3DHead(Base3DDenseHead, AnchorTrainMixin):
                 use_quality=use_quality)
         out = dict(
             loss_cls=losses_cls, loss_bbox=losses_bbox, loss_dir=losses_dir)
-        if self.predict_iou:
-            out['loss_iou'] = losses_iou
+
+        if self.has_iou_mlp and bev_features is not None \
+                and mlvl_iou_targets is not None:
+            with amp.autocast(enabled=False):
+                loss_iou = self._iou_mlp_loss(
+                    cast_tensor_type(bbox_preds, dst_type=torch.float32),
+                    mlvl_anchors_flat,
+                    mlvl_iou_targets,
+                    labels_list,
+                    bev_features,
+                    num_imgs)
+            if loss_iou is not None:
+                out['loss_iou'] = loss_iou
         return out
 
     # ------------------------------------------------------------------
-    # Predict path: overrides Base3DDenseHead to optionally route the
-    # per-anchor IoU prediction through NMS and attach it to the result
-    # InstanceData as ``iou_scores_3d``. Backward-compatible: when
-    # ``predict_iou`` is False this falls back to the base behaviour.
+    # Predict path: standard NMS using cls scores; iou_mlp runs post-NMS
+    # on surviving boxes if bev_features are available.
     # ------------------------------------------------------------------
+
+    def predict(self,
+                x,
+                batch_data_samples,
+                rescale: bool = False,
+                bev_features=None,
+                **kwargs):
+        """Forward predict, forwarding bev_features to predict_by_feat.
+
+        Overrides the base class predict() which lacks **kwargs forwarding,
+        so bev_features passed by VoxelNetBEVRoI would otherwise be rejected.
+        """
+        batch_input_metas = [
+            data_samples.metainfo for data_samples in batch_data_samples]
+        outs = self(x)
+        return self.predict_by_feat(
+            *outs,
+            batch_input_metas=batch_input_metas,
+            rescale=rescale,
+            bev_features=bev_features,
+            **kwargs)
 
     def predict_by_feat(self,
                         cls_scores: List[Tensor],
                         bbox_preds: List[Tensor],
                         dir_cls_preds: List[Tensor],
-                        *args,
                         batch_input_metas: Optional[List[dict]] = None,
                         cfg: Optional[ConfigType] = None,
                         rescale: bool = False,
+                        bev_features: Optional[List[Tensor]] = None,
                         **kwargs) -> InstanceList:
-        if self.predict_iou and len(args) > 0:
-            iou_preds = args[0]
-        else:
-            iou_preds = None
+        """Standard NMS followed by post-NMS RoI IoU scoring.
 
-        if iou_preds is None:
-            return super().predict_by_feat(
-                cls_scores, bbox_preds, dir_cls_preds,
-                batch_input_metas=batch_input_metas,
-                cfg=cfg, rescale=rescale, **kwargs)
+        NMS ranking uses classification scores only.  After NMS, if
+        ``bev_features`` are provided and ``iou_mlp`` is configured, each
+        surviving box is scored by the rotation-aware RoI IoU head and the
+        result is attached as ``iou_scores_3d`` on the InstanceData.
+        """
+        result_list = super().predict_by_feat(
+            cls_scores, bbox_preds, dir_cls_preds,
+            batch_input_metas=batch_input_metas,
+            cfg=cfg, rescale=rescale, **kwargs)
 
-        assert len(cls_scores) == len(bbox_preds) == len(dir_cls_preds) \
-            == len(iou_preds)
-        num_levels = len(cls_scores)
-        featmap_sizes = [cls_scores[i].shape[-2:] for i in range(num_levels)]
-        mlvl_priors = self.prior_generator.grid_anchors(
-            featmap_sizes, device=cls_scores[0].device)
-        mlvl_priors = [
-            prior.reshape(-1, self.box_code_size) for prior in mlvl_priors
-        ]
-        result_list = []
-        for input_id in range(len(batch_input_metas)):
-            input_meta = batch_input_metas[input_id]
-            cls_score_list = select_single_mlvl(cls_scores, input_id)
-            bbox_pred_list = select_single_mlvl(bbox_preds, input_id)
-            dir_cls_pred_list = select_single_mlvl(dir_cls_preds, input_id)
-            iou_pred_list = select_single_mlvl(iou_preds, input_id)
-            results = self._predict_by_feat_single(
-                cls_score_list=cls_score_list,
-                bbox_pred_list=bbox_pred_list,
-                dir_cls_pred_list=dir_cls_pred_list,
-                mlvl_priors=mlvl_priors,
-                input_meta=input_meta,
-                cfg=cfg,
-                rescale=rescale,
-                iou_pred_list=iou_pred_list,
-                **kwargs)
-            result_list.append(results)
-        return result_list
-
-    def _predict_by_feat_single(self,
-                                cls_score_list: List[Tensor],
-                                bbox_pred_list: List[Tensor],
-                                dir_cls_pred_list: List[Tensor],
-                                mlvl_priors: List[Tensor],
-                                input_meta: dict,
-                                cfg: ConfigType,
-                                rescale: bool = False,
-                                iou_pred_list: Optional[List[Tensor]] = None,
-                                **kwargs) -> InstanceData:
-        if iou_pred_list is None:
-            return super()._predict_by_feat_single(
-                cls_score_list=cls_score_list,
-                bbox_pred_list=bbox_pred_list,
-                dir_cls_pred_list=dir_cls_pred_list,
-                mlvl_priors=mlvl_priors,
-                input_meta=input_meta,
-                cfg=cfg,
-                rescale=rescale,
-                **kwargs)
-
-        cfg = self.test_cfg if cfg is None else cfg
-        # Hybrid-IoU ranking at val/test (ST3D / CMT
-        # ``POST_PROCESSING.NMS_CONFIG.SCORE_TYPE`` analog).  Defaults to
-        # ``hybrid`` when this override runs (i.e. when ``predict_iou=True``)
-        # so the IoU head's score actually influences the AP-ranking the
-        # metric reads from ``scores_3d``.  Set ``score_type='cls'`` in
-        # ``test_cfg`` to opt out.  Weights are independent from
-        # ``mean_teacher_cfg['hybrid_w_iou']`` (which gates pseudo-labels).
-        score_type = cfg.get('score_type', 'hybrid')
-        score_weights = cfg.get('score_weights', dict(iou=0.5, cls=0.5))
-        w_iou = float(score_weights['iou'])
-        w_cls = float(score_weights['cls'])
-        assert abs(w_iou + w_cls - 1.0) < 1e-6, \
-            f'score_weights iou+cls must sum to 1, got {w_iou} + {w_cls}'
-        assert score_type in ('cls', 'iou', 'hybrid'), \
-            f"score_type must be 'cls' | 'iou' | 'hybrid', got {score_type!r}"
-
-        assert len(cls_score_list) == len(bbox_pred_list) == len(mlvl_priors) \
-            == len(iou_pred_list)
-        mlvl_bboxes = []
-        mlvl_scores = []
-        mlvl_dir_scores = []
-        mlvl_iou_scores = []
-        for cls_score, bbox_pred, dir_cls_pred, iou_pred, priors in zip(
-                cls_score_list, bbox_pred_list, dir_cls_pred_list,
-                iou_pred_list, mlvl_priors):
-            assert cls_score.size()[-2:] == bbox_pred.size()[-2:]
-            assert cls_score.size()[-2:] == dir_cls_pred.size()[-2:]
-            assert cls_score.size()[-2:] == iou_pred.size()[-2:]
-            dir_cls_pred = dir_cls_pred.permute(1, 2, 0).reshape(-1, 2)
-            dir_cls_score = torch.max(dir_cls_pred, dim=-1)[1]
-
-            cls_score = cls_score.permute(1, 2,
-                                          0).reshape(-1, self.num_classes)
-            if self.use_sigmoid_cls:
-                cls_probs = cls_score.sigmoid()
-            else:
-                cls_probs = cls_score.softmax(-1)
-            bbox_pred = bbox_pred.permute(1, 2,
-                                          0).reshape(-1, self.box_code_size)
-            iou_score = iou_pred.permute(1, 2, 0).reshape(-1).sigmoid()
-
-            # Compose the ranking score that flows through topk + NMS.  ``iou_score``
-            # is per-anchor (shape [N]); ``cls_probs`` is per-class [N, C], so
-            # broadcast iou across the class dim to preserve per-class NMS.
-            if score_type == 'hybrid':
-                scores = w_iou * iou_score.unsqueeze(1) + w_cls * cls_probs
-            elif score_type == 'iou':
-                scores = iou_score.unsqueeze(1).expand_as(cls_probs)
-            else:  # 'cls'
-                scores = cls_probs
-
-            nms_pre = cfg.get('nms_pre', -1)
-            if nms_pre > 0 and scores.shape[0] > nms_pre:
-                if self.use_sigmoid_cls:
-                    max_scores, _ = scores.max(dim=1)
+        if self.has_iou_mlp and bev_features is not None:
+            for i, results in enumerate(result_list):
+                boxes = results.bboxes_3d
+                if len(boxes) > 0:
+                    with torch.no_grad():
+                        roi_feats = self.iou_roi_extractor.extract_roi_features(
+                            bev_features[i], boxes)
+                        iou_scores = self.iou_mlp(roi_feats).squeeze(-1).sigmoid()
                 else:
-                    max_scores, _ = scores[:, :-1].max(dim=1)
-                _, topk_inds = max_scores.topk(nms_pre)
-                priors = priors[topk_inds, :]
-                bbox_pred = bbox_pred[topk_inds, :]
-                scores = scores[topk_inds, :]
-                dir_cls_score = dir_cls_score[topk_inds]
-                iou_score = iou_score[topk_inds]
+                    iou_scores = bev_features[i].new_zeros(0)
+                results.iou_scores_3d = iou_scores
 
-            bboxes = self.bbox_coder.decode(priors, bbox_pred)
-            mlvl_bboxes.append(bboxes)
-            mlvl_scores.append(scores)
-            mlvl_dir_scores.append(dir_cls_score)
-            mlvl_iou_scores.append(iou_score)
-
-        mlvl_bboxes = torch.cat(mlvl_bboxes)
-        mlvl_bboxes_for_nms = xywhr2xyxyr(input_meta['box_type_3d'](
-            mlvl_bboxes, box_dim=self.box_code_size).bev)
-        mlvl_scores = torch.cat(mlvl_scores)
-        mlvl_dir_scores = torch.cat(mlvl_dir_scores)
-        mlvl_iou_scores = torch.cat(mlvl_iou_scores)
-
-        if self.use_sigmoid_cls:
-            padding = mlvl_scores.new_zeros(mlvl_scores.shape[0], 1)
-            mlvl_scores = torch.cat([mlvl_scores, padding], dim=1)
-
-        score_thr = cfg.get('score_thr', 0)
-        # Route iou_score through the existing ``mlvl_attr_scores`` slot of
-        # ``box3d_multiclass_nms`` so it follows the same class-wise gather
-        # and topk re-ordering as the boxes.
-        results = box3d_multiclass_nms(
-            mlvl_bboxes, mlvl_bboxes_for_nms, mlvl_scores, score_thr,
-            cfg.max_num, cfg, mlvl_dir_scores,
-            mlvl_attr_scores=mlvl_iou_scores)
-        bboxes, scores, labels, dir_scores, iou_scores = results
-        if bboxes.shape[0] > 0:
-            dir_rot = limit_period(bboxes[..., 6] - self.dir_offset,
-                                   self.dir_limit_offset, np.pi)
-            bboxes[..., 6] = (
-                dir_rot + self.dir_offset +
-                np.pi * dir_scores.to(bboxes.dtype))
-        bboxes = input_meta['box_type_3d'](bboxes, box_dim=self.box_code_size)
-        results = InstanceData()
-        results.bboxes_3d = bboxes
-        results.scores_3d = scores
-        results.labels_3d = labels
-        results.iou_scores_3d = iou_scores
-        return results
+        return result_list

@@ -22,9 +22,8 @@ class VoxelNetBEVRoI(VoxelNet):
         the teacher forward expose BEV and RoI features alongside detections.
 
     The quality/IoU score for each detected box (``iou_scores_3d``) is now
-    produced entirely by the per-anchor ``conv_iou`` branch in
-    ``Anchor3DHead`` (when ``predict_iou=True``).  The old post-NMS
-    ``BEVRoIIoUHead`` has been removed.
+    produced post-NMS by the rotation-aware ``iou_mlp`` in ``Anchor3DHead``
+    (when ``predict_iou=True`` and ``roi_extractor_cfg`` is set).
     """
 
     def __init__(self,
@@ -106,13 +105,19 @@ class VoxelNetBEVRoI(VoxelNet):
             ``iou_scores_3d`` produced by the per-anchor quality head.
         """
         need_bev = (return_bev_features or self.return_bev_features
-                    or return_roi_features or self.return_roi_features)
+                    or return_roi_features or self.return_roi_features
+                    or getattr(self.bbox_head, 'has_iou_mlp', False))
         if need_bev:
             x, bev_features = self.extract_feat(
                 batch_inputs_dict, return_bev=True)
         else:
             x = self.extract_feat(batch_inputs_dict, return_bev=False)
             bev_features = None
+
+        if getattr(self.bbox_head, 'has_iou_mlp', False) \
+                and bev_features is not None:
+            kwargs['bev_features'] = [
+                bev_features[i] for i in range(bev_features.shape[0])]
 
         results_list = self.bbox_head.predict(x, batch_data_samples, **kwargs)
         predictions = self.add_pred_to_datasample(
@@ -136,12 +141,18 @@ class VoxelNetBEVRoI(VoxelNet):
     def loss(self, batch_inputs_dict, batch_data_samples, **kwargs):
         """Standard anchor-head detection loss.
 
-        BEV features are extracted only when the contrastive/consistency
-        loss in an outer wrapper (e.g. MeanTeacher) requests them via
-        ``return_bev=True``.  In standalone pretrain the BEV extraction path
-        is skipped entirely.
+        When the bbox_head has an ``iou_mlp`` (``has_iou_mlp=True``), the raw
+        BEV feature map is extracted alongside the neck features and passed to
+        ``bbox_head.loss`` as ``bev_features`` so the RoI IoU head can be
+        trained.  The BEV map comes from ``PointPillarsScatter`` and is already
+        computed as part of the normal forward pass — no extra cost.
         """
-        x = self.extract_feat(batch_inputs_dict)
+        if getattr(self.bbox_head, 'has_iou_mlp', False):
+            x, bev = self.extract_feat(batch_inputs_dict, return_bev=True)
+            # Split [B, C, H, W] into a per-image list for loss_by_feat
+            kwargs['bev_features'] = [bev[i] for i in range(bev.shape[0])]
+        else:
+            x = self.extract_feat(batch_inputs_dict)
         return self.bbox_head.loss(x, batch_data_samples, **kwargs)
 
 
@@ -177,96 +188,75 @@ class ROIFeatureExtractor(nn.Module):
         )
         self.feature_proj = nn.Linear(out_channels, out_channels)
 
-    def boxes_to_bev_pixels(self, boxes_3d, bev_h, bev_w):
-        """Convert 3D boxes to BEV pixel coordinates.
-
-        Args:
-            boxes_3d: LiDARInstance3DBoxes or tensor [N, 7+].
-            bev_h, bev_w: BEV feature map dimensions.
-
-        Returns:
-            centers_px (Tensor): [N, 2] pixel centers.
-            dims_px (Tensor): [N, 2] pixel dimensions.
-        """
-        if isinstance(boxes_3d, LiDARInstance3DBoxes):
-            boxes_tensor = boxes_3d.tensor
-        else:
-            boxes_tensor = boxes_3d
-
-        centers_world = boxes_tensor[:, :2]
-        dims_world = boxes_tensor[:, 3:5]
-
-        x_min, y_min = self.point_cloud_range[0], self.point_cloud_range[1]
-        x_max, y_max = self.point_cloud_range[3], self.point_cloud_range[4]
-
-        centers_norm = torch.zeros_like(centers_world)
-        centers_norm[:, 0] = (centers_world[:, 0] - x_min) / (x_max - x_min)
-        centers_norm[:, 1] = (centers_world[:, 1] - y_min) / (y_max - y_min)
-
-        centers_px = torch.zeros_like(centers_norm)
-        centers_px[:, 0] = centers_norm[:, 0] * bev_w
-        centers_px[:, 1] = centers_norm[:, 1] * bev_h
-
-        dims_px = torch.zeros_like(dims_world)
-        dims_px[:, 0] = dims_world[:, 0] / (x_max - x_min) * bev_w
-        dims_px[:, 1] = dims_world[:, 1] / (y_max - y_min) * bev_h
-
-        return centers_px, dims_px
-
     def extract_roi_features(self, bev_features, boxes_3d):
-        """Extract features for each detected box from the BEV feature map.
+        """Extract per-box features using rotation-aware affine RoI pooling.
+
+        Replaces the former axis-aligned integer-crop loop.  An affine grid
+        aligned to each box's heading angle is sampled from the BEV feature
+        map, giving the encoder a heading-canonical view of the box interior.
+        Follows the design of ST3D's ``SECONDHead.roi_grid_pool``.
 
         Args:
-            bev_features (Tensor): BEV feature map [C, H, W].
-            boxes_3d: Detected 3D boxes [N, 7] or LiDARInstance3DBoxes.
+            bev_features (Tensor): BEV feature map ``[C, H, W]`` for one image.
+            boxes_3d: ``[N, 7]`` tensor or ``LiDARInstance3DBoxes``.
 
         Returns:
-            Tensor: Per-box features [N, out_channels].
+            Tensor: Per-box features ``[N, out_channels]``.
         """
         if isinstance(boxes_3d, LiDARInstance3DBoxes):
+            boxes_t = boxes_3d.tensor
             num_boxes = len(boxes_3d)
         else:
-            num_boxes = len(boxes_3d) if boxes_3d.dim() > 1 else 0
+            boxes_t = boxes_3d
+            num_boxes = boxes_3d.shape[0] if boxes_3d.dim() > 1 else 0
 
         if num_boxes == 0:
-            out_channels = self.feature_proj.out_features
-            return torch.zeros((0, out_channels), device=bev_features.device)
+            return torch.zeros(
+                (0, self.feature_proj.out_features),
+                device=bev_features.device)
 
         device = bev_features.device
         C, H, W = bev_features.shape
-        centers_px, dims_px = self.boxes_to_bev_pixels(boxes_3d, H, W)
 
-        roi_features_list = []
-        for i in range(num_boxes):
-            cx, cy = centers_px[i]
-            dx, dy = dims_px[i]
+        x_min_r = self.point_cloud_range[0]
+        y_min_r = self.point_cloud_range[1]
+        range_x  = self.point_cloud_range[3] - x_min_r
+        range_y  = self.point_cloud_range[4] - y_min_r
 
-            padding = 2.0
-            x_min = int(torch.clamp(cx - dx / 2 - padding, 0, W - 1).item())
-            x_max = int(torch.clamp(cx + dx / 2 + padding, 1, W).item())
-            y_min = int(torch.clamp(cy - dy / 2 - padding, 0, H - 1).item())
-            y_max = int(torch.clamp(cy + dy / 2 + padding, 1, H).item())
+        bt = boxes_t.float().to(device)
+        cx, cy = bt[:, 0], bt[:, 1]
+        dx, dy = bt[:, 3], bt[:, 4]
+        angle   = bt[:, 6]
 
-            if x_max <= x_min or y_max <= y_min:
-                x_min = max(0, int(cx.item()) - 1)
-                x_max = min(W, int(cx.item()) + 1)
-                y_min = max(0, int(cy.item()) - 1)
-                y_max = min(H, int(cy.item()) + 1)
+        # Box corners in feature-map pixel space
+        x1 = (cx - dx / 2 - x_min_r) / range_x * W
+        x2 = (cx + dx / 2 - x_min_r) / range_x * W
+        y1 = (cy - dy / 2 - y_min_r) / range_y * H
+        y2 = (cy + dy / 2 - y_min_r) / range_y * H
 
-            roi_feat = bev_features[:, y_min:y_max, x_min:x_max]
+        cosa = torch.cos(angle)
+        sina = torch.sin(angle)
 
-            if roi_feat.numel() == 0:
-                roi_feat = torch.zeros((C, 1, 1), device=device)
+        # 2×3 affine matrices in normalised [-1,1] space (ST3D convention)
+        theta = torch.stack([
+            (x2 - x1) / (W - 1) * cosa,
+            (x2 - x1) / (W - 1) * (-sina),
+            (x1 + x2 - W + 1) / (W - 1),
+            (y2 - y1) / (H - 1) * sina,
+            (y2 - y1) / (H - 1) * cosa,
+            (y1 + y2 - H + 1) / (H - 1),
+        ], dim=1).view(num_boxes, 2, 3)
 
-            roi_feat = F.interpolate(
-                roi_feat.unsqueeze(0),
-                size=(self.roi_size, self.roi_size),
-                mode='bilinear',
-                align_corners=False,
-            )
-            roi_features_list.append(roi_feat)
+        grid = F.affine_grid(
+            theta,
+            torch.Size((num_boxes, C, self.roi_size, self.roi_size)),
+            align_corners=True,
+        )
+        # Expand feature map to [N, C, H, W] without copying memory
+        bev_exp = bev_features.unsqueeze(0).expand(num_boxes, C, H, W)
+        roi_patches = F.grid_sample(
+            bev_exp, grid, align_corners=True)  # [N, C, roi_size, roi_size]
 
-        roi_features_batch = torch.cat(roi_features_list, dim=0)
-        encoded_features = self.roi_encoder(roi_features_batch)
-        encoded_features = encoded_features.squeeze(-1).squeeze(-1)
-        return self.feature_proj(encoded_features)
+        encoded = self.roi_encoder(roi_patches)   # [N, out_ch, 1, 1]
+        encoded = encoded.squeeze(-1).squeeze(-1) # [N, out_ch]
+        return self.feature_proj(encoded)         # [N, out_ch]

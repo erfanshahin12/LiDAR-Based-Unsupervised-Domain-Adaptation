@@ -1,7 +1,5 @@
 # nuScenes→Car pretrain with per-anchor 3D-IoU quality head.
-# Adds predict_iou=True + balanced bin sampling to mt_pretrain_pointpillars_config.py.
-# roi_extractor_cfg is omitted intentionally: the RoI extractor is trained from
-# scratch during the teacher-student phase, not on source data.
+# Adds predict_iou=True + balanced bin sampling + rotation-aware RoI IoU MLP.
 _base_ = ['./mt_pretrain_pointpillars_config.py']
 
 model = dict(
@@ -13,6 +11,16 @@ model = dict(
             num_per_img=256,
             bins=[0.0, 0.1, 0.3, 0.5, 1.0],
         ),
+        # RoI IoU MLP: rotation-aware 7×7 affine crop on the BEV scatter map.
+        # BEV map: 64-channel PointPillarsScatter output at 504×504 for the
+        # nuScenes range [-50.40, -50.40, -5, 50.40, 50.40, 3].
+        roi_extractor_cfg=dict(
+            in_channels=64,
+            out_channels=128,
+            roi_size=7,
+            voxel_size=0.2,
+            point_cloud_range=[-50.40, -50.40, -5, 50.40, 50.40, 3],
+        ),
     ),
     test_cfg=dict(
         use_rotate_nms=True,
@@ -22,7 +30,6 @@ model = dict(
         min_bbox_size=0,
         nms_pre=1000,
         max_num=500,
-        score_type='hybrid',          # 'cls' | 'iou' | 'hybrid'
-        score_weights=dict(cls=0.5, iou=0.5),
+        # score_type is cls by default; Should change code to use hybrid or iou scoring if preferred.
     ),
 )

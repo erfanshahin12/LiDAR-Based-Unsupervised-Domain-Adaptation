@@ -6,9 +6,9 @@ python tools/train.py configs/mean_teacher/mt_pretrain_centerpoint_config.py --w
 
 
 python tools/test.py \
-    configs/mean_teacher/test_kitti_nuspretrained_pointpillars.py \
-    work_dirs/pretrain_pp_ros_26may/epoch_24.pth \
-    --work-dir work_dirs/pretrain_pp_ros_26may/test_kitti_ros \
+    configs/mean_teacher/test_kitti_nuspretrained_centerpoint.pyy \
+    work_dirs/baseline_centerpoint_18may/epoch_20.pth \
+    --work-dir work_dirs/baseline_centerpoint_18may/test_kitti_z_offset \
     --score-thr 0.05\
     --task lidar_det
 
@@ -18,8 +18,19 @@ python tools/plot_losses.py work_dirs/pretrain_03may/20260503_092027/vis_data/20
 
 ***** visualize_pseudo_labels vs GT vs baseline *****
 python tools/visualize_pseudo_labels.py \
-        --ps-label-pkl work_dirs/26may_no_hybrid_no_scaling/20260526_084016/ps_labels/ps_label_e4.pkl \
-        --baseline-config work_dirs/baseline_pointpillars_5may/mt_pretrain_pointpillars_config.py \
-        --baseline-ckpt   work_dirs/baseline_pointpillars_5may/epoch_24.pth \
-        --num-scenes 20 --out-dir work_dirs/26may_no_hybrid_no_scaling/vis_ps_labels_ep7 --baseline-score-thr 0.3 \
-        --gt-cars-only
+        --ps-label-pkl work_dirs/mt_30may_iou_new_hybrid0.5/20260530_134500/ps_labels/ps_label_e0.pkl \
+        --baseline-config configs/mean_teacher/mt_pretrain_iou_head_finetune.py \
+        --baseline-ckpt   work_dirs/iou_head_finetune_29may/epoch_6.pth \
+        --num-scenes 20 --out-dir work_dirs/mt_30may_iou_new_hybrid0.5/vis_ps_labels_ep0 --hybrid-thr 0.3125 --iou-weight 0.5 \
+        --gt-cars-only --stats-only --score-hist
+
+python tools/visualize_pseudo_labels.py \
+        --baseline-config work_dirs/iou_head_finetune_29may/mt_pretrain_iou_head_finetune.py \
+        --baseline-ckpt   work_dirs/iou_head_finetune_29may/epoch_6.pth \
+        --num-scenes 3000 --out-dir  work_dirs/test_baseline_distribution --baseline-score-thr 0.1 \
+        --gt-cars-only --stats-only --score-hist --iou-weight=0.5 
+
+python tools/visualize_pseudo_labels.py \
+        --ps-label-pkl work_dirs/mt_iou_distil_soft_BCE_4jun/20260604_160237/ps_labels/ps_label_e0.pkl \
+        --no-baseline --num-scenes 3712 --out-dir work_dirs/mt_iou_distil_soft_BCE_4jun/test_epoch0 --hybrid-thr 0 --iou-weight 0.5 \
+        --min-cls-thr 0.2--min-iou-thr 0.6 --gt-cars-only --stats-only --score-hist

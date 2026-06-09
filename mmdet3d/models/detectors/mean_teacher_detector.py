@@ -131,7 +131,12 @@ class MeanTeacher3DDetector(Base3DDetector):
             f'missing={len(missing)} unexpected={len(unexpected)}')
 
         # Fail fast on core-layer mismatches (num_classes, anchor config, etc.).
-        critical = ('bbox_head.', 'voxel_encoder.', 'middle_encoder.', 'backbone.', 'neck.')
+        critical = (
+            'bbox_head.', 'voxel_encoder.', 'middle_encoder.', 'backbone.', 'neck.',
+            # CenterPoint (MVXTwoStageDetector) uses pts_* prefixes for the same layers.
+            'pts_bbox_head.', 'pts_voxel_encoder.', 'pts_middle_encoder.',
+            'pts_backbone.', 'pts_neck.',
+        )
         skip = 'bbox_head.conv_iou.'   # IoU head is always newly added
         bad_missing    = [k for k in missing    if k.startswith(critical) and not k.startswith(skip)]
         bad_unexpected = [k for k in unexpected if k.startswith(critical)]
@@ -711,12 +716,16 @@ class MeanTeacher3DDetector(Base3DDetector):
                 losses[f'{key}_source'] = value * w_source
 
         # ── Teacher forward on weak-augmented target ─────────────────
+        # eval() freezes DSNorm/BN running stats so the teacher's target-domain
+        # statistics don't drift from mini-batch noise during the training loop.
+        # The refresh hook already does this correctly; this mirrors that behaviour.
         _ds_switch(self.teacher, 'target')
-        self.teacher.train()
+        self.teacher.eval()
         with torch.no_grad():
             teacher_pred = self.teacher.predict(
                 target_weak_in, target_samp_weak,
                 return_bev_features=True)
+        self.teacher.train()
 
         filtered_preds = [self.filter_teacher_predictions(p) for p in teacher_pred]
         if verbose:
@@ -748,9 +757,14 @@ class MeanTeacher3DDetector(Base3DDetector):
 
         # Extract student features once — neck features for pseudo-label loss,
         # BEV features for contrastive loss — avoiding a second forward pass.
+        # VoxelNetBEVRoI returns a 2-tuple (pts_feats, bev); CenterPointBEVRoI
+        # returns a 3-tuple (img_feats, pts_feats, bev) — unpack accordingly.
         _ds_switch(self.student, 'target')
-        x_strong, bev_features_student = self.student.extract_feat(
-            target_strong_in, return_bev=True)
+        _feats = self.student.extract_feat(target_strong_in, return_bev=True)
+        if len(_feats) == 3:
+            _, x_strong, bev_features_student = _feats
+        else:
+            x_strong, bev_features_student = _feats
 
         # Effective distill weight (0 during warmup or when disabled).
         w_iou_distill = self._iou_distill_weight()
@@ -778,8 +792,10 @@ class MeanTeacher3DDetector(Base3DDetector):
         # pseudo-label box localization.
         if w_iou_distill > 0:
             _ds_switch(self.teacher, 'target')
+            self.teacher.eval()
             with torch.no_grad():
                 x_teacher_strong = self.teacher.extract_feat(target_strong_in)
+            self.teacher.train()
             loss_iou_distill = self._compute_iou_distill_loss(
                 x_strong, x_teacher_strong)
             losses['loss_iou_distill'] = loss_iou_distill * w_iou_distill

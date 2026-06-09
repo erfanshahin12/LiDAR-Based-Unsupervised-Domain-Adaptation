@@ -1,168 +1,111 @@
-_base_ = ['../_base_/schedules/schedule-2x.py',
-    '../_base_/default_runtime.py']
+_base_ = ['../_base_/schedules/cyclic-20e.py',
+          '../_base_/default_runtime.py']
 
 source_dataset_type = 'NuScenesDataset'
-# source_data_root = '/DATA/nuScenes/'
-source_data_root = '/home/erfans00/nuscenes/'
+source_data_root = 'data/nuscenes/'
 ann_file_source = 'nuscenes_infos_train.pkl'
 data_prefix_source = dict(pts='samples/LIDAR_TOP', img='', sweeps='sweeps/LIDAR_TOP')
 classes_nuscenes = ['car', 'truck', 'construction_vehicle', 'bus', 'trailer',
-                  'barrier', 'motorcycle', 'bicycle', 'pedestrian', 'traffic_cone']
-box_origin_source = (0.5, 0.5, 0.5)        # nuScenes box origin
+                    'barrier', 'motorcycle', 'bicycle', 'pedestrian', 'traffic_cone']
+box_origin_source = (0.5, 0.5, 0.5)
 metainfo_source = dict(classes=classes_nuscenes, origin=box_origin_source)
 
 target_dataset_type = 'KittiDataset'
-target_data_root = '/DATA/kitti_mmdet3d/'
+target_data_root = 'data/kitti/'
 ann_file_target = 'kitti_infos_train.pkl'
+ann_file_target_val = 'kitti_infos_val.pkl'
 data_prefix_target = dict(pts='training/velodyne_reduced')
-classes_kitti = ['Car', 'Pedestrian', 'Cyclist']
-box_origin_target = (0.5, 0.5, 0)        # KITTI box origin
-metainfo_target = dict(classes=classes_kitti, box_origin=box_origin_target)
+classes_kitti = ['Car']
+box_origin_target = (0.5, 0.5, 0)
+metainfo_target = dict(classes=classes_kitti, origin=box_origin_target)
 
-hard_instance_bank_path = './configs/mean_teacher/hard_instance_bank/hard_instance_bank_nuscenes_quantile_kitti_20.pkl'
-pretrained_ckpt = './work_dirs/pretrain_16feb/epoch_24.pth'
+pretrained_ckpt = './work_dirs/baseline_centerpoint_18may/epoch_20.pth'
 
-# point_cloud_range = [-50.40, -50.40, -5, 50.40, 50.40, 3]   # nuScenes point cloud range
-point_cloud_range = [0, -51.2, -5, 68.80, 51.2, 3]
+# nuScenes-centered range — KITTI data enters via KittiToNuscenes transform, so it
+# lives in nuScenes frame and must use this range (matches the pretrain checkpoint).
+point_cloud_range = [-51.2, -51.2, -5.0, 51.2, 51.2, 3.0]
 input_modality = dict(use_lidar=True, use_camera=False)
-metainfo = dict(
-        classes=['Car', 'Pedestrian', 'Cyclist'],
-        box_origin=(0.5, 0.5, 0.5))
+metainfo = dict(classes=['Car'], origin=(0.5, 0.5, 0.5))
 backend_args = None
 
-# Dataset
-# db_sampler_kitti= dict(
-#     data_root=target_data_root,
-#     info_path=target_data_root + 'kitti_dbinfos_train.pkl',
-#     rate=1.0,
-#     prepare=dict(
-#         filter_by_difficulty=[-1],
-#         filter_by_min_points=dict(Car=5, Pedestrian=10, Cyclist=10)),
-#     classes=classes_kitti,
-#     sample_groups=dict(Car=12, Pedestrian=6, Cyclist=6),
-#     points_loader=dict(
-#         type='LoadPointsFromFile',
-#         coord_type='LIDAR',
-#         load_dim=4,
-#         use_dim=4,
-#         backend_args=backend_args),
-#     backend_args=backend_args)
+# ── Pipelines ─────────────────────────────────────────────────────────────────
 
-source_pipeline = [     # nuScenes         # supervised training on source data
-    dict(
-        type='LoadPointsFromFile',
-        coord_type='LIDAR',
-        load_dim=5,
-        use_dim=4),
-    dict(
-        type='LoadAnnotations3D', with_bbox_3d=True, with_label_3d=True),
-    dict(
-            type='ClassRemapWithLabel',
-            mapping={
-                'car': 'Car',
-                'bicycle': 'Cyclist',
-                'motorcycle': 'Cyclist',
-                'pedestrian': 'Pedestrian',
-            },
-            class_names=classes_kitti,
-            keep_unmapped=False),  # Drop unmapped classes like 'trailer', 'barrier'
-   dict(
-        type='GlobalRotScaleTrans',
-        rot_range=[-0.3925, 0.3925],        # +/- 22.5 degrees
-        scale_ratio_range=[0.95, 1.05],
-        translation_std=[0, 0, 0]),
+source_pipeline = [     # nuScenes — supervised source
+    dict(type='LoadPointsFromFile', coord_type='LIDAR',
+         load_dim=5, use_dim=5),
+    dict(type='LoadPointsFromMultiSweeps',
+         sweeps_num=5,
+         use_dim=[0, 1, 2, 3],          # drop ring index → 4-ch (x,y,z,intensity)
+         backend_args=backend_args),
+    dict(type='LoadAnnotations3D', with_bbox_3d=True, with_label_3d=True),
+    dict(type='ClassRemapWithLabel',
+         mapping={'car': 'Car'},
+         class_names=classes_kitti,
+         keep_unmapped=False),
+    dict(type='GlobalRotScaleTrans',
+         rot_range=[-0.3925, 0.3925],
+         scale_ratio_range=[0.95, 1.05],
+         translation_std=[0, 0, 0]),
     dict(type='RandomFlip3D', flip_ratio_bev_horizontal=0.5),
     dict(type='PointsRangeFilter', point_cloud_range=point_cloud_range),
     dict(type='ObjectRangeFilter', point_cloud_range=point_cloud_range),
     dict(type='ObjectNameFilter', classes=classes_kitti),
     dict(type='PointShuffle'),
-    dict(
-        type='Pack3DDetInputs',
-        keys=['points', 'gt_bboxes_3d', 'gt_labels_3d'])
-        ]
-
-target_weak_pipeline = [       # KITTI      # sent to teacher model for predicting pseudo instances
-    dict(
-        type='LoadPointsFromFile',
-        coord_type='LIDAR',
-        load_dim=4,
-        use_dim=4),
-    dict(
-        type='KittiToNuscenes'),                    # convert kitti coordinates to nuscenes format
-
-        ### the augmentations below makes the pseudo-labels in a different coordinate system, either delete them or take into account the conversion back to previous coords
-    # dict(type='RandomFlip3D', flip_ratio_bev_horizontal=0.5),
-    # dict(
-    #     type='GlobalRotScaleTrans',
-    #     rot_range=[-0.087, 0.087],      # ±5 degrees (WEAK)
-    #     scale_ratio_range=[0.98, 1.02]),
-    
-    dict(type='PointsRangeFilter', point_cloud_range=point_cloud_range),
-    # dict(type='ObjectRangeFilter', point_cloud_range=point_cloud_range),
-    dict(type='PointShuffle'),
-    dict(
-        type='Pack3DDetInputs',
-        keys=['points'])            # pack only points for unlabeled data
+    dict(type='Pack3DDetInputs', keys=['points', 'gt_bboxes_3d', 'gt_labels_3d']),
 ]
 
-target_strong_pipeline = [       # KITTI      # sent to student model for unsupervised training
-    dict(
-        type='LoadPointsFromFile',
-        coord_type='LIDAR',
-        load_dim=4,
-        use_dim=4),
-    dict(
-        type='KittiToNuscenes'),                    # transform coordinates to nuscenes style
-    # dict(type='ObjectSample', db_sampler=db_sampler_kitti),
+target_weak_pipeline = [    # KITTI — teacher inference (no augmentation)
+    dict(type='LoadPointsFromFile', coord_type='LIDAR',
+         load_dim=4, use_dim=4),
+    dict(type='KittiToNuscenes'),
+    dict(type='PointsRangeFilter', point_cloud_range=point_cloud_range),
+    dict(type='PointShuffle'),
+    dict(type='Pack3DDetInputs', keys=['points']),
+]
 
-    dict(
-        type='HardInstanceSampling',
-        hard_instance_bank_path=hard_instance_bank_path,
-        sample_groups=dict(
-            Car=5, Pedestrian=3, Cyclist=3),        # number of hard instances to sample per class
-        use_pred_boxes_for_collision=True,          # Use predictions for collision
-        iou_thresh=0.3,                             # Collision detection threshold
-        points_loader=dict(
-            type='LoadPointsFromFile',
-            coord_type='LIDAR',
-            load_dim=5,         # Source is nuScenes (5D)
-            use_dim=4)),
-
-    # dict(
-    #     type='ObjectNoise',
-    #     num_try=100,
-    #     translation_std=[1.0, 1.0, 0.5],
-    #     global_rot_range=[0.0, 0.0],
-    #     rot_range=[-0.78539816, 0.78539816]
-    #     ),
+target_strong_pipeline = [  # KITTI — student training (strong augmentation)
+    dict(type='LoadPointsFromFile', coord_type='LIDAR',
+         load_dim=4, use_dim=4),
+    dict(type='KittiToNuscenes'),
+    dict(type='GlobalRotScaleTrans',
+         rot_range=[-0.3925, 0.3925],
+         scale_ratio_range=[0.95, 1.05]),
     dict(type='RandomFlip3D', flip_ratio_bev_horizontal=0.5),
-    dict(
-        type='GlobalRotScaleTrans',
-        rot_range=[-0.78539816, 0.78539816],                # +/- 45 degrees
-        scale_ratio_range=[0.95, 1.05]),
-    dict(type='PointsRangeFilter', point_cloud_range=point_cloud_range),
-    # dict(type='ObjectRangeFilter', point_cloud_range=point_cloud_range),
+    # PointsRangeFilter intentionally omitted: after rotating KITTI data into the
+    # nuScenes frame and applying ±22.5° augmentation, a tight range filter can
+    # eliminate all points and crash the CUDA voxelizer with gridDim=0.
+    # The voxelizer's internal clip (same range) is the effective bound.
     dict(type='PointShuffle'),
-    dict(
-        type='Pack3DDetInputs',
-        keys=['points'])            # pack only points for unlabeled data
+    dict(type='Pack3DDetInputs', keys=['points']),
 ]
 
-labeled_dataset = dict(          # nuScenes
-        type=source_dataset_type,
-        data_root=source_data_root,
-        ann_file=ann_file_source,
-        data_prefix=data_prefix_source,
-        pipeline=source_pipeline,
-        metainfo=metainfo_source,
-        modality=input_modality,
-        box_type_3d='LiDAR',
-        test_mode=False,
-        with_velocity=False,
-        backend_args=backend_args
-        )
+val_pipeline = [    # KITTI val — NusOnKittiMetric inverts predictions back to KITTI frame
+    dict(type='LoadPointsFromFile', coord_type='LIDAR',
+         load_dim=4, use_dim=4, backend_args=backend_args),
+    dict(type='LoadAnnotations3D', with_bbox_3d=True, with_label_3d=True,
+         backend_args=backend_args),
+    dict(type='KittiToNuscenes'),
+    dict(type='PointsRangeFilter', point_cloud_range=point_cloud_range),
+    dict(type='ObjectRangeFilter', point_cloud_range=point_cloud_range),
+    dict(type='Pack3DDetInputs', keys=['points', 'gt_bboxes_3d', 'gt_labels_3d']),
+]
 
-unlabeled_weak_dataset = dict(        # KITTI
+# ── Datasets ──────────────────────────────────────────────────────────────────
+
+labeled_dataset = dict(
+    type=source_dataset_type,
+    data_root=source_data_root,
+    ann_file=ann_file_source,
+    data_prefix=data_prefix_source,
+    pipeline=source_pipeline,
+    metainfo=metainfo_source,
+    modality=input_modality,
+    box_type_3d='LiDAR',
+    test_mode=False,
+    with_velocity=False,
+    backend_args=backend_args)
+
+unlabeled_weak_dataset = dict(
     type=target_dataset_type,
     data_root=target_data_root,
     ann_file=ann_file_target,
@@ -172,12 +115,11 @@ unlabeled_weak_dataset = dict(        # KITTI
     modality=input_modality,
     box_type_3d='LiDAR',
     test_mode=False,
-    load_eval_anns=False,           # not to load annotations, even though an ann_file is provided
-    filter_empty_gt=False,          # skip GT check in prepare_data          
-    backend_args=backend_args
-    )
+    load_eval_anns=False,
+    filter_empty_gt=False,
+    backend_args=backend_args)
 
-unlabeled_strong_dataset = dict(        # KITTI
+unlabeled_strong_dataset = dict(
     type=target_dataset_type,
     data_root=target_data_root,
     ann_file=ann_file_target,
@@ -187,85 +129,108 @@ unlabeled_strong_dataset = dict(        # KITTI
     modality=input_modality,
     box_type_3d='LiDAR',
     test_mode=False,
-    load_eval_anns=False,           # not to load annotations, even though an ann_file is provided
-    filter_empty_gt=False,          # skip GT check in prepare_data
-    backend_args=backend_args
-    )
+    load_eval_anns=False,
+    filter_empty_gt=False,
+    backend_args=backend_args)
 
 train_dataloader = dict(
-    batch_size=2,
-    num_workers=2,
-    persistent_workers=False,
+    batch_size=8,
+    num_workers=6,
+    prefetch_factor=4,
+    persistent_workers=True,
     sampler=dict(type='DefaultSampler', shuffle=True),
     collate_fn=dict(type='mean_teacher_collate_fn'),
     dataset=dict(
-            type='MTCombinedDataset',
-            labeled_dataset=labeled_dataset,
-            unlabeled_weak_dataset=unlabeled_weak_dataset,
-            unlabeled_strong_dataset=unlabeled_strong_dataset,
-            metainfo=metainfo)
-    )
+        type='MTCombinedDataset',
+        labeled_dataset=labeled_dataset,
+        unlabeled_weak_dataset=unlabeled_weak_dataset,
+        unlabeled_strong_dataset=unlabeled_strong_dataset,
+        metainfo=metainfo))
 
-# val_dataloader = dict()
-# test_dataloader = dict()
+val_dataloader = dict(
+    batch_size=1,
+    num_workers=2,
+    persistent_workers=True,
+    drop_last=False,
+    sampler=dict(type='DefaultSampler', shuffle=False),
+    dataset=dict(
+        type=target_dataset_type,
+        data_root=target_data_root,
+        ann_file=ann_file_target_val,
+        data_prefix=data_prefix_target,
+        pipeline=val_pipeline,
+        metainfo=metainfo_target,
+        modality=input_modality,
+        box_type_3d='LiDAR',
+        test_mode=False,
+        filter_empty_gt=False,
+        backend_args=backend_args))
 
-# Model
+test_dataloader = val_dataloader
+
+val_evaluator = dict(
+    type='NusOnKittiMetric',
+    ann_file=target_data_root + ann_file_target_val,
+    metric='bbox',
+    pcd_limit_range=point_cloud_range,
+    label_mapping=None,
+    default_cam_key='CAM2',
+    backend_args=backend_args)
+
+test_evaluator = val_evaluator
+
+# ── Model ─────────────────────────────────────────────────────────────────────
+# Architecture copied verbatim from mt_pretrain_centerpoint_config.py so the
+# Car-only checkpoint (epoch_20.pth) loads with zero core-layer mismatches.
+# Deviations from that pretrain config:
+#   - type changed to CenterPointBEVRoI (adds bbox_head alias + return_bev support)
+#   - roi_extractor_cfg added (in_channels=256 = SparseEncoder dense BEV channels)
+#   - Wrapped in MeanTeacher3DDetector with DSNorm + cls-only pseudo-label settings
+
 voxel_size = [0.1, 0.1, 0.2]
-x_min, y_min, z_min, x_max, y_max, z_max = point_cloud_range
-vx, vy, vz = voxel_size
-
-import numpy as np
-grid_size = [
-    int(np.round((x_max - x_min) / vx)),
-    int(np.round((y_max - y_min) / vy)),
-    int(np.round((z_max - z_min) / vz))]
-
-sparse_shape = [grid_size[2]+1, grid_size[1], grid_size[0]]     # [41, 688, 1024] -> # BEV feature map: [86, 128]
 
 model = dict(
     type='MeanTeacher3DDetector',
     mean_teacher_cfg=dict(
-                     point_cloud_range=point_cloud_range,
-                     ema_momentum=0.999,
-                     use_bev_consistency=True,
-                     tau=0.07,
-                     lambda_weight=0.05,
-                     voxel_size=voxel_size[0],
-                     # Confidence thresholding params
-                     conf_threshold=0.3,
-                     use_class_specific_thresh=False,
-                     class_thresholds=None,  # dict: {class_id: threshold}
-                     # loss weights
-                     source_loss_weight=1.0,
-                     target_loss_weight=0.5,
-                    contrastive_weight=1.0,
-                 ),
+        point_cloud_range=point_cloud_range,
+        ema_momentum=0.9999,
+        update_teacher_buffers=False,
+        use_bev_consistency=True,
+        tau=0.07,
+        source_loss_weight=1.0,
+        target_loss_weight=0.5,
+        contrastive_weight=0.05,
+        verbose=True,
+        eval_use_teacher=True,
+        use_dsnorm=True,
+        # cls-only filtering — no IoU head in the pretrained checkpoint
+        conf_threshold=0.2,
+        hybrid_w_iou=0,
+        iou_warmup_iters=0,
+        iou_distill_weight=0,
+    ),
     pretrained_ckpt=pretrained_ckpt,
 
-    # The architecture for Student and Teacher
-    detector = dict(
-        type='CenterPoint',
+    detector=dict(
+        type='CenterPointBEVRoI',
         data_preprocessor=dict(
             type='Det3DDataPreprocessor',
             voxel=True,
             voxel_layer=dict(
                 max_num_points=10,
-                point_cloud_range=point_cloud_range,
                 voxel_size=voxel_size,
+                point_cloud_range=point_cloud_range,
                 max_voxels=(90000, 120000))),
 
-        pts_voxel_encoder=dict(type='HardSimpleVFE', num_features=4),       # num_features = min(dims of source & target domains)
+        pts_voxel_encoder=dict(type='HardSimpleVFE', num_features=4),
 
         pts_middle_encoder=dict(
             type='SparseEncoder',
-            in_channels=4,                          # same as num_features in voxel encoder
-            sparse_shape=sparse_shape,
-            output_channels=128,                    # final output actually = 256
+            in_channels=4,
+            sparse_shape=[41, 1024, 1024],
+            output_channels=128,
             order=('conv', 'norm', 'act'),
-            encoder_channels=((16, 16, 32),
-                              (32, 32, 64),
-                              (64, 64, 128),
-                              (128, 128)),
+            encoder_channels=((16, 16, 32), (32, 32, 64), (64, 64, 128), (128, 128)),
             encoder_paddings=((0, 0, 1), (0, 0, 1), (0, 0, [0, 1, 1]), (0, 0)),
             block_type='basicblock'),
 
@@ -287,75 +252,109 @@ model = dict(
             upsample_cfg=dict(type='deconv', bias=False),
             use_conv_for_no_stride=True),
 
+        # RoI extractor for BEV contrastive consistency loss.
+        # in_channels=256 matches the SparseEncoder dense BEV output (128 * 2 Z-strides).
+        roi_extractor_cfg=dict(
+            in_channels=256,
+            out_channels=256,
+            roi_size=7,
+            voxel_size=voxel_size[0],
+            point_cloud_range=point_cloud_range),
+
         pts_bbox_head=dict(
             type='CenterHead',
-            in_channels=sum([256, 256]),
-            tasks=[
-                dict(num_class=1, class_names=['Car']),
-                dict(num_class=1, class_names=['Pedestrian']),
-                dict(num_class=1, class_names=['Cyclist']),
-            ],
+            in_channels=512,
+            tasks=[dict(num_class=1, class_names=['Car'])],
             common_heads=dict(
-                reg=(2, 2), height=(1, 2), dim=(3, 2), rot=(2, 2)),      # velocity removed
+                reg=(2, 2), height=(1, 2), dim=(3, 2), rot=(2, 2)),
             share_conv_channel=64,
             bbox_coder=dict(
                 type='CenterPointBBoxCoder',
-                post_center_range=point_cloud_range,
+                post_center_range=[-61.2, -61.2, -10.0, 61.2, 61.2, 10.0],
                 max_num=500,
                 score_threshold=0.1,
                 out_size_factor=8,
                 voxel_size=voxel_size[:2],
-                code_size=7),                   # velocity removed
+                pc_range=point_cloud_range[:2],
+                code_size=7),
             separate_head=dict(
-                type='SeparateHead', init_bias=-2.19, final_kernel=3),
+                type='DCNSeparateHead',
+                dcn_config=dict(
+                    type='DCN',
+                    in_channels=64,
+                    out_channels=64,
+                    kernel_size=3,
+                    padding=1,
+                    groups=4),
+                init_bias=-2.19,
+                final_kernel=3),
             loss_cls=dict(type='mmdet.GaussianFocalLoss', reduction='mean'),
-            loss_bbox=dict(
-                type='mmdet.L1Loss', reduction='mean', loss_weight=0.25),
+            loss_bbox=dict(type='mmdet.L1Loss', reduction='mean', loss_weight=0.25),
             norm_bbox=True),
 
-        # model training and testing settings
         train_cfg=dict(
             pts=dict(
-                grid_size=grid_size,
+                grid_size=[1024, 1024, 40],
                 voxel_size=voxel_size,
                 out_size_factor=8,
                 dense_reg=1,
                 gaussian_overlap=0.1,
                 max_objs=500,
                 min_radius=2,
-                code_weights=[1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0])),        # dropped last 2 for velocity
+                point_cloud_range=point_cloud_range,
+                code_weights=[1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0])),
 
         test_cfg=dict(
             pts=dict(
-                post_center_limit_range=point_cloud_range,
+                post_center_limit_range=[-61.2, -61.2, -10.0, 61.2, 61.2, 10.0],
                 max_per_img=500,
                 max_pool_nms=False,
-                min_radius=[4,0.85, 0.175],         # kept only three classes
+                min_radius=[4],
                 score_threshold=0.1,
                 out_size_factor=8,
                 voxel_size=voxel_size[:2],
+                pc_range=point_cloud_range[:2],
                 nms_type='rotate',
                 pre_max_size=1000,
                 post_max_size=83,
-                nms_thr=0.2)
-                )
-            )
-)
+                nms_thr=0.01))))
 
+# ── Hooks / schedule ──────────────────────────────────────────────────────────
 
-# Runtime configs
-# Hooks
 default_hooks = dict(
-    checkpoint=dict(type='CheckpointHook', interval=5),
-    logger=dict(type='LoggerHook', interval=1))
+    checkpoint=dict(type='CheckpointHook', interval=1, save_best=None),
+    visualization=dict(type='Det3DVisualizationHook', draw=False))
 
-# custom_imports = dict(
-#     imports=['mmdet3d.engine.hooks.mean_teacher_hook'],
-#     allow_failed_imports=False
-# )
-custom_hooks = [dict(type='MeanTeacherHook', interval=1)]
+custom_hooks = [
+    dict(type='MeanTeacherHook', interval=1),
+    dict(
+        type='PseudoLabelRefreshHook',
+        interval=2,
+        update_at_epochs=(0,),
+        ps_batch_size=8,
+        ps_num_workers=6,
+        # Per-scene keep-fraction: keep top 25% by CLS score per scene.
+        # iou_weight=0 → cls-only ranking (CenterPoint has no RoI-IoU head).
+        # All hard floors disabled (0.0) — the fraction cut is epoch-invariant.
+        # coverage_gate_drop=0.30 → skip store update if coverage drops >30%.
+        keep_frac=0.3,
+        iou_weight=0,
+        iou_thr=0.0,
+        cls_thr=0.0,
+        hybrid_thr=0.0,
+        coverage_gate_drop=0.30,
+        ps_min_score=0.05,
+        use_top1_fallback=False,
+        min_pts=5),
+]
 
-# Scheduler and optimizer config
-train_cfg = dict(type='EpochBasedTrainLoop', max_epochs=1, val_interval=1)
-val_cfg = None
-test_cfg = None
+train_cfg = dict(max_epochs=7, val_interval=1)
+val_cfg = dict(type='ValLoop')
+test_cfg = dict(type='TestLoop')
+
+optim_wrapper = dict(
+    type='AmpOptimWrapper',
+    loss_scale='dynamic',
+    optimizer=dict(type='AdamW', lr=1e-4, weight_decay=0.01),
+    accumulative_counts=4,
+    clip_grad=dict(max_norm=35, norm_type=2))
