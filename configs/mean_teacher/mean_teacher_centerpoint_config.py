@@ -19,7 +19,7 @@ classes_kitti = ['Car']
 box_origin_target = (0.5, 0.5, 0)
 metainfo_target = dict(classes=classes_kitti, origin=box_origin_target)
 
-pretrained_ckpt = './work_dirs/baseline_centerpoint_18may/epoch_20.pth'
+pretrained_ckpt = './work_dirs/baseline_centerpoint_ros_10jun/epoch_20.pth'
 
 # nuScenes-centered range — KITTI data enters via KittiToNuscenes transform, so it
 # lives in nuScenes frame and must use this range (matches the pretrain checkpoint).
@@ -42,6 +42,13 @@ source_pipeline = [     # nuScenes — supervised source
          mapping={'car': 'Car'},
          class_names=classes_kitti,
          keep_unmapped=False),
+    # Random Object Scaling: shrink nuScenes Cars toward KITTI size.
+    # Keeps source-domain training consistent with the ROS pretrain baseline.
+    dict(
+        type='RandomObjectScaling',
+        scale_range=[0.75, 1.0],
+        num_try=50,
+        class_names=['Car']),
     dict(type='GlobalRotScaleTrans',
          rot_range=[-0.3925, 0.3925],
          scale_ratio_range=[0.95, 1.05],
@@ -67,6 +74,27 @@ target_strong_pipeline = [  # KITTI — student training (strong augmentation)
     dict(type='LoadPointsFromFile', coord_type='LIDAR',
          load_dim=4, use_dim=4),
     dict(type='KittiToNuscenes'),
+
+    # ── CMT hard-instance sampling (online, from nuScenes dbinfos) ──────────
+    # Mirrors the PointPillars config.  Set sample_groups=None to disable.
+    dict(
+        type='HardInstanceSampling',
+        source_db_path=source_data_root + 'nuscenes_dbinfos_train.pkl',
+        source_class_mapping=dict(Car='car'),
+        db_path_prefix=source_data_root,
+        sample_groups=dict(Car=5),
+        use_pred_boxes_for_collision=False,
+        iou_thresh=0.3,
+        carve=True,
+        carve_extra_width=(1.0, 0.5, 0.5),
+        size_normalize=dict(size_res=[-0.75, -0.34, -0.2]),
+        class_names=classes_kitti,
+        points_loader=dict(
+            type='LoadPointsFromFile',
+            coord_type='LIDAR',
+            load_dim=5,
+            use_dim=4)),
+
     dict(type='GlobalRotScaleTrans',
          rot_range=[-0.3925, 0.3925],
          scale_ratio_range=[0.95, 1.05]),
@@ -76,7 +104,8 @@ target_strong_pipeline = [  # KITTI — student training (strong augmentation)
     # eliminate all points and crash the CUDA voxelizer with gridDim=0.
     # The voxelizer's internal clip (same range) is the effective bound.
     dict(type='PointShuffle'),
-    dict(type='Pack3DDetInputs', keys=['points']),
+    dict(type='Pack3DDetInputs',
+         keys=['points', 'gt_bboxes_3d', 'gt_labels_3d']),
 ]
 
 val_pipeline = [    # KITTI val — NusOnKittiMetric inverts predictions back to KITTI frame
@@ -197,14 +226,24 @@ model = dict(
         update_teacher_buffers=False,
         use_bev_consistency=True,
         tau=0.07,
+        # contrastive thresholds (independent of pseudo-label conf_threshold).
+        # fg_threshold: score above which a teacher pred is a contrastive fg anchor.
+        # neg_threshold: score at-or-below which a pred is a background negative.
+        fg_threshold=0.5,
+        neg_threshold=0.25,
+        # Warmup before contrastive loss fires: roi_extractor is randomly
+        # initialised (not in the pretrained checkpoint) and would inject
+        # noise into the backbone gradient until it learns meaningful BEV
+        # features.  1 epoch = 3769 iters at this dataset / batch size.
+        contrastive_warmup_iters=3769,
         source_loss_weight=1.0,
         target_loss_weight=0.5,
-        contrastive_weight=0.05,
+        contrastive_weight=0.1,
         verbose=True,
         eval_use_teacher=True,
         use_dsnorm=True,
         # cls-only filtering — no IoU head in the pretrained checkpoint
-        conf_threshold=0.2,
+        conf_threshold=0.2,                 # placeholder for refresh hook to overwrite; Will be used by detector if ps-label store is empty
         hybrid_w_iou=0,
         iou_warmup_iters=0,
         iou_distill_weight=0,
@@ -329,26 +368,30 @@ custom_hooks = [
     dict(type='MeanTeacherHook', interval=1),
     dict(
         type='PseudoLabelRefreshHook',
-        interval=2,
+        interval=3,
         update_at_epochs=(0,),
         ps_batch_size=8,
         ps_num_workers=6,
-        # Per-scene keep-fraction: keep top 25% by CLS score per scene.
+        # Per-scene keep-fraction: keep top 50% by CLS score per scene.
         # iou_weight=0 → cls-only ranking (CenterPoint has no RoI-IoU head).
-        # All hard floors disabled (0.0) — the fraction cut is epoch-invariant.
-        # coverage_gate_drop=0.30 → skip store update if coverage drops >30%.
-        keep_frac=0.3,
+        # cls_percentile=60 → adaptive CLS floor at the 60th percentile of the
+        #   global pooled score distribution (recomputed each refresh so it
+        #   drifts with teacher confidence). cls_thr=0 → no fixed absolute floor.
+        # coverage_gate_drop=0.10 → skip store update if coverage drops >10%.
+        keep_frac=0.4,
         iou_weight=0,
         iou_thr=0.0,
         cls_thr=0.0,
+        cls_percentile=60,
         hybrid_thr=0.0,
-        coverage_gate_drop=0.30,
+        coverage_gate_drop=0.10,
         ps_min_score=0.05,
         use_top1_fallback=False,
-        min_pts=5),
+        min_pts=10,
+        hard_instance_quantile=25),
 ]
 
-train_cfg = dict(max_epochs=7, val_interval=1)
+train_cfg = dict(max_epochs=10, val_interval=1)
 val_cfg = dict(type='ValLoop')
 test_cfg = dict(type='TestLoop')
 

@@ -88,8 +88,16 @@ class PseudoLabelRefreshHook(Hook):
             0 = CLS-only ranking.  Default: 0.0.
         iou_thr (float): Optional minimum raw RoI-IoU score guard.
             0.0 = disabled.  Default: 0.0.
-        cls_thr (float): Optional minimum raw CLS score guard.
+        cls_thr (float): Optional minimum raw CLS score guard (absolute).
             0.0 = disabled.  Default: 0.0.
+        cls_percentile (float): Adaptive CLS-score floor expressed as a GLOBAL
+            percentile [0, 100] of the candidate CLS scores pooled across all
+            frames at refresh time.  When > 0, boxes whose CLS score is below
+            the P-th percentile of that pooled distribution are dropped (applied
+            as a hard guard alongside ``cls_thr``).  Because the floor is
+            recomputed each refresh from the current distribution, it tracks
+            teacher-confidence drift instead of cutting at a fixed score — the
+            keep-fraction stays per-scene.  0.0 = disabled.  Default: 0.0.
         ps_min_score (float): Broad threshold used during teacher inference to
             collect the candidate pool (temporarily overrides
             ``mean_teacher_cfg['conf_threshold']``).  Should be ≤
@@ -104,6 +112,14 @@ class PseudoLabelRefreshHook(Hook):
             the keep-fraction cut (same as ``cls_thr``/``iou_thr``).  Boxes
             with fewer than ``min_pts`` interior points are discarded regardless
             of their ranking score.  0 disables the filter.  Default: 5.
+        hard_instance_quantile (float): If > 0, after each accepted refresh the
+            Q-th percentile of ``pt_counts`` across all accepted pseudo-label
+            boxes is computed and pushed to ``HardInstanceSampling`` (if present
+            in the strong pipeline) via ``set_point_threshold()``.  This sets
+            the "hard" threshold so that only source instances whose
+            ``num_points_in_gt`` is below that value are injected — matching
+            the CMT approach of filtering on live target-domain point counts
+            rather than a static dbinfos threshold.  0 = disabled.  Default: 0.
     """
 
     def __init__(
@@ -119,9 +135,11 @@ class PseudoLabelRefreshHook(Hook):
         iou_weight: float = 0.0,
         iou_thr: float = 0.0,
         cls_thr: float = 0.0,
+        cls_percentile: float = 0.0,
         ps_min_score: float = 0.05,
         use_top1_fallback: bool = True,
         min_pts: int = 5,
+        hard_instance_quantile: float = 0.0,
     ) -> None:
         self.interval = interval
         self.update_at_epochs = list(update_at_epochs)
@@ -134,9 +152,11 @@ class PseudoLabelRefreshHook(Hook):
         self.iou_weight = iou_weight
         self.iou_thr = iou_thr
         self.cls_thr = cls_thr
+        self.cls_percentile = cls_percentile
         self.ps_min_score = ps_min_score
         self.use_top1_fallback = use_top1_fallback
         self.min_pts = min_pts
+        self.hard_instance_quantile = hard_instance_quantile
 
         self._ps_loader: Optional[DataLoader] = None
         self._prev_coverage: Optional[float] = None
@@ -151,6 +171,54 @@ class PseudoLabelRefreshHook(Hook):
             model = model.module
         return model
 
+    def _find_hard_instance_transform(self, runner: Runner):
+        """Return the HardInstanceSampling transform from the strong pipeline, or None."""
+        from mmdet3d.datasets.transforms.hard_instance_mining import HardInstanceSampling
+        try:
+            strong_ds = runner.train_dataloader.dataset.unlabeled_strong_dataset
+            for t in strong_ds.pipeline.transforms:
+                if isinstance(t, HardInstanceSampling):
+                    return t
+        except AttributeError:
+            pass
+        return None
+
+    def _compute_and_push_threshold(self, accepted_labels: dict,
+                                    runner: Runner, logger) -> None:
+        """Compute Q-th percentile of pseudo-box pt_counts and push to HardInstanceSampling.
+
+        All ranks receive the same ``accepted_labels`` (after DDP broadcast),
+        so each rank computes the same threshold independently without an extra
+        broadcast step.
+        """
+        if self.hard_instance_quantile <= 0.0:
+            return
+
+        all_pt_counts = []
+        for entry in accepted_labels.values():
+            pt_cnts = entry.get('pt_counts')
+            if pt_cnts is not None and len(pt_cnts) > 0:
+                all_pt_counts.append(pt_cnts)
+
+        if not all_pt_counts:
+            return
+
+        pool = np.concatenate(all_pt_counts)
+        threshold = float(np.percentile(pool, self.hard_instance_quantile))
+        logger.info(
+            f'[PseudoLabelRefreshHook] Hard-instance threshold: '
+            f'P{self.hard_instance_quantile:g} of {len(pool)} pseudo-box '
+            f'pt_counts = {threshold:.1f}')
+
+        hard_transform = self._find_hard_instance_transform(runner)
+        if hard_transform is not None:
+            hard_transform.set_point_threshold(threshold)
+        else:
+            logger.warning(
+                '[PseudoLabelRefreshHook] hard_instance_quantile is set but '
+                'no HardInstanceSampling found in the strong pipeline — '
+                'threshold not pushed.')
+
     def _should_refresh(self, epoch: int) -> bool:
         if epoch in self.update_at_epochs:
             return True
@@ -159,7 +227,16 @@ class PseudoLabelRefreshHook(Hook):
         return False
 
     def _build_ps_loader(self, runner: Runner) -> DataLoader:
-        """Build a DataLoader from the unlabeled_weak sub-dataset."""
+        """Build a DataLoader from the unlabeled_weak sub-dataset.
+
+        IMPORTANT — strong-pipeline-only invariant:
+        ``HardInstanceSampling`` injects source instances only into
+        ``target_strong_pipeline``.  The weak dataset used here for teacher
+        inference must stay clean (no injection) so the persisted pseudo-label
+        store contains only real KITTI detections.  If you ever add
+        ``HardInstanceSampling`` to ``target_weak_pipeline``, the store will
+        contain synthetic source boxes — add explicit filtering here first.
+        """
         train_ds = runner.train_dataloader.dataset
         # MTCombinedDataset exposes the weak target dataset directly.
         weak_ds = getattr(train_ds, 'unlabeled_weak_dataset', None)
@@ -244,6 +321,14 @@ class PseudoLabelRefreshHook(Hook):
 
         # Resume: load labels from the most recent pkl for this work_dir.
         self._load_existing_pkl(runner, model)
+
+        # On resume, push the hard-instance threshold computed from the loaded store.
+        if (self.hard_instance_quantile > 0.0
+                and hasattr(model, 'pseudo_label_store')
+                and model.pseudo_label_store):
+            self._compute_and_push_threshold(
+                model.pseudo_label_store, runner,
+                MMLogger.get_current_instance())
 
     def before_train_epoch(self, runner: Runner) -> None:
         epoch = runner.epoch
@@ -334,6 +419,10 @@ class PseudoLabelRefreshHook(Hook):
             if rank == 0:
                 self._prev_coverage = cov_new
             self._log_ps_stats(new_labels, logger)
+            # Push adaptive hard-instance threshold to HardInstanceSampling.
+            # All ranks have the same new_labels after DDP broadcast, so each
+            # rank computes the same threshold independently.
+            self._compute_and_push_threshold(new_labels, runner, logger)
 
     # ------------------------------------------------------------------
     # Teacher inference pass
@@ -349,8 +438,8 @@ class PseudoLabelRefreshHook(Hook):
         """
         if getattr(model, 'mean_teacher_cfg', {}).get('use_dsnorm', False):
             from mmdet3d.models.layers.dsnorm import set_ds_target
-            model.student.apply(set_ds_target)
-        model.student.eval()
+            model.teacher.apply(set_ds_target)
+        model.teacher.eval()
         new_labels: dict = {}
         total_pos = 0
 
@@ -368,13 +457,13 @@ class PseudoLabelRefreshHook(Hook):
             else:
                 pts_raw = [None] * len(batch_data_samples)
 
-            # Voxelize via the student's own data_preprocessor.
+            # Voxelize via the teacher's own data_preprocessor.
             with torch.no_grad():
-                data = model.student.data_preprocessor(
+                data = model.teacher.data_preprocessor(
                     {'inputs': batch_inputs,
                      'data_samples': batch_data_samples},
                     training=False)
-                pred_list = model.student.predict(
+                pred_list = model.teacher.predict(
                     data['inputs'], data['data_samples'])
 
             for data_sample, pred, pts_xyz in zip(
@@ -415,7 +504,7 @@ class PseudoLabelRefreshHook(Hook):
                 }
                 total_pos += len(labels_t)
 
-        model.student.train()
+        model.teacher.train()
         logger.info(
             f'[PseudoLabelRefreshHook] Collected {total_pos} candidate '
             f'pseudo-boxes across {len(new_labels)} frames '
@@ -454,6 +543,25 @@ class PseudoLabelRefreshHook(Hook):
         filtered: dict = {}
         total_before = 0
         total_after  = 0
+
+        # ── Adaptive CLS floor: P-th percentile of the GLOBAL pooled CLS-score
+        # distribution (keep_frac stays per-scene). Recomputed each refresh so
+        # it drifts with teacher confidence instead of cutting at a fixed score.
+        cls_floor = 0.0
+        if self.cls_percentile > 0:
+            cls_pool = [
+                (e.get('cls_scores') if e.get('cls_scores') is not None
+                 else e['scores'])
+                for e in new_labels.values()
+            ]
+            cls_pool = [c for c in cls_pool if c is not None and len(c) > 0]
+            if cls_pool:
+                pool = np.concatenate(cls_pool)
+                cls_floor = float(np.percentile(pool, self.cls_percentile))
+                logger.info(
+                    f'[PseudoLabelRefreshHook] Adaptive CLS floor: '
+                    f'P{self.cls_percentile:g} of {len(pool)} candidate boxes '
+                    f'= {cls_floor:.3f}')
 
         for key, entry in new_labels.items():
             cls_sc   = entry.get('cls_scores')
@@ -502,6 +610,8 @@ class PseudoLabelRefreshHook(Hook):
                 mask = mask & (iou_sc >= self.iou_thr)
             if self.cls_thr > 0:
                 mask = mask & (cls_sc >= self.cls_thr)
+            if cls_floor > 0:
+                mask = mask & (cls_sc >= cls_floor)
             if self.min_pts > 0 and pt_cnts is not None:
                 mask = mask & (pt_cnts >= self.min_pts)
 
@@ -521,7 +631,8 @@ class PseudoLabelRefreshHook(Hook):
             f'kept {total_after}/{total_before} boxes '
             f'(keep_frac={self.keep_frac}, iou_weight={self.iou_weight}, '
             f'hybrid_thr={self.hybrid_thr}, iou_thr={self.iou_thr}, '
-            f'cls_thr={self.cls_thr}, min_pts={self.min_pts})')
+            f'cls_thr={self.cls_thr}, cls_percentile={self.cls_percentile} '
+            f'(floor={cls_floor:.3f}), min_pts={self.min_pts})')
         return filtered
 
     @staticmethod

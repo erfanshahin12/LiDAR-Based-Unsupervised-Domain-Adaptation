@@ -6,10 +6,10 @@ python tools/train.py configs/mean_teacher/mt_pretrain_centerpoint_config.py --w
 
 
 python tools/test.py \
-    configs/mean_teacher/test_kitti_nuspretrained_centerpoint.pyy \
-    work_dirs/baseline_centerpoint_18may/epoch_20.pth \
-    --work-dir work_dirs/baseline_centerpoint_18may/test_kitti_z_offset \
-    --score-thr 0.05\
+    configs/mean_teacher/test_kitti_nuspretrained_centerpoint.py \
+    work_dirs/baseline_centerpoint_ros_10jun/epoch_20.pth \
+    --work-dir work_dirs/baseline_centerpoint_ros_10jun/test_kitti \
+    --score-thr 0.05 \
     --task lidar_det
 
 work_dirs/baseline_centerpoint_18may/test_kitti
@@ -25,12 +25,13 @@ python tools/visualize_pseudo_labels.py \
         --gt-cars-only --stats-only --score-hist
 
 python tools/visualize_pseudo_labels.py \
-        --baseline-config work_dirs/iou_head_finetune_29may/mt_pretrain_iou_head_finetune.py \
-        --baseline-ckpt   work_dirs/iou_head_finetune_29may/epoch_6.pth \
-        --num-scenes 3000 --out-dir  work_dirs/test_baseline_distribution --baseline-score-thr 0.1 \
-        --gt-cars-only --stats-only --score-hist --iou-weight=0.5 
+        --baseline-config configs/mean_teacher/test_kitti_nuspretrained_centerpoint.py \
+        --baseline-ckpt   work_dirs/baseline_centerpoint_ros_10jun/epoch_20.pth \
+        --num-scenes 3712 --out-dir  work_dirs/test_cp_ros_baseline_distribution \
+        --keep-frac 0.3 --gt-iou --gt-iou-mode 3d --fallback-k 0 --points-analysis \
+        --gt-cars-only --stats-only --score-hist --min-cls-thr 0.0
 
 python tools/visualize_pseudo_labels.py \
-        --ps-label-pkl work_dirs/mt_iou_distil_soft_BCE_4jun/20260604_160237/ps_labels/ps_label_e0.pkl \
-        --no-baseline --num-scenes 3712 --out-dir work_dirs/mt_iou_distil_soft_BCE_4jun/test_epoch0 --hybrid-thr 0 --iou-weight 0.5 \
-        --min-cls-thr 0.2--min-iou-thr 0.6 --gt-cars-only --stats-only --score-hist
+        --ps-label-pkl work_dirs/mt_centerpoint_top0.3_minPts10_8jun/20260608_155316/ps_labels/ps_label_e4.pkl \
+        --no-baseline --num-scenes 3712 --out-dir work_dirs/mt_centerpoint_top0.3_minPts10_8jun/test_epoch4 --hybrid-thr 0 --iou-weight 0.5 \
+        --min-cls-thr 0.0 --min-iou-thr 0.0 --gt-cars-only --stats-only --score-hist

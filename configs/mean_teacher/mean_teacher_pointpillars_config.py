@@ -119,28 +119,32 @@ target_strong_pipeline = [       # KITTI      # sent to student model for unsupe
         use_dim=4),
     dict(
         type='KittiToNuscenes'),                    # transform coordinates to nuscenes style
-    # dict(type='ObjectSample', db_sampler=db_sampler_kitti),
 
-    # dict(
-    #     type='HardInstanceSampling',
-    #     hard_instance_bank_path=hard_instance_bank_path,
-    #     sample_groups=dict(
-    #         Car=5, Pedestrian=3, Cyclist=3),        # number of hard instances to sample per class
-    #     use_pred_boxes_for_collision=True,          # Use predictions for collision
-    #     iou_thresh=0.3,                             # Collision detection threshold
-    #     points_loader=dict(
-    #         type='LoadPointsFromFile',
-    #         coord_type='LIDAR',
-    #         load_dim=5,         # Source is nuScenes (5D)
-    #         use_dim=4)),
+    # ── CMT hard-instance sampling (online, from nuScenes dbinfos) ──────────
+    # Builds the bank in-process (no offline build_hard_bank.py step needed).
+    # Selects nuScenes source instances whose point count is below the 25th
+    # percentile of the KITTI target distribution, carves the insertion region,
+    # and normalises box/point sizes toward KITTI.  Injected boxes are packed as
+    # gt_bboxes_3d / gt_labels_3d and merged as reliable GT in the detector.
+    # Set sample_groups=None (or remove) to disable without touching other config.
+    dict(
+        type='HardInstanceSampling',
+        source_db_path=source_data_root + 'nuscenes_dbinfos_train.pkl',
+        source_class_mapping=dict(Car='car'),       # nuScenes 'car' → KITTI 'Car'
+        db_path_prefix=source_data_root,            # resolve relative DB point-file paths
+        sample_groups=dict(Car=5),
+        use_pred_boxes_for_collision=False,          # strong pass has no prior preds
+        iou_thresh=0.3,
+        carve=True,                                 # CMT: remove returns in insertion zone
+        carve_extra_width=(1.0, 0.5, 0.5),          # (dl, dw, dh) expand for carve
+        size_normalize=dict(size_res=[-0.75, -0.34, -0.2]),  # match source pipeline shrink
+        class_names=classes_kitti,
+        points_loader=dict(
+            type='LoadPointsFromFile',
+            coord_type='LIDAR',
+            load_dim=5,                             # nuScenes points are 5D
+            use_dim=4)),                            # keep x,y,z,intensity
 
-    # dict(
-    #     type='ObjectNoise',
-    #     num_try=100,
-    #     translation_std=[1.0, 1.0, 0.5],
-    #     global_rot_range=[0.0, 0.0],
-    #     rot_range=[-0.78539816, 0.78539816]
-    #     ),
     dict(
         type='GlobalRotScaleTrans',
         rot_range=[-0.3925, 0.3925],                        # +/- 22.5 degrees (matches source)
@@ -155,7 +159,9 @@ target_strong_pipeline = [       # KITTI      # sent to student model for unsupe
     dict(type='PointShuffle'),
     dict(
         type='Pack3DDetInputs',
-        keys=['points'])            # pack only points for unlabeled data
+        # gt_bboxes_3d / gt_labels_3d carry the injected hard-instance boxes;
+        # real KITTI GT is never loaded (no LoadAnnotations3D in this pipeline).
+        keys=['points', 'gt_bboxes_3d', 'gt_labels_3d'])
 ]
 
 val_pipeline = [        # KITTI val — evaluated in nuScenes frame, then inverted by NusOnKittiMetric
@@ -285,6 +291,16 @@ model = dict(
                                                         # student's strong-aug stats causing confidence collapse
                      use_bev_consistency=True,
                      tau=0.07,
+                     # CMT contrastive thresholds (independent of pseudo-label conf_threshold).
+                     # fg_threshold: score above which a teacher pred is a contrastive fg anchor.
+                     # neg_threshold: score at-or-below which a pred is a background negative.
+                     fg_threshold=0.5,
+                     neg_threshold=0.25,
+                     # Warmup before contrastive loss fires: roi_extractor is randomly
+                     # initialised (not in the pretrained checkpoint) and would inject
+                     # noise into the backbone gradient until it learns meaningful BEV
+                     # features.  1 epoch = 3769 iters at this dataset / batch size.
+                     contrastive_warmup_iters=3769,
                      # NOTE: conf_threshold here governs only the online store-empty training
                      # path (filter_teacher_predictions called per-iteration when the store
                      # is empty).  PseudoLabelRefreshHook temporarily overrides this value
@@ -479,25 +495,29 @@ custom_hooks = [
     dict(type='MeanTeacherHook', interval=1),
     dict(
         type='PseudoLabelRefreshHook',
-        interval=1,             # re-run teacher every # epochs
+        interval=3,             # re-run teacher every # epochs
         update_at_epochs=(0,),  # always refresh before epoch 0 starts
         ps_batch_size=8,
         ps_num_workers=6,
-        # Per-scene keep-fraction: keep top 25% by CLS score per scene.
+        # Per-scene keep-fraction: keep top 50% by CLS score per scene.
         # iou_weight=0 → cls-only ranking for now (even though this checkpoint
         # has an IoU head, we use cls scores for consistency with CenterPoint).
-        # All hard floors disabled (0.0) — the fraction cut is epoch-invariant.
-        # coverage_gate_drop=0.30 → skip store update if coverage drops >30%.
+        # cls_percentile=60 → adaptive CLS floor at the 60th percentile of the
+        #   global pooled score distribution (recomputed each refresh so it
+        #   drifts with teacher confidence). cls_thr=0 → no fixed absolute floor.
+        # coverage_gate_drop=0.10 → skip store update if coverage drops >10%.
         # (IoU head still trains normally via iou_distill_weight in mean_teacher_cfg.)
-        keep_frac=0.25,
+        keep_frac=0.4,
         iou_weight=0,
         iou_thr=0.0,
         cls_thr=0.0,
+        cls_percentile=60,
         hybrid_thr=0.0,
-        coverage_gate_drop=0.30,
+        coverage_gate_drop=0.10,
         ps_min_score=0.05,
         use_top1_fallback=False,
         min_pts=5,
+        hard_instance_quantile=25,
     ),
 ]
 

@@ -303,7 +303,7 @@ def load_points_nus(bin_path: str) -> np.ndarray:
     pts_nus = np.empty_like(pts)
     pts_nus[:, 0] = -pts[:, 1]          # x_nus = -y_kitti
     pts_nus[:, 1] = pts[:, 0]           # y_nus =  x_kitti
-    pts_nus[:, 2] = pts[:, 2] - 0.11    # align KITTI ground (−1.73) to nuScenes (−1.84)
+    pts_nus[:, 2] = pts[:, 2] - 0.29    # align KITTI ground (−1.73) to nuScenes (−1.84)
     pts_nus[:, 3] = pts[:, 3] * 255.0
     return pts_nus
 
@@ -428,6 +428,27 @@ def run_baseline(model, pts_nus: np.ndarray, device: str,
     # iou_scores_3d is the raw sigmoid of conv_iou (always separate from scores_3d).
     iou_scores = iou_sc.cpu().numpy() if iou_sc is not None else None
 
+    return apply_score_filter(
+        boxes, cls_scores, iou_scores, labels,
+        hybrid_thr=hybrid_thr, iou_weight=iou_weight,
+        min_cls_thr=min_cls_thr, min_iou_thr=min_iou_thr,
+        keep_frac=keep_frac, min_floor=min_floor,
+        fallback_k=fallback_k, floor_before=floor_before)
+
+
+def apply_score_filter(boxes, cls_scores, iou_scores, labels, *,
+                       hybrid_thr=0.0, iou_weight=0.5,
+                       min_cls_thr=0.0, min_iou_thr=0.0,
+                       keep_frac=None, min_floor=0.0,
+                       fallback_k=0, floor_before=False):
+    """Apply the keep-frac / hybrid-thr score filter to a raw prediction pool.
+
+    Shared by ``run_baseline`` (inference path) and the ``--floor-percentile``
+    pre-pass (cached-prediction path) so both apply identical masking.
+    ``min_floor`` is an ABSOLUTE score value here; the percentile→floor
+    conversion is done by the caller. Returns
+    (boxes, hybrid, labels, iou_scores|None, cls_scores) filtered.
+    """
     # Hybrid computed explicitly from raw components — matches filter_teacher_predictions.
     if iou_scores is not None and iou_weight > 0:
         hybrid = iou_weight * iou_scores + (1.0 - iou_weight) * cls_scores
@@ -735,7 +756,7 @@ def parse_args():
 
     # ── Thresholds & scoring ──────────────────────────────────────────────────
     g = p.add_argument_group('Thresholds & scoring')
-    g.add_argument('--hybrid-thr', type=float, default=0.3,
+    g.add_argument('--hybrid-thr', type=float, default=0.0,
                    help='Minimum hybrid score: iou_weight*IoU + (1-iou_weight)*CLS')
     g.add_argument('--iou-weight', type=float, default=0.5,
                    help='IoU weight in hybrid score [0,1]. 0 = CLS-only.')
@@ -764,8 +785,13 @@ def parse_args():
                    help='Comma-separated keep_frac values for --sweep-from-cache '
                         '(e.g. "0.2,0.3,0.4,0.5"). Setting this activates the '
                         'per-scene keep-fraction sweep instead of the legacy mode.')
-    g.add_argument('--sweep-min-floors', default='0.0,0.1,0.2,0.3',
-                   help='Comma-separated min_floor values for the keep-frac sweep.')
+    g.add_argument('--sweep-floor-percentiles', default='0,30,40,50',
+                   help='Comma-separated GLOBAL score percentiles [0-100] for the '
+                        'adaptive floor in the keep-frac sweep. For each value P the '
+                        'floor is set to the P-th percentile of the pooled box-score '
+                        'distribution across ALL scenes (keep_frac stays per-scene). '
+                        '0 = no floor. Replaces the old absolute --sweep-min-floors so '
+                        'the floor tracks teacher-confidence drift instead of a fixed cut.')
     g.add_argument('--sweep-fallback-ks', default='0,1,3',
                    help='Comma-separated fallback_k integer values for the keep-frac sweep.')
     g.add_argument('--sweep-min-pt-counts', default='0',
@@ -777,18 +803,27 @@ def parse_args():
                    help='Activate per-scene keep-fraction scheme: keep the top '
                         'ceil(keep_frac × N) highest-scoring boxes per scene. '
                         'When set, --hybrid-thr / --min-cls-thr / --min-iou-thr '
-                        'are ignored (use --min-floor and --fallback-k instead).')
-    g.add_argument('--min-floor', type=float, default=0.0,
-                   help='Absolute score floor used with --keep-frac: drop '
-                        'surviving boxes whose score < min_floor (0.0 = off).')
-    g.add_argument('--fallback-k', type=int, default=1,
+                        'are ignored (use --floor-percentile and --fallback-k instead).')
+    g.add_argument('--floor-percentile', type=float, default=0.0,
+                   help='Adaptive score floor used with --keep-frac: drop surviving '
+                        'boxes whose score is below the P-th percentile of the GLOBAL '
+                        'pooled box-score distribution (computed across all scenes in a '
+                        'pre-pass; keep_frac stays per-scene). 0 = off. Replaces the old '
+                        'absolute --min-floor so the floor drifts with teacher confidence.')
+    g.add_argument('--fallback-k', type=int, default=0,
                    help='If fewer than this many boxes survive --keep-frac + '
-                        '--min-floor, restore the top-k raw boxes (ignoring the '
+                        'the floor, restore the top-k raw boxes (ignoring the '
                         'floor) to prevent empty scenes. 0 = off. Default 1.')
     g.add_argument('--floor-before', action='store_true',
-                   help='Apply --min-floor before computing the keep-fraction '
+                   help='Apply the floor before computing the keep-fraction '
                         '(denominator = above-floor count). Default is '
                         'fraction-first (floor acts as a guard afterwards).')
+    g.add_argument('--baseline-min-pts', type=int, default=0,
+                   help='Fixed interior-point filter on baseline predictions: '
+                        'drop baseline boxes containing fewer than this many '
+                        'LiDAR points (counted in the nuScenes frame, same as '
+                        '--sweep-min-pt-counts but a single fixed value applied '
+                        'to the baseline). 0 = off.')
 
     g.add_argument('--gt-iou', action='store_true',
                    help='Replace the model IoU-head axis with actual GT-box IoU '
@@ -1328,10 +1363,25 @@ def _sweep_thresholds(args) -> None:
     # ── Keep-fraction sweep (new mode) ────────────────────────────────────────
     if args.sweep_keep_fracs is not None:
         keep_fracs   = _parse_floats(args.sweep_keep_fracs)
-        min_floors   = _parse_floats(args.sweep_min_floors)
+        percentiles  = _parse_floats(args.sweep_floor_percentiles)
         fallback_ks  = [int(x) for x in args.sweep_fallback_ks.split(',')]
         min_pt_counts = [int(x) for x in
                          getattr(args, 'sweep_min_pt_counts', '0').split(',')]
+
+        # ── Global score pool → percentile-to-absolute-floor map ──────────────
+        # keep_frac is per-scene; the floor is the P-th percentile of the box
+        # scores pooled across ALL scenes, so it drifts with the distribution.
+        pool = np.concatenate([
+            (sc['cls_scores'] if sc.get('iou_scores') is None
+             else 0.5 * sc['iou_scores'] + 0.5 * sc['cls_scores'])
+            for sc in scenes if len(sc['boxes']) > 0
+        ]) if any(len(sc['boxes']) > 0 for sc in scenes) else np.zeros(0)
+        floor_for = {
+            P: (float(np.percentile(pool, P)) if (P > 0 and len(pool) > 0) else 0.0)
+            for P in percentiles
+        }
+        print('  Adaptive floors (global percentile → score):  '
+              + '  '.join(f'P{P:g}={floor_for[P]:.3f}' for P in percentiles))
 
         # ── Pre-compute per-box interior point counts (one pass) ──────────────
         need_pt = any(m > 0 for m in min_pt_counts)
@@ -1358,19 +1408,21 @@ def _sweep_thresholds(args) -> None:
                         sc['pt_counts'] = np.zeros(len(sc['boxes']), dtype=np.int32)
                 print('  Done.\n')
 
-        n_combos = (len(keep_fracs) * len(min_floors)
+        n_combos = (len(keep_fracs) * len(percentiles)
                     * len(fallback_ks) * len(min_pt_counts))
         print(f'  Keep-fraction sweep: {n_combos} combinations '
-              f'({len(keep_fracs)} keep_frac × {len(min_floors)} min_floor × '
+              f'({len(keep_fracs)} keep_frac × {len(percentiles)} floor_pctl × '
               f'{len(fallback_ks)} fallback_k × '
               f'{len(min_pt_counts)} min_pt_count)...\n')
 
-        results = []   # (f05, p50, r50, kf, fl, fk, min_pt)
+        results = []   # (f05, p50, r50, cov, kf, pctl, fl, fk, min_pt)
         for kf in keep_fracs:
-            for fl in min_floors:
+            for pctl in percentiles:
+                fl = floor_for[pctl]
                 for fk in fallback_ks:
                     for min_pt in min_pt_counts:
                         tp50 = fp50 = fn50 = 0
+                        n_cov = 0
                         for sc in scenes:
                             cls_s  = sc['cls_scores']
                             iou_s  = sc.get('iou_scores')
@@ -1390,35 +1442,39 @@ def _sweep_thresholds(args) -> None:
 
                             car_mask = mask & (labels == pred_car_label)
                             pred_car = boxes[car_mask]
+                            if len(pred_car) > 0:
+                                n_cov += 1
 
                             t, f_p, f_n = match_boxes(pred_car, gt_car, 0.50)
                             tp50 += t; fp50 += f_p; fn50 += f_n
 
                         p50 = tp50 / (tp50 + fp50) if (tp50 + fp50) > 0 else 0.0
                         r50 = tp50 / (tp50 + fn50) if (tp50 + fn50) > 0 else 0.0
-                        results.append((_f05(p50, r50), p50, r50,
-                                        kf, fl, fk, min_pt))
+                        cov = n_cov / n_total if n_total > 0 else 0.0
+                        results.append((_f05(p50, r50), p50, r50, cov,
+                                        kf, pctl, fl, fk, min_pt))
 
         results.sort(reverse=True)
         top_n = args.sweep_top_n
-        hdr = (f'{"Rank":>4}  {"keep_frac":>9}  {"min_floor":>9}  '
+        hdr = (f'{"Rank":>4}  {"keep_frac":>9}  {"floor_pctl":>10}  {"→floor":>7}  '
                f'{"fallback_k":>10}  {"min_pts":>7}  '
-               f'{"P@0.5":>6}  {"R@0.5":>6}  {"F_β0.5":>6}')
+               f'{"P@0.5":>6}  {"R@0.5":>6}  {"F_β0.5":>6}  {"cov%":>6}')
         sep = '─' * len(hdr)
         print(f'=== Keep-fraction sweep — top {top_n} of {n_combos} by F_β=0.5 ===')
         print(sep)
         print(hdr)
         print(sep)
-        for rank, (f, p, r, kf, fl, fk, mp) in enumerate(results[:top_n], 1):
-            print(f'{rank:>4}  {kf:>9.3f}  {fl:>9.3f}  {fk:>10d}  '
-                  f'{mp:>7d}  {p:>6.3f}  {r:>6.3f}  {f:>6.3f}')
+        for rank, (f, p, r, cov, kf, pctl, fl, fk, mp) in enumerate(results[:top_n], 1):
+            print(f'{rank:>4}  {kf:>9.3f}  {pctl:>10.3g}  {fl:>7.3f}  {fk:>10d}  '
+                  f'{mp:>7d}  {p:>6.3f}  {r:>6.3f}  {f:>6.3f}  {100*cov:>6.1f}')
         print(sep)
 
         with open(csv_path, 'w') as fout:
-            fout.write('keep_frac,min_floor,fallback_k,min_pt_count,'
-                       'precision,recall,f05\n')
-            for f, p, r, kf, fl, fk, mp in results:
-                fout.write(f'{kf},{fl},{fk},{mp},{p:.4f},{r:.4f},{f:.4f}\n')
+            fout.write('keep_frac,floor_percentile,floor_value,fallback_k,'
+                       'min_pt_count,precision,recall,f05,scene_coverage\n')
+            for f, p, r, cov, kf, pctl, fl, fk, mp in results:
+                fout.write(f'{kf},{pctl},{fl:.4f},{fk},{mp},'
+                           f'{p:.4f},{r:.4f},{f:.4f},{cov:.4f}\n')
         print(f'\nFull sweep results saved → {csv_path}')
         return
 
@@ -1711,6 +1767,32 @@ def main():
     bl_all_giou_bev: list = []  # actual GT BEV IoU per prediction
     bl_scenes_with_boxes: int = 0
 
+    # ── Adaptive-floor pre-pass ───────────────────────────────────────────────
+    # When --floor-percentile is set, pool baseline scores across ALL scenes to
+    # turn the percentile into one absolute floor (keep_frac stays per-scene).
+    # Raw predictions are cached so the main loop reuses them (no re-inference).
+    raw_pred_cache: dict = {}
+    global_floor: float = 0.0
+    if baseline_model is not None and args.floor_percentile > 0:
+        print(f'Adaptive-floor pre-pass: pooling baseline scores over {len(selected)} '
+              f'scene(s) for P{args.floor_percentile:g}...')
+        pool_list = []
+        for key in selected:
+            if not os.path.isfile(key):
+                continue
+            pts_nus = load_points_nus(key)
+            rb, rcls, riou, rlab = run_baseline_raw(baseline_model, pts_nus, args.device)
+            raw_pred_cache[key] = (rb, rcls, riou, rlab)
+            if len(rcls) > 0:
+                hyb = (rcls if (riou is None or args.iou_weight <= 0)
+                       else args.iou_weight * riou + (1.0 - args.iou_weight) * rcls)
+                pool_list.append(hyb)
+        pool = np.concatenate(pool_list) if pool_list else np.zeros(0)
+        global_floor = (float(np.percentile(pool, args.floor_percentile))
+                        if len(pool) > 0 else 0.0)
+        print(f'  Global floor = P{args.floor_percentile:g} of {len(pool)} boxes '
+              f'= {global_floor:.3f}\n')
+
     # ── Per-scene loop ──
     for key in selected:
         scene_id = os.path.splitext(os.path.basename(key))[0]
@@ -1747,17 +1829,43 @@ def main():
         bl_boxes, bl_scores, bl_labels, bl_iou_scores, bl_cls_scores = (
             None, None, None, None, None)
         if baseline_model is not None:
-            bl_boxes, bl_scores, bl_labels, bl_iou_scores, bl_cls_scores = run_baseline(
-                baseline_model, pts_nus, args.device,
-                args.hybrid_thr, args.iou_weight,
-                args.min_cls_thr, args.min_iou_thr,
-                keep_frac=args.keep_frac,
-                min_floor=args.min_floor,
-                fallback_k=args.fallback_k,
-                floor_before=args.floor_before)
+            if args.floor_percentile > 0 and key in raw_pred_cache:
+                # Reuse cached raw preds + the global percentile floor.
+                rb, rcls, riou, rlab = raw_pred_cache[key]
+                bl_boxes, bl_scores, bl_labels, bl_iou_scores, bl_cls_scores = (
+                    apply_score_filter(
+                        rb, rcls, riou, rlab,
+                        hybrid_thr=args.hybrid_thr, iou_weight=args.iou_weight,
+                        min_cls_thr=args.min_cls_thr, min_iou_thr=args.min_iou_thr,
+                        keep_frac=args.keep_frac, min_floor=global_floor,
+                        fallback_k=args.fallback_k, floor_before=args.floor_before))
+            else:
+                bl_boxes, bl_scores, bl_labels, bl_iou_scores, bl_cls_scores = run_baseline(
+                    baseline_model, pts_nus, args.device,
+                    args.hybrid_thr, args.iou_weight,
+                    args.min_cls_thr, args.min_iou_thr,
+                    keep_frac=args.keep_frac,
+                    min_floor=0.0,
+                    fallback_k=args.fallback_k,
+                    floor_before=args.floor_before)
+            # Fixed interior-point filter on baseline predictions. Applied here
+            # so all downstream consumers (score hist, GT-IoU, stats, render)
+            # see the same filtered box pool.
+            if args.baseline_min_pts > 0 and bl_boxes is not None and len(bl_boxes) > 0:
+                bl_pt_counts = count_points_in_boxes(
+                    pts_nus, bl_boxes[:, :7].astype(np.float32))
+                keep = bl_pt_counts >= args.baseline_min_pts
+                bl_boxes = bl_boxes[keep]
+                bl_scores = bl_scores[keep]
+                bl_labels = bl_labels[keep]
+                if bl_iou_scores is not None:
+                    bl_iou_scores = bl_iou_scores[keep]
+                if bl_cls_scores is not None:
+                    bl_cls_scores = bl_cls_scores[keep]
             if args.keep_frac is not None:
                 thr_info = (f'keep_frac={args.keep_frac}'
-                            + (f', floor≥{args.min_floor}' if args.min_floor > 0 else '')
+                            + (f', floor≥{global_floor:.3f} (P{args.floor_percentile:g})'
+                               if args.floor_percentile > 0 else '')
                             + (f', fallback_k={args.fallback_k}' if args.fallback_k > 0 else '')
                             + (' [floor-before]' if args.floor_before else ''))
             else:
@@ -1848,8 +1956,8 @@ def main():
             # Build a human-readable title that names the active filtering scheme.
             if args.keep_frac is not None:
                 _scheme_str = f'keep_frac={args.keep_frac}'
-                if args.min_floor > 0:
-                    _scheme_str += f', floor≥{args.min_floor}'
+                if args.floor_percentile > 0:
+                    _scheme_str += f', floor≥{global_floor:.3f} (P{args.floor_percentile:g})'
                 if args.fallback_k > 0:
                     _scheme_str += f', fallback_k={args.fallback_k}'
                 if args.floor_before:
@@ -1857,7 +1965,7 @@ def main():
                 _hist_title_base = f'Baseline: per-scene keep-fraction ({_scheme_str})'
                 # Threshold overlay: show only the floor line (the hybrid/iou
                 # constraint lines would be misleading for the new scheme).
-                _thr_dict = dict(min_cls=args.min_floor) if args.min_floor > 0 else None
+                _thr_dict = dict(min_cls=global_floor) if args.floor_percentile > 0 else None
             else:
                 _hist_title_base = 'Baseline score distributions'
                 _thr_dict = dict(

@@ -59,6 +59,15 @@ train_pipeline = [          # nuscenes
         mapping={'car': 'Car'},
         class_names=metainfo['classes'],
         keep_unmapped=False),       # Keep or Drop unmapped classes
+    # Random Object Scaling: shrink nuScenes Cars toward KITTI size.
+    # Measured KITTI/nuScenes median ratios: l=0.84, w=0.84, h=0.87 → mean≈0.85.
+    # scale_range=[0.75, 1.0] (mean 0.875) is well-targeted and matches the PP
+    # pretrain config. Keeps the object grounded via z += (new_h-old_h)/2.
+    dict(
+        type='RandomObjectScaling',
+        scale_range=[0.75, 1.0],
+        num_try=50,
+        class_names=['Car']),
     dict(
         type='GlobalRotScaleTrans',
         rot_range=[-0.3925, 0.3925],
@@ -297,7 +306,7 @@ model = dict(
 )
 
 default_hooks = dict(
-    checkpoint=dict(type='CheckpointHook', interval=1, save_best=None),
+    checkpoint=dict(type='CheckpointHook', interval=4, save_best=None),
     visualization=dict(type='Det3DVisualizationHook', draw=False))
 
 train_cfg = dict(max_epochs=20, val_interval=10)

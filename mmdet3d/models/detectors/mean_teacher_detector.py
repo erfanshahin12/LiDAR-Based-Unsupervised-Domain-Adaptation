@@ -270,9 +270,14 @@ class MeanTeacher3DDetector(Base3DDetector):
 
         Store boxes are in canonical (weak-aug) frame; they are transformed to
         the strong-aug frame via ``_transform_boxes``. Missing entries get empty GT.
+
+        Injected hard source instances (placed by HardInstanceSampling in the
+        strong pipeline) are already in the strong-aug frame and are merged here
+        with full reliability (cls = iou = 1.0 → quality weight = 1.0).
         """
         pseudo_labeled_samples = copy.deepcopy(target_samp_strong)
         total_boxes = 0
+        logger = MMLogger.get_current_instance()
 
         for samp_strong, pseudo_samp in zip(target_samp_strong, pseudo_labeled_samples):
             key = samp_strong.metainfo.get('lidar_path')
@@ -285,12 +290,12 @@ class MeanTeacher3DDetector(Base3DDetector):
                 boxes_3d = self._transform_boxes(
                     LiDARInstance3DBoxes(boxes_t), samp_strong.metainfo)
 
-                # Soft-target metadata from the refresh store
-                iou_np  = entry.get('iou_scores')
-                cls_np  = entry.get('cls_scores')
-                iou_t = (torch.from_numpy(iou_np.astype(np.float32))
+                # Soft-target metadata from the refresh store.
+                iou_np = entry.get('iou_scores')
+                cls_np = entry.get('cls_scores')
+                iou_t = (torch.from_numpy(iou_np.astype(np.float32)).to(device)
                          if iou_np is not None else scores_t)
-                cls_t = (torch.from_numpy(cls_np.astype(np.float32))
+                cls_t = (torch.from_numpy(cls_np.astype(np.float32)).to(device)
                          if cls_np is not None else scores_t)
             else:
                 boxes_3d = LiDARInstance3DBoxes(torch.zeros(0, 7, device=device))
@@ -299,6 +304,36 @@ class MeanTeacher3DDetector(Base3DDetector):
                 iou_t    = torch.zeros(0, device=device)
                 cls_t    = torch.zeros(0, device=device)
 
+            # ── Merge reliable hard-instance GT from the strong pipeline ──────
+            # HardInstanceSampling places injected source instances into
+            # samp_strong.gt_instances_3d in the strong-aug frame (they were
+            # augmented together with their points by GlobalRotScaleTrans /
+            # RandomFlip3D).  They need no _transform_boxes and are assigned
+            # full quality weight (cls = iou = 1.0) as reliable GT.
+            hard_gt = getattr(samp_strong, 'gt_instances_3d', None)
+            if (hard_gt is not None
+                    and hasattr(hard_gt, 'bboxes_3d')
+                    and len(hard_gt.bboxes_3d) > 0):
+                h_boxes  = hard_gt.bboxes_3d.to(device)
+                h_labels = hard_gt.labels_3d.to(device)
+                n_h = len(h_boxes)
+                if len(boxes_3d) > 0:
+                    try:
+                        boxes_3d = LiDARInstance3DBoxes.cat([boxes_3d, h_boxes])
+                        labels_t = torch.cat([labels_t, h_labels])
+                        ones = torch.ones(n_h, device=device)
+                        scores_t = torch.cat([scores_t, ones])
+                        iou_t    = torch.cat([iou_t,    ones])
+                        cls_t    = torch.cat([cls_t,    ones])
+                    except Exception as e:
+                        logger.warning(
+                            f'[HardInstances] merge failed, skipping: {e}')
+                else:
+                    boxes_3d = h_boxes
+                    labels_t = h_labels
+                    ones = torch.ones(n_h, device=device)
+                    scores_t, iou_t, cls_t = ones, ones, ones
+
             total_boxes += len(boxes_3d)
             gt = InstanceData(bboxes_3d=boxes_3d, labels_3d=labels_t)
             gt.scores_3d = scores_t
@@ -306,7 +341,7 @@ class MeanTeacher3DDetector(Base3DDetector):
             pseudo_samp.gt_instances_3d = gt
 
         if total_boxes == 0:
-            MMLogger.get_current_instance().warning(
+            logger.warning(
                 '[PseudoLabels] store produced 0 boxes (all frames missing or empty)')
 
         return pseudo_labeled_samples
@@ -453,48 +488,69 @@ class MeanTeacher3DDetector(Base3DDetector):
         return filtered_pred
 
 
-    def contrastive_loss(self, bev_s, bev_t, boxes_t_s, boxes_t,
+    def contrastive_loss(self, bev_s, bev_t, boxes_anchor, boxes_pos,
                          all_boxes_t=None, all_scores_t=None,
-                         conf_threshold=0.6, tau=0.07):
-        """Symmetric InfoNCE on RoI-pooled BEV features (CMT-style).
+                         neg_threshold=0.25, tau=0.07):
+        """Single-direction multi-positive InfoNCE on RoI-pooled BEV features.
 
-        RoI features replace point-sampled BEV features; low-confidence teacher
-        predictions serve as explicit background negatives in the denominator.
+        Anchors   = student RoI features at teacher-fg boxes in the strong frame (grad ON).
+        Positives = teacher RoI features at the same fg boxes in the weak frame (no_grad).
+        Negatives = teacher fg (the positives themselves) ∪ teacher bg (score <= neg_threshold).
+
+        Loss = -logsumexp(sim_pos - logsumexp(sim_neg, dim=1), dim=1).mean()
+        where sim_pos = F_a @ F_pos.T / τ  (all-pairs, [N, N]).
+
+        Args:
+            bev_s: Student BEV feature map [C, H, W], strong-aug frame, grad ON.
+            bev_t: Teacher BEV feature map [C, H, W], weak-aug frame, no grad.
+            boxes_anchor: Teacher fg box tensors transformed to strong frame [N, 7].
+            boxes_pos:    Teacher fg box tensors in weak frame [N, 7].
+            all_boxes_t:  All unfiltered teacher box tensors [M, 7] for bg mining.
+            all_scores_t: Corresponding scores [M] for bg mining.
+            neg_threshold: Score at-or-below which a prediction is background.
+            tau:          InfoNCE temperature.
         """
         device = bev_s.device
-        roi_extractor = getattr(self.student, 'roi_extractor', None)
+        roi = getattr(self.student, 'roi_extractor', None)
 
-        if roi_extractor is None or boxes_t is None or boxes_t.shape[0] == 0:
+        if roi is None or boxes_anchor is None or boxes_anchor.shape[0] == 0:
             return torch.tensor(0., device=device)
 
-        # RoI features: boxes_t and boxes_t_s share the same ordering → F_s[i] ↔ F_t[i].
-        F_s = F.normalize(roi_extractor.extract_roi_features(
-            bev_s, LiDARInstance3DBoxes(boxes_t_s)), dim=1)   # [N, C]
-        F_t = F.normalize(roi_extractor.extract_roi_features(
-            bev_t, LiDARInstance3DBoxes(boxes_t)), dim=1)     # [N, C]
+        # Anchors: student BEV, strong-frame boxes — gradients ON.
+        F_a = F.normalize(
+            roi.extract_roi_features(bev_s, LiDARInstance3DBoxes(boxes_anchor)),
+            dim=1)   # [N, C]
 
-        N = F_s.shape[0]
+        N = F_a.shape[0]
         if N == 0:
             return torch.tensor(0., device=device)
 
-        # Background negatives from low-confidence teacher predictions.
-        F_bg = None
-        if all_boxes_t is not None and all_scores_t is not None:
-            bg_boxes = all_boxes_t[all_scores_t < conf_threshold]
-            if bg_boxes.shape[0] > 0:
-                F_bg = F.normalize(roi_extractor.extract_roi_features(
-                    bev_t, LiDARInstance3DBoxes(bg_boxes)), dim=1)  # [N_bg, C]
+        with torch.no_grad():
+            # Positives: teacher BEV, weak-frame boxes (same N, same order).
+            F_pos = F.normalize(
+                roi.extract_roi_features(bev_t, LiDARInstance3DBoxes(boxes_pos)),
+                dim=1)   # [N, C]
 
-        # s→t: student queries against teacher fg (pos) + teacher bg (neg).
-        F_neg = torch.cat([F_t, F_bg], dim=0) if F_bg is not None else F_t
-        pos_st = (F_s * F_t).sum(dim=1) / tau
-        loss_st = -(pos_st - torch.logsumexp(torch.mm(F_s, F_neg.T) / tau, dim=1)).mean()
+            # Background negatives: unfiltered teacher preds with score <= neg_threshold.
+            F_bg = None
+            if all_boxes_t is not None and all_scores_t is not None:
+                bg_mask = all_scores_t <= neg_threshold
+                bg_boxes = all_boxes_t[bg_mask]
+                if bg_boxes.shape[0] > 0:
+                    F_bg = F.normalize(
+                        roi.extract_roi_features(bev_t, LiDARInstance3DBoxes(bg_boxes)),
+                        dim=1)   # [N_bg, C]
 
-        # t→s: teacher fg queries against student fg (fg-only negatives).
-        pos_ts = (F_t * F_s).sum(dim=1) / tau
-        loss_ts = -(pos_ts - torch.logsumexp(torch.mm(F_t, F_s.T) / tau, dim=1)).mean()
+        # Negatives = teacher fg (positives) + teacher bg.
+        F_neg = torch.cat([F_pos, F_bg], dim=0) if F_bg is not None else F_pos
 
-        return (loss_st + loss_ts) * 0.5
+        # Single-direction multi-positive InfoNCE
+        sim_pos = torch.mm(F_a, F_pos.T) / tau                              # [N, N]
+        sim_neg = torch.mm(F_a, F_neg.T) / tau                              # [N, N+N_bg]
+        neg_lse = torch.logsumexp(sim_neg, dim=1, keepdim=True)             # [N, 1]
+        loss = -torch.logsumexp(sim_pos - neg_lse, dim=1).mean()
+
+        return loss
 
 
     def _transform_boxes(self, boxes, metainfo_strong):
@@ -615,27 +671,50 @@ class MeanTeacher3DDetector(Base3DDetector):
         pseudo_labeled_samples = copy.deepcopy(target_samples_strong)
         total_boxes = 0
 
-        for pred, sample_strong in zip(teacher_predictions, pseudo_labeled_samples):
+        for pred, samp_strong, sample_strong in zip(
+                teacher_predictions, target_samples_strong, pseudo_labeled_samples):
             instance = pred.pred_instances_3d
             boxes  = instance.bboxes_3d
             labels = instance.labels_3d
             scores = instance.scores_3d if hasattr(instance, 'scores_3d') else None
-
-            total_boxes += len(boxes)
-            gt = InstanceData(bboxes_3d=boxes, labels_3d=labels)
-            if scores is not None:
-                gt.scores_3d = scores
+            device = labels.device
 
             # Attach soft-target metadata produced by filter_teacher_predictions.
-            # filter_teacher_predictions stores raw cls in cls_scores_3d and the
-            # raw IoU head score in iou_scores_3d; use them as quality signals.
-            device = labels.device
             iou_t = getattr(instance, 'iou_scores_3d', scores)
             cls_t = getattr(instance, 'cls_scores_3d', scores)
             if iou_t is None:
                 iou_t = scores if scores is not None else torch.zeros(0, device=device)
             if cls_t is None:
                 cls_t = scores if scores is not None else torch.zeros(0, device=device)
+
+            # ── Merge reliable hard-instance GT from the strong pipeline ──────
+            hard_gt = getattr(samp_strong, 'gt_instances_3d', None)
+            if (hard_gt is not None
+                    and hasattr(hard_gt, 'bboxes_3d')
+                    and len(hard_gt.bboxes_3d) > 0):
+                h_boxes  = hard_gt.bboxes_3d.to(device)
+                h_labels = hard_gt.labels_3d.to(device)
+                n_h = len(h_boxes)
+                if len(boxes) > 0:
+                    try:
+                        boxes  = LiDARInstance3DBoxes.cat([boxes, h_boxes])
+                        labels = torch.cat([labels, h_labels])
+                        ones   = torch.ones(n_h, device=device)
+                        scores = torch.cat([scores, ones]) if scores is not None else ones
+                        iou_t  = torch.cat([iou_t, ones])
+                        cls_t  = torch.cat([cls_t, ones])
+                    except Exception as e:
+                        logger.warning(
+                            f'[HardInstances] merge failed, skipping: {e}')
+                else:
+                    boxes, labels = h_boxes, h_labels
+                    ones = torch.ones(n_h, device=device)
+                    scores, iou_t, cls_t = ones, ones, ones
+
+            total_boxes += len(boxes)
+            gt = InstanceData(bboxes_3d=boxes, labels_3d=labels)
+            if scores is not None:
+                gt.scores_3d = scores
             self._attach_pseudo_meta(gt, cls_t, iou_t, device)
 
             sample_strong.gt_instances_3d = gt
@@ -800,28 +879,52 @@ class MeanTeacher3DDetector(Base3DDetector):
                 x_strong, x_teacher_strong)
             losses['loss_iou_distill'] = loss_iou_distill * w_iou_distill
 
-        # ── TERM 3: BEV contrastive loss ──────────────────────────────
+        # ── TERM 3: BEV contrastive loss (single-direction multi-positive) ──
+        # Only runs when use_bev_consistency is True (default).
+        # Iterates over the *unfiltered* teacher_pred so that fg/bg thresholds
+        # (fg_threshold / neg_threshold) are applied fresh here, independent of
+        # the pseudo-label conf_threshold.  Anchor positions = teacher fg boxes
+        # transformed into the student's strong-aug frame.
         loss_cont_total = torch.tensor(0., device=device)
         n_valid = 0
-        tau = self.mean_teacher_cfg.get('tau', 0.07)
-        conf_thr = self.mean_teacher_cfg.get('conf_threshold', 0.6)
 
-        for i in range(len(filtered_preds)):
-            bev_t = getattr(filtered_preds[i], 'bev_features', None)
-            if bev_t is None:
-                continue
-            boxes_t   = filtered_preds[i].pred_instances_3d.bboxes_3d.tensor
-            boxes_t_s = transformed_preds[i].pred_instances_3d.bboxes_3d.tensor
-            if boxes_t.shape[0] == 0:
-                continue
-            loss_i = self.contrastive_loss(
-                bev_features_student[i], bev_t, boxes_t_s, boxes_t,
-                all_boxes_t=teacher_pred[i].pred_instances_3d.bboxes_3d.tensor,
-                all_scores_t=teacher_pred[i].pred_instances_3d.scores_3d,
-                conf_threshold=conf_thr, tau=tau,
-            )
-            loss_cont_total += loss_i
-            n_valid += 1
+        cont_warmup = int(self.mean_teacher_cfg.get('contrastive_warmup_iters', 0))
+        if (self.mean_teacher_cfg.get('use_bev_consistency', True)
+                and self._train_iter >= cont_warmup):
+            tau     = self.mean_teacher_cfg.get('tau', 0.07)
+            fg_thr  = self.mean_teacher_cfg.get('fg_threshold', 0.5)
+            neg_thr = self.mean_teacher_cfg.get('neg_threshold', 0.25)
+
+            for i in range(len(teacher_pred)):
+                # Teacher BEV is stored on the (possibly filtered) pred object;
+                # fall back to teacher_pred in case filtered_preds dropped the frame.
+                bev_t = getattr(teacher_pred[i], 'bev_features', None)
+                if bev_t is None:
+                    bev_t = getattr(filtered_preds[i], 'bev_features', None)
+                if bev_t is None:
+                    continue
+
+                all_boxes_t  = teacher_pred[i].pred_instances_3d.bboxes_3d.tensor
+                all_scores_t = teacher_pred[i].pred_instances_3d.scores_3d
+
+                # foreground: score > fg_threshold (independent of pseudo conf_threshold).
+                fg_mask   = all_scores_t > fg_thr
+                boxes_pos = all_boxes_t[fg_mask]   # weak frame
+                if boxes_pos.shape[0] == 0:
+                    continue
+
+                # Same fg boxes transformed into the student's strong-aug frame.
+                boxes_anchor = self._transform_boxes(
+                    LiDARInstance3DBoxes(boxes_pos),
+                    target_samp_strong[i].metainfo).tensor  # strong frame
+
+                loss_i = self.contrastive_loss(
+                    bev_features_student[i], bev_t, boxes_anchor, boxes_pos,
+                    all_boxes_t=all_boxes_t, all_scores_t=all_scores_t,
+                    neg_threshold=neg_thr, tau=tau,
+                )
+                loss_cont_total += loss_i
+                n_valid += 1
 
         losses['loss_contrastive'] = (
             loss_cont_total / n_valid * w_cont if n_valid > 0
