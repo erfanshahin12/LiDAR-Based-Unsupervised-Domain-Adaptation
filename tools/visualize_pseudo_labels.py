@@ -366,37 +366,25 @@ _KITTI_TEST_CFG = dict(
 
 
 def run_baseline(model, pts_nus: np.ndarray, device: str,
-                 hybrid_thr: float, iou_weight: float,
-                 min_cls_thr: float = 0.0,
-                 min_iou_thr: float = 0.0,
-                 # ── per-scene keep-fraction scheme (optional) ──────────────
                  keep_frac: float | None = None,
                  min_floor: float = 0.0,
                  fallback_k: int = 1,
                  floor_before: bool = False,
                  ) -> tuple[np.ndarray, np.ndarray, np.ndarray,
                             np.ndarray | None, np.ndarray]:
-    """Run baseline on a single scene and apply threshold filtering.
+    """Run baseline on a single scene and apply per-scene keep-fraction filtering.
 
     The test_cfg is overridden with _KITTI_TEST_CFG (matching
     test_kitti_nuspretrained_pointpillars.py) so that inference is consistent
     with KITTI evaluation regardless of which training config was loaded.
-    Specifically, score_type='cls' guarantees that scores_3d is the raw
-    classification sigmoid — not the hybrid blend — so hybrid can be computed
-    explicitly from raw components below.
+    ``score_type='cls'`` guarantees ``scores_3d`` is the raw classification
+    sigmoid, which is the score used for keep_frac ranking and the floor.
 
-    **When ``keep_frac`` is None (default):** hard-threshold mode.
-      Three independent constraints applied to the hybrid score:
-        hybrid = iou_weight*iou_scores + (1-iou_weight)*cls_scores >= hybrid_thr
-        cls_scores >= min_cls_thr   (0.0 = off)
-        iou_scores >= min_iou_thr   (0.0 = off)
+    Filtering: keep the top ``keep_frac`` of boxes per scene by CLS score
+    (None = keep all), then drop survivors below ``min_floor`` (see
+    ``select_scene_keep_mask``).
 
-    **When ``keep_frac`` is set:** per-scene keep-fraction mode.
-      Applies ``select_scene_keep_mask`` over the hybrid score;
-      ``hybrid_thr / min_cls_thr / min_iou_thr`` are ignored.
-      See ``select_scene_keep_mask`` for the three-step logic.
-
-    Returns (boxes (K,7), hybrid (K,), labels (K,), iou_scores (K,)|None,
+    Returns (boxes (K,7), cls (K,), labels (K,), iou_scores (K,)|None,
              cls_scores (K,)) in nuScenes frame.
     """
     pts_tensor = torch.from_numpy(pts_nus).float()
@@ -430,47 +418,28 @@ def run_baseline(model, pts_nus: np.ndarray, device: str,
 
     return apply_score_filter(
         boxes, cls_scores, iou_scores, labels,
-        hybrid_thr=hybrid_thr, iou_weight=iou_weight,
-        min_cls_thr=min_cls_thr, min_iou_thr=min_iou_thr,
         keep_frac=keep_frac, min_floor=min_floor,
         fallback_k=fallback_k, floor_before=floor_before)
 
 
 def apply_score_filter(boxes, cls_scores, iou_scores, labels, *,
-                       hybrid_thr=0.0, iou_weight=0.5,
-                       min_cls_thr=0.0, min_iou_thr=0.0,
                        keep_frac=None, min_floor=0.0,
                        fallback_k=0, floor_before=False):
-    """Apply the keep-frac / hybrid-thr score filter to a raw prediction pool.
+    """Apply the per-scene keep-fraction + floor filter to a raw prediction pool.
 
     Shared by ``run_baseline`` (inference path) and the ``--floor-percentile``
-    pre-pass (cached-prediction path) so both apply identical masking.
-    ``min_floor`` is an ABSOLUTE score value here; the percentile→floor
-    conversion is done by the caller. Returns
-    (boxes, hybrid, labels, iou_scores|None, cls_scores) filtered.
+    pre-pass (cached-prediction path) so both apply identical masking. Ranking
+    and floor use the raw CLS score. ``min_floor`` is an ABSOLUTE score value;
+    the percentile→floor conversion is done by the caller. Returns
+    (boxes, cls, labels, iou_scores|None, cls_scores) filtered.
     """
-    # Hybrid computed explicitly from raw components — matches filter_teacher_predictions.
-    if iou_scores is not None and iou_weight > 0:
-        hybrid = iou_weight * iou_scores + (1.0 - iou_weight) * cls_scores
-    else:
-        hybrid = cls_scores.copy()
+    mask = select_scene_keep_mask(cls_scores,
+                                  keep_frac=keep_frac,
+                                  min_floor=min_floor,
+                                  fallback_k=fallback_k,
+                                  floor_before=floor_before)
 
-    if keep_frac is not None:
-        # ── Per-scene keep-fraction scheme ───────────────────────────────────
-        mask = select_scene_keep_mask(hybrid,
-                                      keep_frac=keep_frac,
-                                      min_floor=min_floor,
-                                      fallback_k=fallback_k,
-                                      floor_before=floor_before)
-    else:
-        # ── Legacy hard-threshold scheme ─────────────────────────────────────
-        mask = hybrid >= hybrid_thr
-        if iou_scores is not None and min_iou_thr > 0:
-            mask = mask & (iou_scores >= min_iou_thr)
-        if min_cls_thr > 0:
-            mask = mask & (cls_scores >= min_cls_thr)
-
-    return (boxes[mask], hybrid[mask], labels[mask],
+    return (boxes[mask], cls_scores[mask], labels[mask],
             iou_scores[mask] if iou_scores is not None else None,
             cls_scores[mask])
 
@@ -755,36 +724,14 @@ def parse_args():
                    help='Torch device for baseline inference')
 
     # ── Thresholds & scoring ──────────────────────────────────────────────────
+    # The score used for ranking (keep_frac) and the floor is the raw CLS score.
     g = p.add_argument_group('Thresholds & scoring')
-    g.add_argument('--hybrid-thr', type=float, default=0.0,
-                   help='Minimum hybrid score: iou_weight*IoU + (1-iou_weight)*CLS')
-    g.add_argument('--iou-weight', type=float, default=0.5,
-                   help='IoU weight in hybrid score [0,1]. 0 = CLS-only.')
-    g.add_argument('--min-cls-thr', type=float, default=0.0,
-                   help='Minimum raw CLS score floor applied independently of hybrid '
-                        '(0.0 = off)')
-    g.add_argument('--min-iou-thr', type=float, default=0.0,
-                   help='Minimum raw IoU head score floor applied independently of hybrid '
-                        '(0.0 = off)')
-    g.add_argument('--sweep-iou-weights', default='0.5,0.6,0.7,0.8',
-                   help='Comma-separated iou_weight values for --sweep-from-cache '
-                        '(legacy hybrid-thr mode, ignored when --sweep-keep-fracs is set).')
-    g.add_argument('--sweep-hybrid-thrs', default='0.30,0.35,0.40,0.45,0.50',
-                   help='Comma-separated hybrid_thr values for --sweep-from-cache '
-                        '(legacy mode, ignored when --sweep-keep-fracs is set).')
-    g.add_argument('--sweep-floors', default='0.10,0.15,0.20,0.25,0.30',
-                   help='Comma-separated symmetric floor values (min_cls=min_iou) '
-                        'for --sweep-from-cache (legacy mode, ignored when '
-                        '--sweep-keep-fracs is set).')
-    g.add_argument('--sweep-cov-target', type=float, default=0.85,
-                   help='Coverage target for penalised score in legacy sweep (default 0.85).')
     g.add_argument('--sweep-top-n', type=int, default=20,
                    help='Number of top results to display in sweep table.')
-    # ── Keep-fraction sweep axes (new mode) ──────────────────────────────────
+    # ── Keep-fraction sweep axes ──────────────────────────────────────────────
     g.add_argument('--sweep-keep-fracs', default=None,
                    help='Comma-separated keep_frac values for --sweep-from-cache '
-                        '(e.g. "0.2,0.3,0.4,0.5"). Setting this activates the '
-                        'per-scene keep-fraction sweep instead of the legacy mode.')
+                        '(e.g. "0.2,0.3,0.4,0.5"). Activates the keep-fraction sweep.')
     g.add_argument('--sweep-floor-percentiles', default='0,30,40,50',
                    help='Comma-separated GLOBAL score percentiles [0-100] for the '
                         'adaptive floor in the keep-frac sweep. For each value P the '
@@ -794,22 +741,34 @@ def parse_args():
                         'the floor tracks teacher-confidence drift instead of a fixed cut.')
     g.add_argument('--sweep-fallback-ks', default='0,1,3',
                    help='Comma-separated fallback_k integer values for the keep-frac sweep.')
+    g.add_argument('--sweep-abs-floors', default=None,
+                   help='Comma-separated ABSOLUTE score floors (e.g. "0.25,0.3,0.35,0.4") '
+                        'for the keep-frac sweep. Swept in ADDITION to '
+                        '--sweep-floor-percentiles, so a single run compares fixed floors '
+                        'against the adaptive percentile floor. In the table the '
+                        'floor_pctl column shows the percentile (e.g. 60) for adaptive '
+                        'rows and the fixed value (e.g. 0.3) for absolute rows; the '
+                        '→floor column always shows the absolute cut applied.')
     g.add_argument('--sweep-min-pt-counts', default='0',
                    help='Comma-separated minimum interior point count values for the '
                         'keep-frac sweep (e.g. "0,3,5"). 0 = no filter. Requires '
                         '--kitti-info so the velodyne_reduced bin files can be located.')
     # ── Per-scene keep-fraction thresholding ─────────────────────────────────
     g.add_argument('--keep-frac', type=float, default=None,
-                   help='Activate per-scene keep-fraction scheme: keep the top '
-                        'ceil(keep_frac × N) highest-scoring boxes per scene. '
-                        'When set, --hybrid-thr / --min-cls-thr / --min-iou-thr '
-                        'are ignored (use --floor-percentile and --fallback-k instead).')
+                   help='Per-scene keep-fraction: keep the top ceil(keep_frac × N) '
+                        'highest-CLS boxes per scene. None = keep all (floor still '
+                        'applies). Combine with --min-floor / --floor-percentile.')
     g.add_argument('--floor-percentile', type=float, default=0.0,
                    help='Adaptive score floor used with --keep-frac: drop surviving '
                         'boxes whose score is below the P-th percentile of the GLOBAL '
                         'pooled box-score distribution (computed across all scenes in a '
-                        'pre-pass; keep_frac stays per-scene). 0 = off. Replaces the old '
-                        'absolute --min-floor so the floor drifts with teacher confidence.')
+                        'pre-pass; keep_frac stays per-scene). 0 = off. Adaptive '
+                        'alternative to the fixed --min-floor; --min-floor takes precedence.')
+    g.add_argument('--min-floor', type=float, default=0.0,
+                   help='FIXED absolute score floor used with --keep-frac: drop survivors '
+                        'below this value (floor acts as a guard after the per-scene '
+                        'fraction, unless --floor-before). 0 = off. Takes precedence over '
+                        '--floor-percentile when both are set (no pooling pre-pass needed).')
     g.add_argument('--fallback-k', type=int, default=0,
                    help='If fewer than this many boxes survive --keep-frac + '
                         'the floor, restore the top-k raw boxes (ignoring the '
@@ -1100,8 +1059,8 @@ def plot_score_distributions(cls_scores, iou_scores, out_path: str,
         iou_label:    label for the primary IoU axis.
         iou2_scores:  optional second IoU array (e.g. BEV when iou_scores is 3D).
         iou2_label:   label for the second IoU axis.
-        thresholds:   optional dict with keys min_cls, min_iou, hybrid_thr, iou_weight.
-            When provided, draws constraint lines on the histograms and hexbin.
+        thresholds:   optional dict with key min_cls (the score floor). When
+            provided, draws the floor line on the CLS histogram and hexbin.
         scene_stats: (n_with_boxes, n_total) for scene coverage reporting.
     """
     cls = np.asarray(cls_scores, dtype=np.float32)
@@ -1164,23 +1123,11 @@ def plot_score_distributions(cls_scores, iou_scores, out_path: str,
         ax.set_ylim(0, 1)
         ax.plot([0, 1], [0, 1], color='white', linestyle=':', linewidth=0.8,
                 alpha=0.5, label=f'{score1_label} = {y_label}')
-        # Constraint overlays (relevant only for the model-IoU-head case)
+        # Floor line on the CLS axis.
         min_cls = thr.get('min_cls', 0.0)
-        min_iou = thr.get('min_iou', 0.0)
-        ht = thr.get('hybrid_thr', 0.0)
-        w = thr.get('iou_weight', 0.0)
         if min_cls > 0:
             ax.axvline(min_cls, color='cyan', linestyle='--',
-                       linewidth=1.0, alpha=0.85, label=f'min CLS={min_cls:.2f}')
-        if min_iou > 0:
-            ax.axhline(min_iou, color='lime', linestyle='--',
-                       linewidth=1.0, alpha=0.85, label=f'min IoU={min_iou:.2f}')
-        if ht > 0 and w > 0:
-            cx = np.linspace(0.0, 1.0, 300)
-            iy = (ht - (1.0 - w) * cx) / w
-            vis = (iy >= 0) & (iy <= 1)
-            ax.plot(cx[vis], iy[vis], color='orange', linewidth=1.2,
-                    alpha=0.85, label=f'hybrid≥{ht:.2f} (w={w})')
+                       linewidth=1.0, alpha=0.85, label=f'floor={min_cls:.2f}')
         ax.legend(fontsize=7, facecolor='#222222',
                   edgecolor='white', labelcolor='white')
         return corr
@@ -1301,17 +1248,14 @@ def _f05(p: float, r: float) -> float:
 
 
 def _sweep_thresholds(args) -> None:
-    """Load raw-prediction cache and sweep threshold combinations.
+    """Load a raw-prediction cache and sweep keep-fraction filtering combinations.
 
-    Two modes, selected by whether ``--sweep-keep-fracs`` is provided:
-
-    * **Keep-fraction mode** (new): sweeps ``keep_frac × min_floor × fallback_k``
-      using ``select_scene_keep_mask`` per scene.  CSV columns:
-      ``keep_frac, min_floor, fallback_k, precision, recall, f05``.
-
-    * **Legacy hybrid-thr mode**: sweeps ``iou_weight × hybrid_thr × floor``.
-      CSV columns: ``iou_w, floor, hybrid_thr, precision, recall, f05,
-      coverage, n_boxes, score``.
+    Sweeps ``keep_frac × floor × fallback_k × min_pt_count`` using
+    ``select_scene_keep_mask`` per scene, ranking/flooring on the CLS score.
+    The floor axis combines ``--sweep-floor-percentiles`` (adaptive, pooled)
+    and ``--sweep-abs-floors`` (fixed). Requires ``--sweep-keep-fracs``.
+    CSV columns: ``keep_frac, floor_percentile, floor_value, fallback_k,
+    min_pt_count, precision, recall, f05, scene_coverage``.
     """
     print(f'Loading cache: {args.sweep_from_cache}')
     with open(args.sweep_from_cache, 'rb') as f:
@@ -1369,11 +1313,10 @@ def _sweep_thresholds(args) -> None:
                          getattr(args, 'sweep_min_pt_counts', '0').split(',')]
 
         # ── Global score pool → percentile-to-absolute-floor map ──────────────
-        # keep_frac is per-scene; the floor is the P-th percentile of the box
+        # keep_frac is per-scene; the floor is the P-th percentile of the CLS
         # scores pooled across ALL scenes, so it drifts with the distribution.
         pool = np.concatenate([
-            (sc['cls_scores'] if sc.get('iou_scores') is None
-             else 0.5 * sc['iou_scores'] + 0.5 * sc['cls_scores'])
+            sc['cls_scores']
             for sc in scenes if len(sc['boxes']) > 0
         ]) if any(len(sc['boxes']) > 0 for sc in scenes) else np.zeros(0)
         floor_for = {
@@ -1382,6 +1325,16 @@ def _sweep_thresholds(args) -> None:
         }
         print('  Adaptive floors (global percentile → score):  '
               + '  '.join(f'P{P:g}={floor_for[P]:.3f}' for P in percentiles))
+
+        # Floor axis = adaptive percentile floors + (optionally) fixed absolute
+        # floors. Each entry is (display, abs_floor): display is the percentile
+        # for adaptive rows and the value itself for absolute rows.
+        floor_specs = [(P, floor_for[P]) for P in percentiles]
+        if args.sweep_abs_floors:
+            abs_floors = _parse_floats(args.sweep_abs_floors)
+            floor_specs += [(fl, fl) for fl in abs_floors]
+            print('  Absolute floors:  '
+                  + '  '.join(f'{fl:.3f}' for fl in abs_floors))
 
         # ── Pre-compute per-box interior point counts (one pass) ──────────────
         need_pt = any(m > 0 for m in min_pt_counts)
@@ -1408,32 +1361,27 @@ def _sweep_thresholds(args) -> None:
                         sc['pt_counts'] = np.zeros(len(sc['boxes']), dtype=np.int32)
                 print('  Done.\n')
 
-        n_combos = (len(keep_fracs) * len(percentiles)
+        n_combos = (len(keep_fracs) * len(floor_specs)
                     * len(fallback_ks) * len(min_pt_counts))
         print(f'  Keep-fraction sweep: {n_combos} combinations '
-              f'({len(keep_fracs)} keep_frac × {len(percentiles)} floor_pctl × '
+              f'({len(keep_fracs)} keep_frac × {len(floor_specs)} floor × '
               f'{len(fallback_ks)} fallback_k × '
               f'{len(min_pt_counts)} min_pt_count)...\n')
 
         results = []   # (f05, p50, r50, cov, kf, pctl, fl, fk, min_pt)
         for kf in keep_fracs:
-            for pctl in percentiles:
-                fl = floor_for[pctl]
+            for pctl, fl in floor_specs:
                 for fk in fallback_ks:
                     for min_pt in min_pt_counts:
                         tp50 = fp50 = fn50 = 0
                         n_cov = 0
                         for sc in scenes:
                             cls_s  = sc['cls_scores']
-                            iou_s  = sc.get('iou_scores')
                             boxes  = sc['boxes']
                             labels = sc['labels']
                             gt_car = sc['gt_car_boxes']
 
-                            hybrid = (cls_s if iou_s is None
-                                      else 0.5 * iou_s + 0.5 * cls_s)
-
-                            mask = select_scene_keep_mask(hybrid,
+                            mask = select_scene_keep_mask(cls_s,
                                                           keep_frac=kf,
                                                           min_floor=fl,
                                                           fallback_k=fk)
@@ -1478,89 +1426,9 @@ def _sweep_thresholds(args) -> None:
         print(f'\nFull sweep results saved → {csv_path}')
         return
 
-    # ── Legacy hybrid-thr sweep ───────────────────────────────────────────────
-    iou_weights = _parse_floats(args.sweep_iou_weights)
-    hybrid_thrs = _parse_floats(args.sweep_hybrid_thrs)
-    floors      = _parse_floats(args.sweep_floors)
-    cov_target  = args.sweep_cov_target
-    top_n       = args.sweep_top_n
-    n_combos    = len(iou_weights) * len(hybrid_thrs) * len(floors)
-    print(f'  Legacy hybrid-thr sweep: {n_combos} combinations '
-          f'({len(iou_weights)} iou_w × {len(hybrid_thrs)} hybrid_thr × '
-          f'{len(floors)} floor)...\n')
-
-    ref = (round(args.iou_weight, 4),
-           round(args.hybrid_thr, 4),
-           round(min(args.min_cls_thr, args.min_iou_thr), 4))
-
-    results = []
-    for w in iou_weights:
-        for ht in hybrid_thrs:
-            for fl in floors:
-                tp25 = fp25 = fn25 = 0
-                tp50 = fp50 = fn50 = 0
-                n_with = 0
-                total_boxes = 0
-                for sc in scenes:
-                    cls_s  = sc['cls_scores']
-                    iou_s  = sc.get('iou_scores')
-                    boxes  = sc['boxes']
-                    labels = sc['labels']
-                    gt_car = sc['gt_car_boxes']
-
-                    hybrid = (w * iou_s + (1.0 - w) * cls_s
-                              if iou_s is not None and w > 0 else cls_s)
-                    mask = hybrid >= ht
-                    if fl > 0:
-                        mask = mask & (cls_s >= fl)
-                        if iou_s is not None:
-                            mask = mask & (iou_s >= fl)
-
-                    car_mask = mask & (labels == pred_car_label)
-                    pred_car = boxes[car_mask]
-                    total_boxes += int(car_mask.sum())
-                    if len(pred_car) > 0:
-                        n_with += 1
-
-                    t, f_p, f_n = match_boxes(pred_car, gt_car, 0.25)
-                    tp25 += t; fp25 += f_p; fn25 += f_n
-                    t, f_p, f_n = match_boxes(pred_car, gt_car, 0.50)
-                    tp50 += t; fp50 += f_p; fn50 += f_n
-
-                p50  = tp50 / (tp50 + fp50) if (tp50 + fp50) > 0 else 0.0
-                r50  = tp50 / (tp50 + fn50) if (tp50 + fn50) > 0 else 0.0
-                cov  = n_with / n_total if n_total > 0 else 0.0
-                f    = _f05(p50, r50)
-                score = f * min(1.0, cov / cov_target)
-                results.append((score, f, p50, r50, cov, total_boxes, w, ht, fl))
-
-    results.sort(reverse=True)
-    shown = results[:top_n]
-
-    hdr = (f'{"Rank":>4}  {"iou_w":>5}  {"floor":>5}  {"hybrid":>6}  '
-           f'{"P@0.5":>6}  {"R@0.5":>6}  {"F_β0.5":>6}  '
-           f'{"Cov%":>5}  {"Boxes":>6}  {"Score":>6}')
-    sep = '─' * len(hdr)
-    print(f'=== Legacy sweep — top {top_n} of {n_combos} by '
-          f'F_β=0.5 × cov_factor (cov_target={cov_target:.0%}) ===')
-    print(f'  (model test_cfg score_thr is an implicit CLS floor not shown here)')
-    print(sep)
-    print(hdr)
-    print(sep)
-    for rank, (score, f, p, r, cov, nb, w, ht, fl) in enumerate(shown, 1):
-        marker = ' ←' if (round(w,4), round(ht,4), round(fl,4)) == ref else ''
-        print(f'{rank:>4}  {w:>5.2f}  {fl:>5.2f}  {ht:>6.3f}  '
-              f'{p:>6.3f}  {r:>6.3f}  {f:>6.3f}  '
-              f'{cov*100:>5.1f}  {nb:>6}  {score:>6.3f}{marker}')
-    print(sep)
-
-    with open(csv_path, 'w') as fout:
-        fout.write('iou_w,floor,hybrid_thr,precision,recall,f05,'
-                   'coverage,n_boxes,score\n')
-        for score, f, p, r, cov, nb, w, ht, fl in results:
-            fout.write(f'{w},{fl},{ht},{p:.4f},{r:.4f},{f:.4f},'
-                       f'{cov:.4f},{nb},{score:.4f}\n')
-    print(f'\nFull sweep results saved → {csv_path}')
+    # Keep-fraction is the only sweep mode.
+    print('ERROR: --sweep-keep-fracs is required for --sweep-from-cache '
+          '(e.g. --sweep-keep-fracs 0.4,0.6).')
 
 
 def main():
@@ -1773,6 +1641,15 @@ def main():
     # Raw predictions are cached so the main loop reuses them (no re-inference).
     raw_pred_cache: dict = {}
     global_floor: float = 0.0
+    # A fixed absolute --min-floor takes precedence over the adaptive percentile
+    # floor (which needs a pooling pre-pass). Set it directly and skip the pre-pass.
+    if args.min_floor > 0:
+        if args.floor_percentile > 0:
+            print(f'Both --min-floor ({args.min_floor:.3f}) and --floor-percentile '
+                  f'({args.floor_percentile:g}) set; using the fixed --min-floor.')
+            args.floor_percentile = 0.0
+        global_floor = args.min_floor
+        print(f'Using fixed absolute floor = {global_floor:.3f} (--min-floor)')
     if baseline_model is not None and args.floor_percentile > 0:
         print(f'Adaptive-floor pre-pass: pooling baseline scores over {len(selected)} '
               f'scene(s) for P{args.floor_percentile:g}...')
@@ -1784,9 +1661,7 @@ def main():
             rb, rcls, riou, rlab = run_baseline_raw(baseline_model, pts_nus, args.device)
             raw_pred_cache[key] = (rb, rcls, riou, rlab)
             if len(rcls) > 0:
-                hyb = (rcls if (riou is None or args.iou_weight <= 0)
-                       else args.iou_weight * riou + (1.0 - args.iou_weight) * rcls)
-                pool_list.append(hyb)
+                pool_list.append(rcls)   # CLS score is the ranking/floor score
         pool = np.concatenate(pool_list) if pool_list else np.zeros(0)
         global_floor = (float(np.percentile(pool, args.floor_percentile))
                         if len(pool) > 0 else 0.0)
@@ -1835,17 +1710,13 @@ def main():
                 bl_boxes, bl_scores, bl_labels, bl_iou_scores, bl_cls_scores = (
                     apply_score_filter(
                         rb, rcls, riou, rlab,
-                        hybrid_thr=args.hybrid_thr, iou_weight=args.iou_weight,
-                        min_cls_thr=args.min_cls_thr, min_iou_thr=args.min_iou_thr,
                         keep_frac=args.keep_frac, min_floor=global_floor,
                         fallback_k=args.fallback_k, floor_before=args.floor_before))
             else:
                 bl_boxes, bl_scores, bl_labels, bl_iou_scores, bl_cls_scores = run_baseline(
                     baseline_model, pts_nus, args.device,
-                    args.hybrid_thr, args.iou_weight,
-                    args.min_cls_thr, args.min_iou_thr,
                     keep_frac=args.keep_frac,
-                    min_floor=0.0,
+                    min_floor=global_floor,
                     fallback_k=args.fallback_k,
                     floor_before=args.floor_before)
             # Fixed interior-point filter on baseline predictions. Applied here
@@ -1862,17 +1733,6 @@ def main():
                     bl_iou_scores = bl_iou_scores[keep]
                 if bl_cls_scores is not None:
                     bl_cls_scores = bl_cls_scores[keep]
-            if args.keep_frac is not None:
-                thr_info = (f'keep_frac={args.keep_frac}'
-                            + (f', floor≥{global_floor:.3f} (P{args.floor_percentile:g})'
-                               if args.floor_percentile > 0 else '')
-                            + (f', fallback_k={args.fallback_k}' if args.fallback_k > 0 else '')
-                            + (' [floor-before]' if args.floor_before else ''))
-            else:
-                thr_info = (f'hybrid≥{args.hybrid_thr}, w={args.iou_weight}'
-                            + (f', cls≥{args.min_cls_thr}' if args.min_cls_thr > 0 else '')
-                            + (f', iou≥{args.min_iou_thr}' if args.min_iou_thr > 0 else ''))
-            # print(f'  Baseline: {len(bl_boxes)} boxes ({thr_info})')
             if len(bl_scores) > 0:
                 bl_all_scores.extend(bl_scores.tolist())
                 bl_all_cls.extend(bl_cls_scores.tolist())
@@ -1954,25 +1814,20 @@ def main():
             _use_gt_iou = getattr(args, 'gt_iou', False)
             _gt_iou_mode = getattr(args, 'gt_iou_mode', 'both')
             # Build a human-readable title that names the active filtering scheme.
-            if args.keep_frac is not None:
-                _scheme_str = f'keep_frac={args.keep_frac}'
-                if args.floor_percentile > 0:
-                    _scheme_str += f', floor≥{global_floor:.3f} (P{args.floor_percentile:g})'
-                if args.fallback_k > 0:
-                    _scheme_str += f', fallback_k={args.fallback_k}'
-                if args.floor_before:
-                    _scheme_str += ' [floor-before]'
-                _hist_title_base = f'Baseline: per-scene keep-fraction ({_scheme_str})'
-                # Threshold overlay: show only the floor line (the hybrid/iou
-                # constraint lines would be misleading for the new scheme).
-                _thr_dict = dict(min_cls=global_floor) if args.floor_percentile > 0 else None
-            else:
-                _hist_title_base = 'Baseline score distributions'
-                _thr_dict = dict(
-                    min_cls=args.min_cls_thr,
-                    min_iou=args.min_iou_thr,
-                    hybrid_thr=args.hybrid_thr,
-                    iou_weight=args.iou_weight)
+            _scheme_str = f'keep_frac={args.keep_frac}'
+            if args.floor_percentile > 0:
+                _scheme_str += f', floor≥{global_floor:.3f} (P{args.floor_percentile:g})'
+            elif global_floor > 0:
+                _scheme_str += f', floor≥{global_floor:.3f} (fixed)'
+            if args.fallback_k > 0:
+                _scheme_str += f', fallback_k={args.fallback_k}'
+            if args.floor_before:
+                _scheme_str += ' [floor-before]'
+            if args.baseline_min_pts > 0:
+                _scheme_str += f', min_pts={args.baseline_min_pts}'
+            _hist_title_base = f'Baseline: per-scene keep-fraction ({_scheme_str})'
+            # Threshold overlay: the floor line only.
+            _thr_dict = dict(min_cls=global_floor) if global_floor > 0 else None
             if _use_gt_iou:
                 # First IoU axis: 3D GT IoU (or BEV if mode='bev')
                 _iou1       = bl_all_giou_3d if _gt_iou_mode in ('3d', 'both') else bl_all_giou_bev
@@ -2000,8 +1855,8 @@ def main():
                     scene_stats=(bl_scenes_with_boxes, n))
         else:
             print('--score-hist: no baseline scores collected '
-                  '(add --baseline-config/--baseline-ckpt or lower --hybrid-thr / '
-                  '--keep-frac).')
+                  '(add --baseline-config/--baseline-ckpt, or relax '
+                  '--keep-frac / --min-floor).')
 
 
 if __name__ == '__main__':

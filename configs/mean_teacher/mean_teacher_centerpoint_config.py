@@ -83,11 +83,11 @@ target_strong_pipeline = [  # KITTI — student training (strong augmentation)
         source_class_mapping=dict(Car='car'),
         db_path_prefix=source_data_root,
         sample_groups=dict(Car=5),
-        use_pred_boxes_for_collision=False,
-        iou_thresh=0.3,
+        use_pred_boxes_for_collision=False,  # no preds available in strong pipeline
+        iou_thresh=0.3,  # applied between injected instances (inter-instance collision)
         carve=True,
         carve_extra_width=(1.0, 0.5, 0.5),
-        size_normalize=dict(size_res=[-0.75, -0.34, -0.2]),
+        size_normalize=dict(size_res=[-0.71, -0.35, -0.16]),
         class_names=classes_kitti,
         points_loader=dict(
             type='LoadPointsFromFile',
@@ -223,7 +223,12 @@ model = dict(
     mean_teacher_cfg=dict(
         point_cloud_range=point_cloud_range,
         ema_momentum=0.9999,
-        update_teacher_buffers=False,
+        # EMA the teacher's DSNorm/BN buffers from the student so the teacher's
+        # target-domain running stats track KITTI (standard Mean-Teacher). With
+        # False the teacher normalised KITTI using frozen nuScenes stats while
+        # its affine params were EMA'd toward the student's KITTI-batch stats —
+        # a growing miscalibration. The EMA loop only touches float buffers.
+        update_teacher_buffers=True,
         use_bev_consistency=True,
         tau=0.07,
         # contrastive thresholds (independent of pseudo-label conf_threshold).
@@ -234,8 +239,8 @@ model = dict(
         # Warmup before contrastive loss fires: roi_extractor is randomly
         # initialised (not in the pretrained checkpoint) and would inject
         # noise into the backbone gradient until it learns meaningful BEV
-        # features.  1 epoch = 3769 iters at this dataset / batch size.
-        contrastive_warmup_iters=3769,
+        # features.  1 epoch = 3517 iters at this dataset / batch size.
+        contrastive_warmup_iters=3517,  # 1 epoch
         source_loss_weight=1.0,
         target_loss_weight=0.5,
         contrastive_weight=0.1,
@@ -247,6 +252,10 @@ model = dict(
         hybrid_w_iou=0,
         iou_warmup_iters=0,
         iou_distill_weight=0,
+        # Soft-quality weighting of pseudo-label losses (Stage 2). The quality
+        # weight is the teacher CLS score only (no cls+iou hybrid). enable=False
+        # ⇒ both heads fall back to hard targets (single master switch).
+        pseudo_loss_cfg=dict(enable_soft_quality=True),
     ),
     pretrained_ckpt=pretrained_ckpt,
 
@@ -292,9 +301,12 @@ model = dict(
             use_conv_for_no_stride=True),
 
         # RoI extractor for BEV contrastive consistency loss.
-        # in_channels=256 matches the SparseEncoder dense BEV output (128 * 2 Z-strides).
+        # in_channels=512 matches the SECONDFPN neck output (2 x 256) — the same
+        # detection representation the CenterHead regresses from. The contrastive
+        # loss now operates on neck features (not the pre-backbone SparseEncoder
+        # map) so it actually shapes the features used for box regression.
         roi_extractor_cfg=dict(
-            in_channels=256,
+            in_channels=512,
             out_channels=256,
             roi_size=7,
             voxel_size=voxel_size[0],
@@ -372,23 +384,36 @@ custom_hooks = [
         update_at_epochs=(0,),
         ps_batch_size=8,
         ps_num_workers=6,
-        # Per-scene keep-fraction: keep top 50% by CLS score per scene.
-        # iou_weight=0 → cls-only ranking (CenterPoint has no RoI-IoU head).
-        # cls_percentile=60 → adaptive CLS floor at the 60th percentile of the
-        #   global pooled score distribution (recomputed each refresh so it
-        #   drifts with teacher confidence). cls_thr=0 → no fixed absolute floor.
+        # Per-scene keep-fraction: keep top 70% by CLS score per scene, then a
+        # FIXED absolute CLS floor of 0.40 as a guard (cls-only ranking;
+        # CenterPoint has no RoI-IoU head).
+        # cls_thr=0.40 replaces the old adaptive cls_percentile (now 0/off)
+        # min_pts=10 drops sparse phantom FPs.
+        # Ordering: fraction-first, floor-as-guard (the hook's only mode).
+        # See floor_before note if changing.
         # coverage_gate_drop=0.10 → skip store update if coverage drops >10%.
-        keep_frac=0.4,
+        keep_frac=0.7,
         iou_weight=0,
         iou_thr=0.0,
-        cls_thr=0.0,
-        cls_percentile=60,
+        cls_thr=0.40,
+        cls_percentile=0,
         hybrid_thr=0.0,
         coverage_gate_drop=0.10,
         ps_min_score=0.05,
         use_top1_fallback=False,
         min_pts=10,
-        hard_instance_quantile=25),
+        hard_instance_quantile=25,
+        # Augmentation-consistency geometry QC: keep only boxes that
+        # reproduce under a BEV flip (teacher second view), 3D-IoU >= thresh.
+        # No target-domain priors. enabled=False ⇒ skip the second pass.
+        consistency_filter=dict(enabled=True, iou_thresh=0.5,
+                                direction='horizontal'),
+        # Stage 2 — Memory Ensemble & Voting (ST3D port): match each refresh
+        # against the persistent memory bank; matched boxes keep the higher
+        # score + reset counter, disappeared boxes age out (ignore@2, remove@3),
+        # new boxes are added. enabled=False ⇒ write the filtered store as-is.
+        memory_ensemble=dict(enabled=False, iou_thresh=0.1, ignore_thresh=2,
+                             rm_thresh=3, weighted=False)),
 ]
 
 train_cfg = dict(max_epochs=10, val_interval=1)
@@ -401,3 +426,15 @@ optim_wrapper = dict(
     optimizer=dict(type='AdamW', lr=1e-4, weight_decay=0.01),
     accumulative_counts=4,
     clip_grad=dict(max_norm=35, norm_type=2))
+
+# ── LR schedule ───────────────────────────────────────────────────────────────
+# Override the inherited cyclic-20e schedule, which COSINE-RAMPS lr UP from 1e-4
+# to 1e-3 over epochs 0-8 (eta_min=lr*10). On this 10-epoch adaptation that ramp
+# coincided exactly with the training collapse (lr reached ~8.7e-4 by epoch 6).
+# Adapting from a pretrained checkpoint wants a brief warmup then a DECAY.
+# Pattern matches configs/_base_/schedules/cosine.py.
+param_scheduler = [
+    dict(type='LinearLR', start_factor=0.1, by_epoch=False, begin=0, end=500),
+    dict(type='CosineAnnealingLR', begin=0, T_max=10, end=10,
+         by_epoch=True, eta_min=1e-6),
+]

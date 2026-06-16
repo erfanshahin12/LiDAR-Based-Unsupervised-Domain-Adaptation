@@ -1,3 +1,4 @@
+import copy
 import glob
 import os
 import pickle
@@ -14,6 +15,8 @@ from mmengine.runner import Runner
 from torch.utils.data import DataLoader
 
 from mmdet3d.registry import HOOKS
+from mmdet3d.engine.hooks.memory_ensemble import active_store, memory_ensemble
+from mmdet3d.structures.ops.iou3d_calculator import bbox_overlaps_3d
 
 
 def _ps_collate_fn(batch):
@@ -140,6 +143,8 @@ class PseudoLabelRefreshHook(Hook):
         use_top1_fallback: bool = True,
         min_pts: int = 5,
         hard_instance_quantile: float = 0.0,
+        memory_ensemble: Optional[dict] = None,
+        consistency_filter: Optional[dict] = None,
     ) -> None:
         self.interval = interval
         self.update_at_epochs = list(update_at_epochs)
@@ -158,8 +163,22 @@ class PseudoLabelRefreshHook(Hook):
         self.min_pts = min_pts
         self.hard_instance_quantile = hard_instance_quantile
 
+        # MEV (Memory Ensemble & Voting) and consistency-filter configs.
+        # Each is an independent on/off knob; absent or enabled=False = off.
+        self._memory_cfg = memory_ensemble or {}
+        self._consistency_cfg = consistency_filter or {}
+
         self._ps_loader: Optional[DataLoader] = None
         self._prev_coverage: Optional[float] = None
+        # Persistent memory bank (frame -> entry with memory_counter), kept on
+        # rank 0 across refreshes when MEV is enabled.
+        self._prev_store: dict = {}
+
+    def _mev_enabled(self) -> bool:
+        return bool(self._memory_cfg.get('enabled', False))
+
+    def _consistency_enabled(self) -> bool:
+        return bool(self._consistency_cfg.get('enabled', False))
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -289,7 +308,15 @@ class PseudoLabelRefreshHook(Hook):
             logger = MMLogger.get_current_instance()
             logger.info(
                 f'[PseudoLabelRefreshHook] Loading pseudo labels from {best_path}')
-            model.load_pseudo_labels_from_pkl(best_path)
+            if self._mev_enabled():
+                # The pkl is a memory bank: seed the bank for matching and feed
+                # the student only its active (non-ignored) subset.
+                with open(best_path, 'rb') as f:
+                    bank = pickle.load(f)
+                self._prev_store = bank
+                model.set_pseudo_labels(active_store(bank))
+            else:
+                model.load_pseudo_labels_from_pkl(best_path)
 
     @staticmethod
     def _scene_coverage(labels: dict):
@@ -367,11 +394,26 @@ class PseudoLabelRefreshHook(Hook):
         # gate on rank 0.
         accepted = True
         cov_new = 0.0
+        memory_bank = None  # full bank (with counters/ignored) → pkl, rank 0 only
         if rank == 0:
             raw_labels = new_labels
-            new_labels = self._apply_three_constraint_filter(new_labels, logger)
+            filtered = self._apply_three_constraint_filter(new_labels, logger)
             if self.use_top1_fallback:
-                new_labels = self._top1_fallback(new_labels, raw_labels, logger)
+                filtered = self._top1_fallback(filtered, raw_labels, logger)
+
+            # MEV: merge this refresh's boxes into the persistent memory bank.
+            # The bank (with memory_counter + ignore-flagged tracks) is what we
+            # persist; the student sees only the active subset.
+            if self._mev_enabled():
+                for e in filtered.values():
+                    e['memory_counter'] = np.zeros(
+                        len(e['gt_boxes']), dtype=np.int32)
+                memory_bank = memory_ensemble(
+                    self._prev_store, filtered, self._memory_cfg, logger)
+                new_labels = active_store(memory_bank)
+            else:
+                memory_bank = filtered
+                new_labels = filtered
 
             _, _, cov_new = self._scene_coverage(new_labels)
             prev_str = (f'{self._prev_coverage:.3f}'
@@ -395,10 +437,12 @@ class PseudoLabelRefreshHook(Hook):
         if rank == 0 and accepted:
             os.makedirs(ps_dir, exist_ok=True)
             pkl_path = os.path.join(ps_dir, f'ps_label_e{epoch}.pkl')
+            # Persist the full memory bank (carries memory_counter + ignore
+            # tracks) so resume + the next refresh can match against it.
             with open(pkl_path, 'wb') as f:
-                pickle.dump(new_labels, f)
+                pickle.dump(memory_bank, f)
             logger.info(
-                f'[PseudoLabelRefreshHook] Wrote {len(new_labels)} entries '
+                f'[PseudoLabelRefreshHook] Wrote {len(memory_bank)} entries '
                 f'to {pkl_path}')
 
         if world_size > 1:
@@ -418,6 +462,9 @@ class PseudoLabelRefreshHook(Hook):
             model.set_pseudo_labels(new_labels)
             if rank == 0:
                 self._prev_coverage = cov_new
+                # Roll the memory bank forward for the next refresh (rank 0
+                # owns it; MEV only ever runs on rank 0).
+                self._prev_store = memory_bank
             self._log_ps_stats(new_labels, logger)
             # Push adaptive hard-instance threshold to HardInstanceSampling.
             # All ranks have the same new_labels after DDP broadcast, so each
@@ -466,8 +513,16 @@ class PseudoLabelRefreshHook(Hook):
                 pred_list = model.teacher.predict(
                     data['inputs'], data['data_samples'])
 
-            for data_sample, pred, pts_xyz in zip(
-                    batch_data_samples, pred_list, pts_raw):
+            # Augmentation-consistency keep-masks (one bool array per frame),
+            # computed from a flipped second teacher view.  Empty when disabled.
+            if self._consistency_enabled():
+                cons_masks = self._consistency_keep_masks(
+                    model, batch_inputs, batch_data_samples, pred_list)
+            else:
+                cons_masks = [None] * len(batch_data_samples)
+
+            for data_sample, pred, pts_xyz, cons_mask in zip(
+                    batch_data_samples, pred_list, pts_raw, cons_masks):
                 key = data_sample.metainfo.get('lidar_path')
                 if key is None:
                     continue
@@ -482,6 +537,20 @@ class PseudoLabelRefreshHook(Hook):
                 scores_t = inst.scores_3d.cpu().numpy()
                 iou_t    = getattr(inst, 'iou_scores_3d', None)
                 cls_t    = getattr(inst, 'cls_scores_3d', None)
+
+                # Drop boxes that did not reproduce under the flipped view.
+                # ``cons_mask`` was computed on the pre-filter prediction, which
+                # is the same box order as ``inst`` (filter_teacher_predictions
+                # only re-thresholds; here conf_threshold == ps_min_score, a
+                # broad pre-floor that keeps the full NMS-survivor set).
+                if cons_mask is not None and len(cons_mask) == len(boxes_t):
+                    boxes_t  = boxes_t[cons_mask]
+                    labels_t = labels_t[cons_mask]
+                    scores_t = scores_t[cons_mask]
+                    if iou_t is not None:
+                        iou_t = iou_t[cons_mask]
+                    if cls_t is not None:
+                        cls_t = cls_t[cons_mask]
 
                 # Interior point count per box (used by min_pts guard).
                 if pts_xyz is not None and len(boxes_t) > 0 and len(pts_xyz) > 0:
@@ -510,6 +579,63 @@ class PseudoLabelRefreshHook(Hook):
             f'pseudo-boxes across {len(new_labels)} frames '
             f'(pre-floor={self.ps_min_score})')
         return new_labels
+
+    def _consistency_keep_masks(self, model, batch_inputs, batch_data_samples,
+                                pred_list) -> list:
+        """Per-frame bool keep-masks from an augmentation-consistency check.
+
+        Runs the teacher a second time on a BEV-flipped copy of each point
+        cloud, un-flips the resulting boxes back to the canonical frame, and
+        keeps only the original (weak-view) boxes that reproduce there with
+        rotated-3D-IoU ≥ ``consistency_filter.iou_thresh``.  Boxes whose
+        geometry is unstable under the flip — the drift signature — are dropped.
+        No target-domain priors are used.
+
+        The flip pass uses a **deep copy** of ``batch_data_samples`` because
+        ``predict`` writes ``pred_instances_3d`` into the samples in place;
+        re-using the originals would clobber the weak ``pred_list``.
+        """
+        direction = self._consistency_cfg.get('direction', 'horizontal')
+        thr = float(self._consistency_cfg.get('iou_thresh', 0.5))
+        flip_axis = 1 if direction == 'horizontal' else 0  # LiDAR: h→y, v→x
+
+        flipped_points = []
+        for p in batch_inputs['points']:
+            pf = p.clone() if isinstance(p, torch.Tensor) \
+                else torch.as_tensor(np.asarray(p))
+            pf = pf.clone()
+            pf[:, flip_axis] = -pf[:, flip_axis]
+            flipped_points.append(pf)
+
+        flip_samples = copy.deepcopy(batch_data_samples)
+        with torch.no_grad():
+            data_f = model.teacher.data_preprocessor(
+                {'inputs': {'points': flipped_points},
+                 'data_samples': flip_samples},
+                training=False)
+            pred_f = model.teacher.predict(
+                data_f['inputs'], data_f['data_samples'])
+
+        dev = 'cuda' if torch.cuda.is_available() else 'cpu'
+        masks = []
+        for pred, predf in zip(pred_list, pred_f):
+            boxes = pred.pred_instances_3d.bboxes_3d
+            boxesf = predf.pred_instances_3d.bboxes_3d
+            n = len(boxes)
+            if n == 0:
+                masks.append(np.zeros(0, dtype=bool))
+                continue
+            if len(boxesf) == 0:
+                masks.append(np.zeros(n, dtype=bool))
+                continue
+            boxesf_un = boxesf.clone()
+            boxesf_un.flip(direction)  # flip is its own inverse → canonical frame
+            ta = boxes.tensor[:, :7].to(dev).float()
+            tb = boxesf_un.tensor[:, :7].to(dev).float()
+            iou = bbox_overlaps_3d(ta, tb, mode='iou', coordinate='lidar')
+            keep = (iou.max(dim=1).values >= thr).cpu().numpy()
+            masks.append(keep)
+        return masks
 
     # ------------------------------------------------------------------
     # Keep-fraction filter

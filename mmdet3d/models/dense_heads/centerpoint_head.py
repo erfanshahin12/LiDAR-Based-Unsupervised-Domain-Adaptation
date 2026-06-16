@@ -427,7 +427,7 @@ class CenterHead(BaseModule):
                 - list[torch.Tensor]: Masks indicating which
                     boxes are valid.
         """
-        heatmaps, anno_boxes, inds, masks = multi_apply(
+        heatmaps, anno_boxes, inds, masks, qualities = multi_apply(
             self.get_targets_single, batch_gt_instances_3d)
         # Transpose heatmaps
         heatmaps = list(map(list, zip(*heatmaps)))
@@ -441,7 +441,10 @@ class CenterHead(BaseModule):
         # Transpose inds
         masks = list(map(list, zip(*masks)))
         masks = [torch.stack(masks_) for masks_ in masks]
-        return heatmaps, anno_boxes, inds, masks
+        # Transpose per-object soft-quality weights → per-task [B, max_objs].
+        qualities = list(map(list, zip(*qualities)))
+        qualities = [torch.stack(quals_) for quals_ in qualities]
+        return heatmaps, anno_boxes, inds, masks, qualities
 
     def get_targets_single(self,
                            gt_instances_3d: InstanceData) -> Tuple[Tensor]:
@@ -469,6 +472,15 @@ class CenterHead(BaseModule):
         gt_bboxes_3d = torch.cat(
             (gt_bboxes_3d.gravity_center, gt_bboxes_3d.tensor[:, 3:]),
             dim=1).to(device)
+        # Per-box soft-quality weight (cls score for pseudo boxes attached by
+        # the Mean-Teacher detector; absent ⇒ 1.0, an exact no-op for source
+        # GT). Used to down-weight the bbox regression of low-confidence
+        # pseudo-labels. Length matches gt_labels_3d (original GT order).
+        if hasattr(gt_instances_3d, 'quality_weights_3d'):
+            quality_3d = gt_instances_3d.quality_weights_3d.to(
+                device=device, dtype=torch.float32)
+        else:
+            quality_3d = gt_bboxes_3d.new_ones(len(gt_labels_3d))
         # gt_bboxes_3d is [N,7] without velocity or [N,9] with velocity
         use_vel = gt_bboxes_3d.shape[-1] > 7
         anno_box_size = 10 if use_vel else 8
@@ -491,19 +503,23 @@ class CenterHead(BaseModule):
 
         task_boxes = []
         task_classes = []
+        task_qualities = []
         flag2 = 0
         for idx, mask in enumerate(task_masks):
             task_box = []
             task_class = []
+            task_quality = []
             for m in mask:
                 task_box.append(gt_bboxes_3d[m])
                 # 0 is background for each task, so we need to add 1 here.
                 task_class.append(gt_labels_3d[m] + 1 - flag2)
+                task_quality.append(quality_3d[m])
             task_boxes.append(torch.cat(task_box, axis=0).to(device))
             task_classes.append(torch.cat(task_class).long().to(device))
+            task_qualities.append(torch.cat(task_quality).to(device))
             flag2 += len(mask)
         draw_gaussian = draw_heatmap_gaussian
-        heatmaps, anno_boxes, inds, masks = [], [], [], []
+        heatmaps, anno_boxes, inds, masks, qualities = [], [], [], [], []
 
         for idx, task_head in enumerate(self.task_heads):
             heatmap = gt_bboxes_3d.new_zeros(
@@ -515,6 +531,9 @@ class CenterHead(BaseModule):
 
             ind = gt_labels_3d.new_zeros((max_objs), dtype=torch.int64)
             mask = gt_bboxes_3d.new_zeros((max_objs), dtype=torch.uint8)
+            # Per-slot soft-quality weight; defaults to 1.0 for empty slots
+            # (they are masked out anyway).
+            qual = gt_bboxes_3d.new_ones((max_objs), dtype=torch.float32)
 
             num_objs = min(task_boxes[idx].shape[0], max_objs)
 
@@ -567,6 +586,7 @@ class CenterHead(BaseModule):
 
                     ind[new_idx] = y * feature_map_size[0] + x
                     mask[new_idx] = 1
+                    qual[new_idx] = task_qualities[idx][k]
                     rot = task_boxes[idx][k][6]
                     box_dim = task_boxes[idx][k][3:6]
                     if self.norm_bbox:
@@ -586,7 +606,8 @@ class CenterHead(BaseModule):
             anno_boxes.append(anno_box)
             masks.append(mask)
             inds.append(ind)
-        return heatmaps, anno_boxes, inds, masks
+            qualities.append(qual)
+        return heatmaps, anno_boxes, inds, masks, qualities
 
     def loss(self, pts_feats: List[Tensor],
              batch_data_samples: List[Det3DDataSample], *args,
@@ -627,7 +648,7 @@ class CenterHead(BaseModule):
             dict[str,torch.Tensor]: Loss of heatmap and bbox of each task.
         """
 
-        heatmaps, anno_boxes, inds, masks = self.get_targets(
+        heatmaps, anno_boxes, inds, masks, qualities = self.get_targets(
             batch_gt_instances_3d)
         loss_dict = dict()
         for task_id, preds_dict in enumerate(preds_dicts):
@@ -660,6 +681,11 @@ class CenterHead(BaseModule):
 
             code_weights = self.train_cfg.get('code_weights', None)
             bbox_weights = mask * mask.new_tensor(code_weights)
+            # Scale each object's regression weight by its soft-quality weight
+            # (cls score for pseudo boxes; 1.0 for source GT ⇒ no-op). Shapes:
+            # bbox_weights [B, max_objs, code_size], qualities [B, max_objs].
+            qual = qualities[task_id].to(bbox_weights.dtype)
+            bbox_weights = bbox_weights * qual.unsqueeze(-1)
             loss_bbox = self.loss_bbox(
                 pred, target_box, bbox_weights, avg_factor=(num + 1e-4))
             loss_dict[f'task{task_id}.loss_heatmap'] = loss_heatmap

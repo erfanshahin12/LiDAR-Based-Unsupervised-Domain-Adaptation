@@ -254,13 +254,20 @@ class HardInstanceSampling(BaseTransform):
         if threshold == float('inf'):
             threshold = None  # no filtering before first pseudo-label refresh
 
-        # Existing boxes for collision detection.
+        # Seed collision set from scene boxes already in results (if any).
+        # In the strong pipeline load_eval_anns=False so gt_bboxes_3d is absent
+        # and pred_bboxes_3d is never produced before this transform — seed_boxes
+        # will be None and we rely solely on the inter-instance check below.
         if self.use_pred_boxes_for_collision and 'pred_bboxes_3d' in results:
-            existing_boxes = results['pred_bboxes_3d']
+            seed_boxes = results['pred_bboxes_3d']
         elif 'gt_bboxes_3d' in results:
-            existing_boxes = results['gt_bboxes_3d']
+            seed_boxes = results['gt_bboxes_3d']
         else:
-            existing_boxes = None
+            seed_boxes = None
+
+        # placed_boxes accumulates every accepted injection so that subsequent
+        # candidates are checked against already-placed instances.
+        placed_np: List[np.ndarray] = []   # list of (1, 7) arrays
 
         sampled_boxes: List[np.ndarray] = []
         sampled_labels: List[int] = []
@@ -283,9 +290,20 @@ class HardInstanceSampling(BaseTransform):
                 if self.size_normalize is not None:
                     pts, box = self._apply_size_normalize(pts, box)
 
-                if existing_boxes is not None and self._has_collision(box, existing_boxes):
+                # Check against scene boxes (if available).
+                if seed_boxes is not None and self._has_collision(box, seed_boxes):
                     continue
 
+                # Check against already-placed injected instances.
+                if placed_np:
+                    placed_boxes_obj = LiDARInstance3DBoxes(
+                        torch.from_numpy(
+                            np.concatenate(placed_np, axis=0)[:, :7]).float(),
+                        box_dim=7, origin=(0.5, 0.5, 0))
+                    if self._has_collision(box, placed_boxes_obj):
+                        continue
+
+                placed_np.append(box)
                 sampled_boxes.append(box)
                 sampled_labels.append(label)
                 sampled_points_list.append(pts)
@@ -308,7 +326,7 @@ class HardInstanceSampling(BaseTransform):
         """Emit empty GT keys when nothing is injected so Pack3DDetInputs works."""
         if 'gt_bboxes_3d' not in results:
             results['gt_bboxes_3d'] = LiDARInstance3DBoxes(
-                torch.zeros((0, 7), dtype=torch.float32), origin=(0.5, 0.5, 0.5))
+                torch.zeros((0, 7), dtype=torch.float32), origin=(0.5, 0.5, 0))
         if 'gt_labels_3d' not in results:
             results['gt_labels_3d'] = np.array([], dtype=np.int64)
 
@@ -439,24 +457,20 @@ class HardInstanceSampling(BaseTransform):
         else:
             pts_np = np.asarray(orig_pts, dtype=np.float32).copy()
 
-        # ── Determine box origin (consistent with scene after KittiToNuscenes) ─
-        if 'gt_bboxes_3d' in results and hasattr(results['gt_bboxes_3d'], 'origin'):
-            origin = results['gt_bboxes_3d'].origin
-        else:
-            origin = (0.5, 0.5, 0.5)   # nuScenes frame default
+        # nuScenes dbinfos store box3d_lidar with bottom-center z (verified
+        # empirically: local points fall in [0, h], not [-h/2, h/2]).
+        # Use origin=(0.5, 0.5, 0) so LiDARInstance3DBoxes treats z as bottom-z.
+        origin = (0.5, 0.5, 0)
 
         # ── CMT carving: remove scene points inside enlarged injected boxes ──
         if self.carve and new_boxes_np.shape[0] > 0:
             from mmdet3d.structures.ops.box_np_ops import points_in_rbbox
             carved_boxes = new_boxes_np[:, :7].copy()
             carved_boxes[:, 3:6] += 2.0 * self.carve_extra_width   # grow l,w,h
-            # points_in_rbbox expects bottom-centre origin (0.5, 0.5, 0).
-            # After KittiToNuscenes the boxes sit at nuScenes origin (0.5,0.5,0.5).
-            # Shift z-centre down by h/2 to match points_in_rbbox convention.
-            carved_boxes_bc = carved_boxes.copy()
-            carved_boxes_bc[:, 2] -= carved_boxes_bc[:, 5] / 2.0
+            # box3d_lidar z is already bottom-center; points_in_rbbox with
+            # origin=(0.5, 0.5, 0) expects bottom-center — no z shift needed.
             inside = points_in_rbbox(
-                pts_np[:, :3], carved_boxes_bc, z_axis=2, origin=(0.5, 0.5, 0))
+                pts_np[:, :3], carved_boxes, z_axis=2, origin=(0.5, 0.5, 0))
             keep = ~inside.any(axis=1)
             pts_np = pts_np[keep]
 

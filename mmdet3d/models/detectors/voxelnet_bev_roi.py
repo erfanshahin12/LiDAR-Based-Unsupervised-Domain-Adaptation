@@ -123,18 +123,22 @@ class VoxelNetBEVRoI(VoxelNet):
         predictions = self.add_pred_to_datasample(
             batch_data_samples, results_list)
 
-        for i, data_sample in enumerate(predictions):
-            if (return_bev_features or self.return_bev_features) \
-                    and bev_features is not None:
-                data_sample.bev_features = bev_features[i]
-
-            if (return_roi_features or self.return_roi_features) \
-                    and self.roi_extractor is not None \
-                    and bev_features is not None:
-                boxes_3d = data_sample.pred_instances_3d.bboxes_3d
-                data_sample.roi_features = \
-                    self.roi_extractor.extract_roi_features(
-                        bev_features[i], boxes_3d)
+        # Per-sample NECK map (the detection representation the head regresses
+        # from) for the Mean-Teacher contrastive / RoI consistency loss. The
+        # iou_mlp above still receives the pre-backbone scatter map via
+        # kwargs['bev_features']; the two paths are independent.
+        if (return_bev_features or self.return_bev_features
+                or return_roi_features or self.return_roi_features):
+            neck_map = x[0] if isinstance(x, (list, tuple)) else x
+            for i, data_sample in enumerate(predictions):
+                if return_bev_features or self.return_bev_features:
+                    data_sample.bev_features = neck_map[i]
+                if (return_roi_features or self.return_roi_features) \
+                        and self.roi_extractor is not None:
+                    boxes_3d = data_sample.pred_instances_3d.bboxes_3d
+                    data_sample.roi_features = \
+                        self.roi_extractor.extract_roi_features(
+                            neck_map[i], boxes_3d)
 
         return predictions
 

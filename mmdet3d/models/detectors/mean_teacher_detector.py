@@ -189,9 +189,8 @@ class MeanTeacher3DDetector(Base3DDetector):
     def _pseudo_loss_cfg(self) -> dict:
         """Return pseudo_loss_cfg with defaults filled in."""
         defaults = dict(
+            enable_soft_quality=True,   # master on/off for soft-quality weighting
             use_soft_cls_targets=True,
-            cls_score_weight=0.5,
-            iou_score_weight=0.5,
             min_quality_weight=0.0,
             normalize_quality_weights=False,
             weight_bbox_by_quality=True,
@@ -203,11 +202,16 @@ class MeanTeacher3DDetector(Base3DDetector):
     def _attach_pseudo_meta(self, gt, cls_scores_t, iou_scores_t, device):
         """Attach soft-target metadata to a pseudo GT InstanceData.
 
-        Computes a hybrid quality weight from cls and IoU scores, then
-        attaches ``cls_scores_3d``, ``iou_scores_3d``, and
-        ``quality_weights_3d`` to ``gt`` according to ``pseudo_loss_cfg``.
-        Empty-box batches receive zero-length tensors so downstream code
-        can always rely on the fields being present.
+        The quality weight is the teacher **classification score only** — the
+        single confidence signal shared by both detector heads (CenterPoint has
+        no IoU head, so its ``iou_scores`` just mirror ``scores``). The former
+        ``0.5·cls + 0.5·iou`` hybrid is dropped. Attaches ``cls_scores_3d``,
+        ``iou_scores_3d`` and ``quality_weights_3d`` per ``pseudo_loss_cfg``.
+
+        Master switch: when ``enable_soft_quality=False`` nothing is attached,
+        so both heads fall back to hard targets — Anchor3D via its ``hasattr``
+        checks, CenterHead via its default-1.0 quality. This is the single point
+        that toggles soft-quality across both architectures.
 
         Args:
             gt: InstanceData whose ``bboxes_3d`` is already set.
@@ -216,8 +220,9 @@ class MeanTeacher3DDetector(Base3DDetector):
             device: torch device.
         """
         pcfg = self._pseudo_loss_cfg()
-        w_cls = float(pcfg['cls_score_weight'])
-        w_iou = float(pcfg['iou_score_weight'])
+        if not pcfg.get('enable_soft_quality', True):
+            return  # soft-quality disabled → attach nothing (hard targets)
+
         min_q  = float(pcfg['min_quality_weight'])
         norm_q = bool(pcfg['normalize_quality_weights'])
 
@@ -228,8 +233,8 @@ class MeanTeacher3DDetector(Base3DDetector):
         cls_t = cls_scores_t.to(device=device, dtype=torch.float32)
         iou_t = iou_scores_t.to(device=device, dtype=torch.float32)
 
-        quality = w_cls * cls_t + w_iou * iou_t
-        quality = quality.clamp(min=min_q)
+        # Cls-only quality (hybrid cls+iou dropped per Stage-2 decision).
+        quality = cls_t.clamp(min=min_q)
         if norm_q and quality.numel() > 0 and quality.max() > 0:
             quality = quality / quality.max()
 
@@ -451,7 +456,6 @@ class MeanTeacher3DDetector(Base3DDetector):
             A new prediction object with low-confidence boxes removed.
             ``bev_features`` is preserved unchanged.
         """
-        verbose = self.mean_teacher_cfg.get('verbose', False)
         conf_threshold = self.mean_teacher_cfg.get('conf_threshold', 0.6)
         w_iou_eff = self._hybrid_effective_w_iou()
 
@@ -491,14 +495,14 @@ class MeanTeacher3DDetector(Base3DDetector):
     def contrastive_loss(self, bev_s, bev_t, boxes_anchor, boxes_pos,
                          all_boxes_t=None, all_scores_t=None,
                          neg_threshold=0.25, tau=0.07):
-        """Single-direction multi-positive InfoNCE on RoI-pooled BEV features.
+        """Instance-aligned cross-view InfoNCE on RoI-pooled neck features.
 
         Anchors   = student RoI features at teacher-fg boxes in the strong frame (grad ON).
-        Positives = teacher RoI features at the same fg boxes in the weak frame (no_grad).
-        Negatives = teacher fg (the positives themselves) ∪ teacher bg (score <= neg_threshold).
+        Positives = teacher RoI features at the same fg boxes in the weak frame (no_grad);
+                    anchor i is paired with positive i (the same physical object).
+        Negatives = the other instances' positives ∪ teacher bg (score <= neg_threshold).
 
-        Loss = -logsumexp(sim_pos - logsumexp(sim_neg, dim=1), dim=1).mean()
-        where sim_pos = F_a @ F_pos.T / τ  (all-pairs, [N, N]).
+        Loss = cross_entropy(F_a @ [F_pos; F_bg].T / τ, target=i).
 
         Args:
             bev_s: Student BEV feature map [C, H, W], strong-aug frame, grad ON.
@@ -541,14 +545,16 @@ class MeanTeacher3DDetector(Base3DDetector):
                         roi.extract_roi_features(bev_t, LiDARInstance3DBoxes(bg_boxes)),
                         dim=1)   # [N_bg, C]
 
-        # Negatives = teacher fg (positives) + teacher bg.
-        F_neg = torch.cat([F_pos, F_bg], dim=0) if F_bg is not None else F_pos
-
-        # Single-direction multi-positive InfoNCE
-        sim_pos = torch.mm(F_a, F_pos.T) / tau                              # [N, N]
-        sim_neg = torch.mm(F_a, F_neg.T) / tau                              # [N, N+N_bg]
-        neg_lse = torch.logsumexp(sim_neg, dim=1, keepdim=True)             # [N, 1]
-        loss = -torch.logsumexp(sim_pos - neg_lse, dim=1).mean()
+        # Instance-aligned InfoNCE: anchor i's positive is the SAME object in the
+        # teacher's weak view (column i); every other positive (other instances)
+        # and every background RoI are negatives. Preserves per-instance
+        # discrimination — pulling each anchor toward ALL foreground would
+        # homogenise features and harm box regression now that the loss shapes
+        # the detection neck.
+        keys = torch.cat([F_pos, F_bg], dim=0) if F_bg is not None else F_pos  # [N+N_bg, C]
+        logits = torch.mm(F_a, keys.T) / tau                                  # [N, N+N_bg]
+        targets = torch.arange(N, device=device)
+        loss = F.cross_entropy(logits, targets)
 
         return loss
 
@@ -746,7 +752,6 @@ class MeanTeacher3DDetector(Base3DDetector):
         w_source = self.mean_teacher_cfg.get('source_loss_weight', 1.0)
         w_target = self.mean_teacher_cfg.get('target_loss_weight', 0.5)
         w_cont   = self.mean_teacher_cfg.get('contrastive_weight', 0.1)
-        verbose  = self.mean_teacher_cfg.get('verbose', False)
         _use_dsnorm = self.mean_teacher_cfg.get('use_dsnorm', False)
 
         if _use_dsnorm:
@@ -807,16 +812,6 @@ class MeanTeacher3DDetector(Base3DDetector):
         self.teacher.train()
 
         filtered_preds = [self.filter_teacher_predictions(p) for p in teacher_pred]
-        if verbose:
-            conf_thr_log = self.mean_teacher_cfg.get('conf_threshold', 0.6)
-            total_before = sum(len(p.pred_instances_3d.scores_3d) for p in teacher_pred)
-            total_after  = sum(len(p.pred_instances_3d.scores_3d) for p in filtered_preds)
-            per_sample   = [len(p.pred_instances_3d.scores_3d) for p in filtered_preds]
-            logger.info(
-                f'[Filter] kept {total_after}/{total_before} boxes across '
-                f'{len(filtered_preds)} samples (thresh={conf_thr_log:.2f})  '
-                f'per-sample: {per_sample}')
-
         transformed_preds = copy.deepcopy(filtered_preds)
 
         for pred, samp in zip(transformed_preds, target_samp_strong):
@@ -834,16 +829,21 @@ class MeanTeacher3DDetector(Base3DDetector):
             pseudo_samples = self._create_pseudo_labels(
                 transformed_preds, target_samp_strong)
 
-        # Extract student features once — neck features for pseudo-label loss,
-        # BEV features for contrastive loss — avoiding a second forward pass.
+        # Extract student neck features once — used for BOTH the pseudo-label
+        # loss and the contrastive loss. The contrastive loss now operates on the
+        # neck (detection) representation, not the pre-backbone SparseEncoder map,
+        # so it shapes the features the box-regression head actually consumes.
         # VoxelNetBEVRoI returns a 2-tuple (pts_feats, bev); CenterPointBEVRoI
         # returns a 3-tuple (img_feats, pts_feats, bev) — unpack accordingly.
         _ds_switch(self.student, 'target')
         _feats = self.student.extract_feat(target_strong_in, return_bev=True)
         if len(_feats) == 3:
-            _, x_strong, bev_features_student = _feats
+            _, x_strong, _ = _feats
         else:
-            x_strong, bev_features_student = _feats
+            x_strong, _ = _feats
+        # Per-sample neck map for contrastive RoI pooling (SECONDFPN returns a
+        # single-level list; unwrap to a [B, C, H, W] tensor before indexing).
+        neck_student = x_strong[0] if isinstance(x_strong, (list, tuple)) else x_strong
 
         # Effective distill weight (0 during warmup or when disabled).
         w_iou_distill = self._iou_distill_weight()
@@ -919,7 +919,7 @@ class MeanTeacher3DDetector(Base3DDetector):
                     target_samp_strong[i].metainfo).tensor  # strong frame
 
                 loss_i = self.contrastive_loss(
-                    bev_features_student[i], bev_t, boxes_anchor, boxes_pos,
+                    neck_student[i], bev_t, boxes_anchor, boxes_pos,
                     all_boxes_t=all_boxes_t, all_scores_t=all_scores_t,
                     neg_threshold=neg_thr, tau=tau,
                 )

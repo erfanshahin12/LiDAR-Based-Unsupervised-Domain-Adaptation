@@ -133,8 +133,8 @@ target_strong_pipeline = [       # KITTI      # sent to student model for unsupe
         source_class_mapping=dict(Car='car'),       # nuScenes 'car' → KITTI 'Car'
         db_path_prefix=source_data_root,            # resolve relative DB point-file paths
         sample_groups=dict(Car=5),
-        use_pred_boxes_for_collision=False,          # strong pass has no prior preds
-        iou_thresh=0.3,
+        use_pred_boxes_for_collision=False,          # no preds available in strong pipeline
+        iou_thresh=0.3,  # applied between injected instances (inter-instance collision)
         carve=True,                                 # CMT: remove returns in insertion zone
         carve_extra_width=(1.0, 0.5, 0.5),          # (dl, dw, dh) expand for carve
         size_normalize=dict(size_res=[-0.75, -0.34, -0.2]),  # match source pipeline shrink
@@ -285,10 +285,10 @@ model = dict(
     type='MeanTeacher3DDetector',
     mean_teacher_cfg=dict(
                      point_cloud_range=point_cloud_range,
-                     ema_momentum=0.999,
-                     update_teacher_buffers=False,      # teacher updates its own DSNorm target stats via .train()
-                                                        # on weak-aug KITTI; EMA of stats would contaminate with
-                                                        # student's strong-aug stats causing confidence collapse
+                     ema_momentum=0.9999,
+                     update_teacher_buffers=True,       # EMA teacher BN/DSNorm buffers along with params so
+                                                        # teacher's target-domain running stats stay aligned with
+                                                        # its EMA'd affine weights (frozen buffers = miscalibration)
                      use_bev_consistency=True,
                      tau=0.07,
                      # CMT contrastive thresholds (independent of pseudo-label conf_threshold).
@@ -299,15 +299,15 @@ model = dict(
                      # Warmup before contrastive loss fires: roi_extractor is randomly
                      # initialised (not in the pretrained checkpoint) and would inject
                      # noise into the backbone gradient until it learns meaningful BEV
-                     # features.  1 epoch = 3769 iters at this dataset / batch size.
-                     contrastive_warmup_iters=3769,
+                     # features.  1 epoch = 3517 iters at this dataset / batch size.
+                     contrastive_warmup_iters=3517,
                      # NOTE: conf_threshold here governs only the online store-empty training
                      # path (filter_teacher_predictions called per-iteration when the store
                      # is empty).  PseudoLabelRefreshHook temporarily overrides this value
                      # to ps_min_score during the refresh inference pass, then restores it.
                      source_loss_weight=1.0,
                      target_loss_weight=0.5,
-                     contrastive_weight=0.05,
+                     contrastive_weight=0.1,
                      verbose=True,
                      eval_use_teacher=True,
                      use_dsnorm=True,
@@ -323,24 +323,16 @@ model = dict(
                      # KITTI scene (no pseudo-label boxes, no localization noise).
                      # suppress_target_iou_loss drops loss_iou from TERM 2 when
                      # distillation is active, avoiding the noisy feedback loop.
-                     iou_distill_weight=0.5,
-                     iou_distill_warmup_iters=1000,
-                     suppress_target_iou_loss=True,
-                     # ── Quality-weighted pseudo-label distillation ──────────
-                     # Feature-level IoU distillation BCE is weighted by the
-                     # teacher's own IoU map so high-quality regions dominate.
-                     iou_distill_quality_weight=True,
-                     # Per-pseudo-box soft-target distillation.
-                     # All flags default to True; set individual flags False
-                     # to ablate each component independently.
+                     iou_distill_weight=0.0,
+                     # Soft-quality weighting of pseudo-label losses (Stage 2).
+                     # quality = teacher CLS score only (no cls+iou hybrid).
+                     # Anchor3D already consumes the attached fields; this knob
+                     # toggles them. enable=False ⇒ hard targets (single switch).
                      pseudo_loss_cfg=dict(
-                         use_soft_cls_targets=True,     # soft BCE instead of hard focal for pseudo positives
-                         cls_score_weight=0.8,          # weight of cls score in hybrid quality
-                         iou_score_weight=0.2,          # weight of IoU score in hybrid quality
-                         min_quality_weight=0.0,        # floor for quality weight (0 = no floor)
-                         normalize_quality_weights=False,  # normalize quality across batch
-                         weight_bbox_by_quality=True,   # scale bbox regression loss by quality
-                         weight_dir_by_quality=True,    # scale dir classification loss by quality
+                         enable_soft_quality=True,
+                         use_soft_cls_targets=True,    # soft BCE for pseudo positives
+                         weight_bbox_by_quality=True,  # scale bbox loss by quality
+                         weight_dir_by_quality=True,   # scale dir loss by quality
                      ),
                  ),
     pretrained_ckpt=pretrained_ckpt,
@@ -383,10 +375,12 @@ model = dict(
             upsample_strides=[1, 2, 4],
             out_channels=[128, 128, 128]),
 
-        # RoI feature extractor for MeanTeacher contrastive/BEV-consistency loss
-        # (matches middle_encoder output: 64ch BEV map).
+        # RoI feature extractor for MeanTeacher contrastive/BEV-consistency loss.
+        # in_channels=384 matches the SECONDFPN neck output (3 x 128) — the
+        # contrastive loss now operates on the neck (detection) features the
+        # head regresses from, not the pre-backbone 64ch scatter map.
         roi_extractor_cfg=dict(
-            in_channels=64,
+            in_channels=384,
             out_channels=256,
             roi_size=7,
             voxel_size=voxel_size[0],
@@ -499,25 +493,38 @@ custom_hooks = [
         update_at_epochs=(0,),  # always refresh before epoch 0 starts
         ps_batch_size=8,
         ps_num_workers=6,
-        # Per-scene keep-fraction: keep top 50% by CLS score per scene.
-        # iou_weight=0 → cls-only ranking for now (even though this checkpoint
-        # has an IoU head, we use cls scores for consistency with CenterPoint).
-        # cls_percentile=60 → adaptive CLS floor at the 60th percentile of the
-        #   global pooled score distribution (recomputed each refresh so it
-        #   drifts with teacher confidence). cls_thr=0 → no fixed absolute floor.
+        # Per-scene keep-fraction: keep top 60% by CLS score per scene, then a
+        # FIXED absolute CLS floor of 0.40 as a guard. iou_weight=0 → cls-only
+        # ranking (this checkpoint has an IoU head, but we use cls for consistency
+        # with CenterPoint; IoU head still trains via the MT detector).
+        # cls_thr=0.40 replaces the old adaptive cls_percentile (now 0/off): the
+        #   percentile floor was pro-cyclical — it slid down as the teacher
+        #   degraded, scooping in the FP flood that drove the collapse. A fixed
+        #   floor is self-limiting. min_pts=10 drops sparse phantom FPs.
+        # Ordering: fraction-first, floor-as-guard (the hook's only mode).
         # coverage_gate_drop=0.10 → skip store update if coverage drops >10%.
-        # (IoU head still trains normally via iou_distill_weight in mean_teacher_cfg.)
-        keep_frac=0.4,
+        keep_frac=0.6,
         iou_weight=0,
         iou_thr=0.0,
-        cls_thr=0.0,
-        cls_percentile=60,
+        cls_thr=0.40,
+        cls_percentile=0,
         hybrid_thr=0.0,
         coverage_gate_drop=0.10,
         ps_min_score=0.05,
         use_top1_fallback=False,
-        min_pts=5,
+        min_pts=10,
         hard_instance_quantile=25,
+        # Stage 2 — augmentation-consistency geometry QC: keep only boxes that
+        # reproduce under a BEV flip (teacher second view), 3D-IoU >= thresh.
+        # No target-domain priors. enabled=False ⇒ skip the second pass.
+        consistency_filter=dict(enabled=True, iou_thresh=0.5,
+                                direction='horizontal'),
+        # Stage 2 — Memory Ensemble & Voting (ST3D port): match each refresh
+        # against the persistent memory bank; matched boxes keep the higher
+        # score + reset counter, disappeared boxes age out (ignore@2, remove@3),
+        # new boxes are added. enabled=False ⇒ write the filtered store as-is.
+        memory_ensemble=dict(enabled=True, iou_thresh=0.1, ignore_thresh=2,
+                             rm_thresh=3, weighted=False),
     ),
 ]
 
@@ -527,6 +534,15 @@ train_cfg = dict(type='EpochBasedTrainLoop', max_epochs=7, val_interval=2)
 # Gradient accumulation with 8 steps to achieve effective batch size of 32 (8 x 4)
 optim_wrapper = dict(type='AmpOptimWrapper',
                      loss_scale='dynamic',
-                     optimizer=dict(type='AdamW', lr=0.001, weight_decay=0.01),
+                     optimizer=dict(type='AdamW', lr=1e-4, weight_decay=0.01),
                      accumulative_counts=4,
                      clip_grad=dict(max_norm=35, norm_type=2))
+
+# Override schedule-2x's MultiStepLR (milestones at epochs 20 & 23 — never fires in
+# a 7-epoch run, so LR would stay at 1e-4 flat).  Short warmup + cosine decay mirrors
+# the CenterPoint Stage-1 fix that resolved the collapse (T_max=7 for this run length).
+param_scheduler = [
+    dict(type='LinearLR', start_factor=0.1, by_epoch=False, begin=0, end=500),
+    dict(type='CosineAnnealingLR', begin=0, T_max=7, end=7,
+         by_epoch=True, eta_min=1e-6),
+]
