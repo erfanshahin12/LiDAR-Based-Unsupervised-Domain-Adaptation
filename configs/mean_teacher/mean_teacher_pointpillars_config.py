@@ -29,23 +29,7 @@ metainfo = dict(
         origin=(0.5, 0.5, 0.5))
 backend_args = None
 
-# Dataset
-# db_sampler_kitti= dict(
-#     data_root=target_data_root,
-#     info_path=target_data_root + 'kitti_dbinfos_train.pkl',
-#     rate=1.0,
-#     prepare=dict(
-#         filter_by_difficulty=[-1],
-#         filter_by_min_points=dict(Car=5, Pedestrian=10, Cyclist=10)),
-#     classes=classes_kitti,
-#     sample_groups=dict(Car=12, Pedestrian=6, Cyclist=6),
-#     points_loader=dict(
-#         type='LoadPointsFromFile',
-#         coord_type='LIDAR',
-#         load_dim=4,
-#         use_dim=4,
-#         backend_args=backend_args),
-#     backend_args=backend_args)
+# ── Pipelines ─────────────────────────────────────────────────────────────────
 
 source_pipeline = [     # nuScenes         # supervised training on source data
     dict(
@@ -67,11 +51,8 @@ source_pipeline = [     # nuScenes         # supervised training on source data
             },
             class_names=classes_kitti,
             keep_unmapped=False),  # Drop all non-Car classes
-    dict(
-        type='RandomObjectScaling',
-        scale_range=[0.75, 1.0],   # shrink nuScenes Cars toward KITTI size
-        num_try=50,
-        class_names=['Car']),
+    # Source object scale augmentation (stable-baseline ROS).
+    dict(type='RandomObjectScaling', scale_range=[0.75, 1.0], class_names=['Car']),
     dict(
         type='GlobalRotScaleTrans',
         rot_range=[-0.3925, 0.3925],        # +/- 22.5 degrees
@@ -267,6 +248,7 @@ val_evaluator = dict(
     pcd_limit_range=point_cloud_range,
     label_mapping=None,
     default_cam_key='CAM2',
+    ground_snap=dict(enabled=True, pctl=2.0, min_pts=25, margin=0.3, max_disp=0.0),
     backend_args=backend_args)
 
 test_evaluator = val_evaluator
@@ -525,6 +507,11 @@ custom_hooks = [
         # new boxes are added. enabled=False ⇒ write the filtered store as-is.
         memory_ensemble=dict(enabled=True, iou_thresh=0.1, ignore_thresh=2,
                              rm_thresh=3, weighted=False),
+        # ── Ground-snap ───────────────────────────────────────────────────────────────
+        # Snap each box bottom to the local ground estimated from its own footprint
+        # points (association-free, label-free). Shared by the refresh hook (training
+        # pseudo-labels) and NusOnKittiMetric (eval predictions) so train/test match.
+        ground_snap=dict(enabled=True, pctl=2.0, min_pts=25, margin=0.3, max_disp=0.0),
     ),
 ]
 

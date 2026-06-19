@@ -42,13 +42,8 @@ source_pipeline = [     # nuScenes — supervised source
          mapping={'car': 'Car'},
          class_names=classes_kitti,
          keep_unmapped=False),
-    # Random Object Scaling: shrink nuScenes Cars toward KITTI size.
-    # Keeps source-domain training consistent with the ROS pretrain baseline.
-    dict(
-        type='RandomObjectScaling',
-        scale_range=[0.75, 1.0],
-        num_try=50,
-        class_names=['Car']),
+    # Source object scale augmentation (stable-baseline ROS).
+    dict(type='RandomObjectScaling', scale_range=[0.75, 1.0], class_names=['Car']),
     dict(type='GlobalRotScaleTrans',
          rot_range=[-0.3925, 0.3925],
          scale_ratio_range=[0.95, 1.05],
@@ -204,6 +199,7 @@ val_evaluator = dict(
     pcd_limit_range=point_cloud_range,
     label_mapping=None,
     default_cam_key='CAM2',
+    ground_snap=dict(enabled=True, pctl=2.0, min_pts=25, margin=0.3, max_disp=0.0),
     backend_args=backend_args)
 
 test_evaluator = val_evaluator
@@ -222,7 +218,7 @@ model = dict(
     type='MeanTeacher3DDetector',
     mean_teacher_cfg=dict(
         point_cloud_range=point_cloud_range,
-        ema_momentum=0.9999,
+        ema_momentum=0.99995,
         # EMA the teacher's DSNorm/BN buffers from the student so the teacher's
         # target-domain running stats track KITTI (standard Mean-Teacher). With
         # False the teacher normalised KITTI using frozen nuScenes stats while
@@ -243,7 +239,7 @@ model = dict(
         contrastive_warmup_iters=3517,  # 1 epoch
         source_loss_weight=1.0,
         target_loss_weight=0.5,
-        contrastive_weight=0.1,
+        contrastive_weight=0.0,
         verbose=True,
         eval_use_teacher=True,
         use_dsnorm=True,
@@ -413,7 +409,12 @@ custom_hooks = [
         # score + reset counter, disappeared boxes age out (ignore@2, remove@3),
         # new boxes are added. enabled=False ⇒ write the filtered store as-is.
         memory_ensemble=dict(enabled=False, iou_thresh=0.1, ignore_thresh=2,
-                             rm_thresh=3, weighted=False)),
+                             rm_thresh=3, weighted=False),
+        # ── Ground-snap ───────────────────────────────────────────────────────────────
+        # Snap each box bottom to the local ground estimated from its own footprint
+        # points (association-free, label-free). Shared by the refresh hook (training
+        # pseudo-labels) and NusOnKittiMetric (eval predictions) so train/test match.
+        ground_snap=dict(enabled=True, pctl=2.0, min_pts=25, margin=0.3, max_disp=0.0)),
 ]
 
 train_cfg = dict(max_epochs=10, val_interval=1)

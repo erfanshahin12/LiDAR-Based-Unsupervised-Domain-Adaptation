@@ -233,7 +233,7 @@ class MeanTeacher3DDetector(Base3DDetector):
         cls_t = cls_scores_t.to(device=device, dtype=torch.float32)
         iou_t = iou_scores_t.to(device=device, dtype=torch.float32)
 
-        # Cls-only quality (hybrid cls+iou dropped per Stage-2 decision).
+        # Cls-only quality (hybrid cls+iou dropped).
         quality = cls_t.clamp(min=min_q)
         if norm_q and quality.numel() > 0 and quality.max() > 0:
             quality = quality / quality.max()

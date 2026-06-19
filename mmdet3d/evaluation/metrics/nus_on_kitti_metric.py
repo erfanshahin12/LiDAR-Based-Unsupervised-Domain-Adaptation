@@ -6,6 +6,7 @@ from mmengine.logging import MMLogger
 
 from mmdet3d.registry import METRICS
 from mmdet3d.structures import LiDARInstance3DBoxes
+from mmdet3d.structures.ops.ground_snap import ground_snap_boxes
 
 from mmdet3d.evaluation.metrics.kitti_metric import KittiMetric
 
@@ -44,6 +45,7 @@ class NusOnKittiMetric(KittiMetric):
             submission_prefix: Optional[str] = None,
             label_mapping: Optional[Dict[int, int]] = None,
             collect_device: str = 'cpu',
+            ground_snap: Optional[dict] = None,
             backend_args: Optional[dict] = None) -> None:
         self.default_prefix = 'NusOnKitti metric'
         super().__init__(
@@ -58,6 +60,10 @@ class NusOnKittiMetric(KittiMetric):
             collect_device=collect_device,
             backend_args=backend_args)
         self.label_mapping = label_mapping or {}
+        # Ground-snap predictions before scoring (point-based, label-free), so
+        # the eval distribution matches the ground-snapped training targets.
+        # enabled=False / None ⇒ no-op (for with/without ablation).
+        self.ground_snap_cfg = ground_snap or {}
 
     @staticmethod
     def _nus_to_kitti_boxes(
@@ -89,11 +95,42 @@ class NusOnKittiMetric(KittiMetric):
         t[:, 6] = t[:, 6] - np.pi / 2  # yaw_kitti = yaw_nus - π/2
         return LiDARInstance3DBoxes(t, box_dim=7, origin=(0.5, 0.5, 0))
 
+    def _batch_points(self, data_batch: Optional[dict], idx: int):
+        """Per-sample points (M, >=3) np from data_batch, or None if absent.
+
+        ``val_pipeline`` loads points and applies KittiToNuscenes, so they are
+        in the same nuScenes working frame as the predictions — the frame
+        ground-snap operates in (before the inverse 0.29 transform)."""
+        try:
+            pts = data_batch['inputs']['points'][idx]
+        except (TypeError, KeyError, IndexError):
+            return None
+        if isinstance(pts, torch.Tensor):
+            pts = pts.detach().cpu().numpy()
+        return pts
+
     def process(self, data_batch: dict, data_samples: Sequence[dict]) -> None:
         """Inverse-rotate predicted boxes to KITTI frame, remap labels, then
         delegate to KittiMetric.process for accumulation."""
-        for data_sample in data_samples:
+        snap_enabled = bool(self.ground_snap_cfg.get('enabled', False))
+        snap_kwargs = {k: v for k, v in self.ground_snap_cfg.items()
+                       if k != 'enabled'}
+        for idx, data_sample in enumerate(data_samples):
             pred_3d = data_sample['pred_instances_3d']
+
+            # Ground-snap predictions in the working frame, before the inverse
+            # transform — point-based and label-free, mirroring the training
+            # pseudo-label snap so train/test distributions match.
+            if snap_enabled and len(pred_3d['bboxes_3d']) > 0:
+                pts = self._batch_points(data_batch, idx)
+                if pts is not None and len(pts) > 0:
+                    boxes_np = pred_3d['bboxes_3d'].tensor[:, :7].cpu().numpy()
+                    labels_np = pred_3d['labels_3d'].cpu().numpy()
+                    snapped, _ = ground_snap_boxes(
+                        boxes_np, pts, labels=labels_np, **snap_kwargs)
+                    pred_3d['bboxes_3d'] = LiDARInstance3DBoxes(
+                        torch.from_numpy(snapped), box_dim=7,
+                        origin=(0.5, 0.5, 0))
 
             if len(pred_3d['bboxes_3d']) > 0:
                 pred_3d['bboxes_3d'] = self._nus_to_kitti_boxes(

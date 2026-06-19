@@ -16,6 +16,7 @@ from torch.utils.data import DataLoader
 
 from mmdet3d.registry import HOOKS
 from mmdet3d.engine.hooks.memory_ensemble import active_store, memory_ensemble
+from mmdet3d.structures.ops.ground_snap import ground_snap_boxes
 from mmdet3d.structures.ops.iou3d_calculator import bbox_overlaps_3d
 
 
@@ -145,6 +146,7 @@ class PseudoLabelRefreshHook(Hook):
         hard_instance_quantile: float = 0.0,
         memory_ensemble: Optional[dict] = None,
         consistency_filter: Optional[dict] = None,
+        ground_snap: Optional[dict] = None,
     ) -> None:
         self.interval = interval
         self.update_at_epochs = list(update_at_epochs)
@@ -167,6 +169,10 @@ class PseudoLabelRefreshHook(Hook):
         # Each is an independent on/off knob; absent or enabled=False = off.
         self._memory_cfg = memory_ensemble or {}
         self._consistency_cfg = consistency_filter or {}
+        # Ground-snap: snap each pseudo-box bottom to local ground (point-based,
+        # association-free). Same on/off convention. The kwargs (pctl/min_pts/
+        # margin/max_disp) are forwarded to ground_snap_boxes.
+        self._ground_snap_cfg = ground_snap or {}
 
         self._ps_loader: Optional[DataLoader] = None
         self._prev_coverage: Optional[float] = None
@@ -179,6 +185,13 @@ class PseudoLabelRefreshHook(Hook):
 
     def _consistency_enabled(self) -> bool:
         return bool(self._consistency_cfg.get('enabled', False))
+
+    def _ground_snap_enabled(self) -> bool:
+        return bool(self._ground_snap_cfg.get('enabled', False))
+
+    def _ground_snap_kwargs(self) -> dict:
+        """ground_snap_boxes kwargs from the config (drop the 'enabled' flag)."""
+        return {k: v for k, v in self._ground_snap_cfg.items() if k != 'enabled'}
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -489,14 +502,19 @@ class PseudoLabelRefreshHook(Hook):
         model.teacher.eval()
         new_labels: dict = {}
         total_pos = 0
+        total_snapped = 0  # ground-snap accounting across the pass
+
+        snap_enabled = self._ground_snap_enabled()
+        snap_kwargs = self._ground_snap_kwargs() if snap_enabled else {}
 
         for batch in self._ps_loader:
             batch_inputs = batch['inputs']
             batch_data_samples = batch['data_samples']
 
-            # Save raw xyz before voxelization for interior-point counting.
-            # Each element is (M_i, C) on CPU; we only need the first 3 dims.
-            if self.min_pts > 0:
+            # Save raw xyz before voxelization — needed for interior-point
+            # counting (min_pts guard) and/or ground-snap. Each element is
+            # (M_i, C) on CPU; we only need the first 3 dims.
+            if self.min_pts > 0 or snap_enabled:
                 pts_raw = [
                     (p.numpy() if isinstance(p, torch.Tensor) else np.asarray(p))[:, :3]
                     for p in batch_inputs['points']
@@ -552,6 +570,17 @@ class PseudoLabelRefreshHook(Hook):
                     if cls_t is not None:
                         cls_t = cls_t[cons_mask]
 
+                # Ground-snap: rigidly shift each box bottom to the local ground
+                # estimated from its own footprint points (association-free,
+                # label-free). Applied BEFORE the interior-point count so the
+                # stored pt_counts reflect the snapped boxes. Points are in the
+                # working (nuScenes) frame, same as the boxes.
+                if snap_enabled and pts_xyz is not None and len(boxes_t) > 0 \
+                        and len(pts_xyz) > 0:
+                    boxes_t, n_snap = ground_snap_boxes(
+                        boxes_t, pts_xyz, labels=labels_t, **snap_kwargs)
+                    total_snapped += n_snap
+
                 # Interior point count per box (used by min_pts guard).
                 if pts_xyz is not None and len(boxes_t) > 0 and len(pts_xyz) > 0:
                     from mmdet3d.structures.ops.box_np_ops import points_in_rbbox
@@ -578,6 +607,10 @@ class PseudoLabelRefreshHook(Hook):
             f'[PseudoLabelRefreshHook] Collected {total_pos} candidate '
             f'pseudo-boxes across {len(new_labels)} frames '
             f'(pre-floor={self.ps_min_score})')
+        if snap_enabled:
+            logger.info(
+                f'[ground-snap] snapped {total_snapped}/{total_pos} pseudo-box '
+                f'bottoms to local ground ({snap_kwargs})')
         return new_labels
 
     def _consistency_keep_masks(self, model, batch_inputs, batch_data_samples,
