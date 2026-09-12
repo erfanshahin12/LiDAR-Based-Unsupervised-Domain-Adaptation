@@ -70,25 +70,25 @@ target_strong_pipeline = [  # KITTI — student training (strong augmentation)
          load_dim=4, use_dim=4),
     dict(type='KittiToNuscenes'),
 
-    # ── CMT hard-instance sampling (online, from nuScenes dbinfos) ──────────
+    # ── Hard-instance sampling (online, from nuScenes dbinfos) ──────────
     # Mirrors the PointPillars config.  Set sample_groups=None to disable.
-    dict(
-        type='HardInstanceSampling',
-        source_db_path=source_data_root + 'nuscenes_dbinfos_train.pkl',
-        source_class_mapping=dict(Car='car'),
-        db_path_prefix=source_data_root,
-        sample_groups=dict(Car=5),
-        use_pred_boxes_for_collision=False,  # no preds available in strong pipeline
-        iou_thresh=0.3,  # applied between injected instances (inter-instance collision)
-        carve=True,
-        carve_extra_width=(1.0, 0.5, 0.5),
-        size_normalize=dict(size_res=[-0.71, -0.35, -0.16]),
-        class_names=classes_kitti,
-        points_loader=dict(
-            type='LoadPointsFromFile',
-            coord_type='LIDAR',
-            load_dim=5,
-            use_dim=4)),
+    # dict(
+    #     type='HardInstanceSampling',
+    #     source_db_path=source_data_root + 'nuscenes_dbinfos_train.pkl',
+    #     source_class_mapping=dict(Car='car'),
+    #     db_path_prefix=source_data_root,
+    #     sample_groups=dict(Car=5),
+    #     use_pred_boxes_for_collision=False,  # no preds available in strong pipeline
+    #     iou_thresh=0.3,  # applied between injected instances (inter-instance collision)
+    #     carve=True,
+    #     carve_extra_width=(1.0, 0.5, 0.5),
+    #     size_normalize=dict(size_res=[-0.71, -0.35, -0.16]),
+    #     class_names=classes_kitti,
+    #     points_loader=dict(
+    #         type='LoadPointsFromFile',
+    #         coord_type='LIDAR',
+    #         load_dim=5,
+    #         use_dim=4)),
 
     dict(type='GlobalRotScaleTrans',
          rot_range=[-0.3925, 0.3925],
@@ -402,7 +402,7 @@ custom_hooks = [
         # Augmentation-consistency geometry QC: keep only boxes that
         # reproduce under a BEV flip (teacher second view), 3D-IoU >= thresh.
         # No target-domain priors. enabled=False ⇒ skip the second pass.
-        consistency_filter=dict(enabled=True, iou_thresh=0.5,
+        consistency_filter=dict(enabled=False, iou_thresh=0.5,
                                 direction='horizontal'),
         # Stage 2 — Memory Ensemble & Voting (ST3D port): match each refresh
         # against the persistent memory bank; matched boxes keep the higher

@@ -71,3 +71,35 @@ def ground_snap_boxes(boxes, points, pctl=2.0, min_pts=25, margin=0.3,
         out[i, 2] = ground
         n_snapped += 1
     return out, n_snapped
+
+
+def size_debias_boxes(boxes, ratios, car_label=None, labels=None):
+    """Remove a systematic box-size offset by dividing l/w/h by fixed ratios.
+
+    Multiplicative shrink toward the target-domain size prior: it corrects the
+    constant source->target scale offset (e.g. nuScenes boxes are larger than
+    KITTI) while *preserving* per-object size variation — unlike a clamp-to-prior.
+    x/y/yaw and the bottom z are unchanged, so a height shrink lowers the top and
+    keeps the (ground-snapped) base in place. Apply AFTER ``ground_snap_boxes``.
+
+    Args:
+        boxes (np.ndarray): (N, 7) ``[x, y, z_bottom, l, w, h, yaw]``.
+        ratios (sequence[float]): ``[l_ratio, w_ratio, h_ratio]`` divisors
+            (each = predicted/GT median for that dimension).
+        car_label (int | None): with ``labels``, only de-bias this class.
+        labels (np.ndarray | None): (N,) per-box labels for ``car_label`` gating.
+
+    Returns:
+        tuple[np.ndarray, int]: (de-biased boxes copy, number of boxes affected).
+    """
+    out = boxes.astype(np.float32, copy=True)
+    if len(out) == 0:
+        return out, 0
+    eligible = np.ones(len(out), dtype=bool)
+    if car_label is not None and labels is not None:
+        eligible &= (np.asarray(labels) == car_label)
+    rl, rw, rh = (float(r) for r in ratios)
+    out[eligible, 3] /= rl   # length
+    out[eligible, 4] /= rw   # width
+    out[eligible, 5] /= rh   # height (bottom z fixed → top lowers)
+    return out, int(eligible.sum())

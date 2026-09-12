@@ -16,7 +16,7 @@ from torch.utils.data import DataLoader
 
 from mmdet3d.registry import HOOKS
 from mmdet3d.engine.hooks.memory_ensemble import active_store, memory_ensemble
-from mmdet3d.structures.ops.ground_snap import ground_snap_boxes
+from mmdet3d.structures.ops.ground_snap import ground_snap_boxes, size_debias_boxes
 from mmdet3d.structures.ops.iou3d_calculator import bbox_overlaps_3d
 
 
@@ -147,6 +147,7 @@ class PseudoLabelRefreshHook(Hook):
         memory_ensemble: Optional[dict] = None,
         consistency_filter: Optional[dict] = None,
         ground_snap: Optional[dict] = None,
+        size_debias: Optional[dict] = None,
     ) -> None:
         self.interval = interval
         self.update_at_epochs = list(update_at_epochs)
@@ -173,6 +174,10 @@ class PseudoLabelRefreshHook(Hook):
         # association-free). Same on/off convention. The kwargs (pctl/min_pts/
         # margin/max_disp) are forwarded to ground_snap_boxes.
         self._ground_snap_cfg = ground_snap or {}
+        # Size de-bias: divide l/w/h by fixed ratios to remove the systematic
+        # source->target scale offset. None (default) => off, so it fires only
+        # when a config supplies it (PointPillars), never for CenterPoint.
+        self._size_debias_cfg = size_debias
 
         self._ps_loader: Optional[DataLoader] = None
         self._prev_coverage: Optional[float] = None
@@ -192,6 +197,9 @@ class PseudoLabelRefreshHook(Hook):
     def _ground_snap_kwargs(self) -> dict:
         """ground_snap_boxes kwargs from the config (drop the 'enabled' flag)."""
         return {k: v for k, v in self._ground_snap_cfg.items() if k != 'enabled'}
+
+    def _size_debias_enabled(self) -> bool:
+        return self._size_debias_cfg is not None
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -502,10 +510,13 @@ class PseudoLabelRefreshHook(Hook):
         model.teacher.eval()
         new_labels: dict = {}
         total_pos = 0
-        total_snapped = 0  # ground-snap accounting across the pass
+        total_snapped = 0    # ground-snap accounting across the pass
+        total_debiased = 0   # size de-bias accounting across the pass
 
         snap_enabled = self._ground_snap_enabled()
         snap_kwargs = self._ground_snap_kwargs() if snap_enabled else {}
+        debias_enabled = self._size_debias_enabled()
+        debias_ratios = self._size_debias_cfg.get('ratios') if debias_enabled else None
 
         for batch in self._ps_loader:
             batch_inputs = batch['inputs']
@@ -590,6 +601,16 @@ class PseudoLabelRefreshHook(Hook):
                 else:
                     pt_counts = np.zeros(len(boxes_t), dtype=np.int32)
 
+                # Size de-bias: shrink l/w/h toward the target-domain prior to
+                # remove the systematic source->target scale offset. Applied
+                # AFTER ground-snap (keeps the snapped bottom z) and AFTER the
+                # point count (so pt_counts reflect the natural detection
+                # footprint, not the cosmetic shrink). No-op when ratios is None.
+                if debias_enabled and len(boxes_t) > 0:
+                    boxes_t, n_deb = size_debias_boxes(
+                        boxes_t, debias_ratios, labels=labels_t)
+                    total_debiased += n_deb
+
                 new_labels[key] = {
                     'gt_boxes':  boxes_t.astype(np.float32),
                     'gt_labels': labels_t.astype(np.int64),
@@ -611,6 +632,10 @@ class PseudoLabelRefreshHook(Hook):
             logger.info(
                 f'[ground-snap] snapped {total_snapped}/{total_pos} pseudo-box '
                 f'bottoms to local ground ({snap_kwargs})')
+        if debias_enabled:
+            logger.info(
+                f'[size-debias] de-biased {total_debiased}/{total_pos} pseudo-box '
+                f'sizes by l/w/h ratios {debias_ratios}')
         return new_labels
 
     def _consistency_keep_masks(self, model, batch_inputs, batch_data_samples,

@@ -14,7 +14,7 @@ from .box_np_ops import (box2d_to_corner_jit, box3d_to_bbox,
                          remove_outside_points, rotation_points_single_angle,
                          surface_equ_3d)
 # yapf:enable
-from .ground_snap import ground_snap_boxes
+from .ground_snap import ground_snap_boxes, size_debias_boxes
 from .iou3d_calculator import (AxisAlignedBboxOverlaps3D, BboxOverlaps3D,
                                BboxOverlapsNearest3D,
                                axis_aligned_bbox_overlaps_3d, bbox_overlaps_3d,
@@ -35,5 +35,5 @@ __all__ = [
     'BboxOverlapsNearest3D', 'BboxOverlaps3D', 'bbox_overlaps_nearest_3d',
     'bbox_overlaps_3d', 'AxisAlignedBboxOverlaps3D',
     'axis_aligned_bbox_overlaps_3d', 'bbox3d_mapping_back', 'bbox3d2roi',
-    'bbox3d2result', 'ground_snap_boxes'
+    'bbox3d2result', 'ground_snap_boxes', 'size_debias_boxes'
 ]

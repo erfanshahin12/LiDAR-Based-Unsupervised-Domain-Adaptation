@@ -213,12 +213,14 @@ def select_scene_keep_mask(scores: np.ndarray,
 
 def match_boxes(pred: np.ndarray, gt: np.ndarray,
                 iou_thr: float) -> tuple[int, int, int]:
-    """Greedy BEV IoU matching. Returns (TP, FP, FN)."""
+    """Greedy 3D IoU matching. Returns (TP, FP, FN)."""
     if len(pred) == 0:
         return 0, 0, len(gt)
     if len(gt) == 0:
         return 0, len(pred), 0
-    iou = bev_iou_matrix(pred, gt)
+    iou = LiDARInstance3DBoxes.overlaps(
+        LiDARInstance3DBoxes(torch.from_numpy(pred)),
+        LiDARInstance3DBoxes(torch.from_numpy(gt))).cpu().numpy()
     matched_pred: set = set()
     matched_gt: set = set()
     flat_idx = np.argsort(iou.ravel())[::-1]
@@ -732,7 +734,7 @@ def parse_args():
     g.add_argument('--sweep-keep-fracs', default=None,
                    help='Comma-separated keep_frac values for --sweep-from-cache '
                         '(e.g. "0.2,0.3,0.4,0.5"). Activates the keep-fraction sweep.')
-    g.add_argument('--sweep-floor-percentiles', default='0,30,40,50',
+    g.add_argument('--sweep-floor-percentiles', default='0',
                    help='Comma-separated GLOBAL score percentiles [0-100] for the '
                         'adaptive floor in the keep-frac sweep. For each value P the '
                         'floor is set to the P-th percentile of the pooled box-score '
@@ -1004,7 +1006,7 @@ def _find_mt_config(pkl_path: str) -> str | None:
 
 
 def _empty_stats() -> dict:
-    return {'0.25': {'tp': 0, 'fp': 0, 'fn': 0},
+    return {'0.7': {'tp': 0, 'fp': 0, 'fn': 0},
             '0.50': {'tp': 0, 'fp': 0, 'fn': 0}}
 
 
@@ -1762,7 +1764,7 @@ def main():
             ps_labels_arr = ps_entry.get('gt_labels', np.zeros(len(ps_boxes), dtype=np.int64))
             ps_car_boxes = ps_boxes[ps_labels_arr == pred_car_label]
             # print(f'  GT Car={len(gt_car)}  Pseudo Car={len(ps_car_boxes)}/{len(ps_boxes)}')
-            for thr_key, thr_val in (('0.25', 0.25), ('0.50', 0.50)):
+            for thr_key, thr_val in (('0.7', 0.7), ('0.50', 0.50)):
                 ps_tp, ps_fp, ps_fn = match_boxes(ps_car_boxes, gt_car, thr_val)
                 stats['pseudo'][thr_key]['tp'] += ps_tp
                 stats['pseudo'][thr_key]['fp'] += ps_fp
@@ -1793,7 +1795,7 @@ def main():
             return f'{tp:5d} {fp:5d} {fn:5d}  {r:.3f}  {p:.3f}'
 
         print(f'\n=== Stats summary ({n} scenes) ===')
-        hdr1 = f'{"":12s}  {"── IoU@0.25 ──":^30s}  {"── IoU@0.50 ──":^30s}'
+        hdr1 = f'{"":12s}  {"── 3D-IoU@0.7 ──":^30s}  {"── 3D-IoU@0.50 ──":^30s}'
         hdr2 = (f'{"":12s}  {"TP":>5s} {"FP":>5s} {"FN":>5s}  {"R":>5s}  {"P":>5s}'
                 f'  {"TP":>5s} {"FP":>5s} {"FN":>5s}  {"R":>5s}  {"P":>5s}')
         print(hdr1)
@@ -1801,7 +1803,7 @@ def main():
         for name in ('pseudo', 'baseline'):
             if name == 'baseline' and args.no_baseline:
                 continue
-            row = (f'{name:12s}  {_row(stats[name], "0.25")}'
+            row = (f'{name:12s}  {_row(stats[name], "0.7")}'
                    f'  {_row(stats[name], "0.50")}')
             print(row)
     else:

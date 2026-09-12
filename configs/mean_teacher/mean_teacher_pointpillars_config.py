@@ -18,9 +18,7 @@ classes_kitti = ['Car']
 box_origin_target = (0.5, 0.5, 0)        # KITTI box origin
 metainfo_target = dict(classes=classes_kitti, origin=box_origin_target)
 
-hard_instance_bank_path = './configs/mean_teacher/hard_instance_bank/hard_instance_bank_nuscenes_quantile_kitti_20.pkl'
-# pretrained_ckpt = './work_dirs/baseline_pointpillars_5may/epoch_24.pth'
-pretrained_ckpt = './work_dirs/pretrain_3jun_iou_head/epoch_24.pth'
+pretrained_ckpt = './work_dirs/pretrain_pp_ros_26may/epoch_24.pth'
 
 point_cloud_range = [-50.40, -50.40, -5, 50.40, 50.40, 3]
 input_modality = dict(use_lidar=True, use_camera=False)
@@ -118,7 +116,7 @@ target_strong_pipeline = [       # KITTI      # sent to student model for unsupe
         iou_thresh=0.3,  # applied between injected instances (inter-instance collision)
         carve=True,                                 # CMT: remove returns in insertion zone
         carve_extra_width=(1.0, 0.5, 0.5),          # (dl, dw, dh) expand for carve
-        size_normalize=dict(size_res=[-0.75, -0.34, -0.2]),  # match source pipeline shrink
+        size_normalize=dict(size_res=[-0.71, -0.35, -0.16]),  # match source pipeline shrink
         class_names=classes_kitti,
         points_loader=dict(
             type='LoadPointsFromFile',
@@ -266,57 +264,40 @@ output_shape = [
 model = dict(
     type='MeanTeacher3DDetector',
     mean_teacher_cfg=dict(
-                     point_cloud_range=point_cloud_range,
-                     ema_momentum=0.9999,
-                     update_teacher_buffers=True,       # EMA teacher BN/DSNorm buffers along with params so
-                                                        # teacher's target-domain running stats stay aligned with
-                                                        # its EMA'd affine weights (frozen buffers = miscalibration)
-                     use_bev_consistency=True,
-                     tau=0.07,
-                     # CMT contrastive thresholds (independent of pseudo-label conf_threshold).
-                     # fg_threshold: score above which a teacher pred is a contrastive fg anchor.
-                     # neg_threshold: score at-or-below which a pred is a background negative.
-                     fg_threshold=0.5,
-                     neg_threshold=0.25,
-                     # Warmup before contrastive loss fires: roi_extractor is randomly
-                     # initialised (not in the pretrained checkpoint) and would inject
-                     # noise into the backbone gradient until it learns meaningful BEV
-                     # features.  1 epoch = 3517 iters at this dataset / batch size.
-                     contrastive_warmup_iters=3517,
-                     # NOTE: conf_threshold here governs only the online store-empty training
-                     # path (filter_teacher_predictions called per-iteration when the store
-                     # is empty).  PseudoLabelRefreshHook temporarily overrides this value
-                     # to ps_min_score during the refresh inference pass, then restores it.
-                     source_loss_weight=1.0,
-                     target_loss_weight=0.5,
-                     contrastive_weight=0.1,
-                     verbose=True,
-                     eval_use_teacher=True,
-                     use_dsnorm=True,
-                     # Hybrid IoU pseudo-label scoring. The detector filters teacher predictions
-                     # with ``hybrid = w_iou * iou + (1 - w_iou) * cls`` after  ``iou_warmup_iters`
-                     # of student iterations; before that it falls back to cls-only.
-                     # Setting ``hybrid_w_iou=0`` disables hybrid scoring.
-                     conf_threshold=0.1,
-                     hybrid_w_iou=0,
-                     iou_warmup_iters=0,
-                     # IoU-head distillation on target: student IoU logits are
-                     # trained to match the teacher's on the same strongly-augmented
-                     # KITTI scene (no pseudo-label boxes, no localization noise).
-                     # suppress_target_iou_loss drops loss_iou from TERM 2 when
-                     # distillation is active, avoiding the noisy feedback loop.
-                     iou_distill_weight=0.0,
-                     # Soft-quality weighting of pseudo-label losses (Stage 2).
-                     # quality = teacher CLS score only (no cls+iou hybrid).
-                     # Anchor3D already consumes the attached fields; this knob
-                     # toggles them. enable=False ⇒ hard targets (single switch).
-                     pseudo_loss_cfg=dict(
-                         enable_soft_quality=True,
-                         use_soft_cls_targets=True,    # soft BCE for pseudo positives
-                         weight_bbox_by_quality=True,  # scale bbox loss by quality
-                         weight_dir_by_quality=True,   # scale dir loss by quality
-                     ),
-                 ),
+        point_cloud_range=point_cloud_range,
+        ema_momentum=0.99995,
+        # EMA the teacher's DSNorm/BN buffers from the student so the teacher's
+        # target-domain running stats track KITTI (standard Mean-Teacher). With
+        # False the teacher normalised KITTI using frozen nuScenes stats while
+        # its affine params were EMA'd toward the student's KITTI-batch stats —
+        # a growing miscalibration. The EMA loop only touches float buffers.
+        update_teacher_buffers=True,
+        # Contrastive BEV-consistency loss is DEACTIVATED (use_bev_consistency=
+        # False, contrastive_weight=0). The detector-level roi_extractor_cfg is
+        # also removed below — the RoI head's only consumer was this loss, so
+        # there is nothing to build. (CenterPoint leaves this plumbing nominally
+        # on at weight 0; here it is fully off.) The thresholds below are inert.
+        use_bev_consistency=False,
+        tau=0.07,
+        fg_threshold=0.5,
+        neg_threshold=0.25,
+        contrastive_warmup_iters=3517,  # 1 epoch
+        source_loss_weight=1.0,
+        target_loss_weight=0.5,
+        contrastive_weight=0.0,
+        verbose=True,
+        eval_use_teacher=True,
+        use_dsnorm=True,
+        # cls-only filtering — no IoU head in this architecture
+        conf_threshold=0.2,                 # placeholder for refresh hook to overwrite; Will be used by detector if ps-label store is empty
+        hybrid_w_iou=0,
+        iou_warmup_iters=0,
+        iou_distill_weight=0,
+        # Soft-quality weighting of pseudo-label losses (Stage 2). The quality
+        # weight is the teacher CLS score only (no cls+iou hybrid). enable=False
+        # ⇒ both heads fall back to hard targets (single master switch).
+        pseudo_loss_cfg=dict(enable_soft_quality=True),
+    ),
     pretrained_ckpt=pretrained_ckpt,
 
     # The architecture for Student and Teacher
@@ -357,16 +338,10 @@ model = dict(
             upsample_strides=[1, 2, 4],
             out_channels=[128, 128, 128]),
 
-        # RoI feature extractor for MeanTeacher contrastive/BEV-consistency loss.
-        # in_channels=384 matches the SECONDFPN neck output (3 x 128) — the
-        # contrastive loss now operates on the neck (detection) features the
-        # head regresses from, not the pre-backbone 64ch scatter map.
-        roi_extractor_cfg=dict(
-            in_channels=384,
-            out_channels=256,
-            roi_size=7,
-            voxel_size=voxel_size[0],
-            point_cloud_range=point_cloud_range),
+        # NOTE: roi_extractor_cfg intentionally omitted. Its only consumer was
+        # the MeanTeacher contrastive/BEV-consistency loss, which is deactivated
+        # (see mean_teacher_cfg above). With it absent, VoxelNetBEVRoI sets
+        # self.roi_extractor=None and contrastive_loss early-returns 0.
 
         bbox_head=dict(
             type='Anchor3DHead',
@@ -403,19 +378,7 @@ model = dict(
                 type='mmdet.SmoothL1Loss', beta=1.0 / 9.0, loss_weight=1.5),
             loss_dir=dict(
                 type='mmdet.CrossEntropyLoss', use_sigmoid=False,
-                loss_weight=0.2),
-            # Per-anchor IoU quality head: BCE vs true rotated-3D-IoU targets,
-            # balanced across bins [0,0.1) [0.1,0.3) [0.3,0.5) [0.5,1.0].
-            # num_per_img:  total number of non-positive anchors drawn from all bins combined
-            # Pretrained on source domain; loaded from the pretrain checkpoint.
-            # filter_teacher_predictions applies hybrid_w_iou independently of
-            # score_type below.
-            predict_iou=True,
-            loss_iou_weight=0.5,
-            iou_sample_cfg=dict(
-                num_per_img=256,
-                bins=[0.0, 0.1, 0.3, 0.5, 1.0],
-            )),
+                loss_weight=0.2)),
     
         # model training and testing settings
         train_cfg=dict(
@@ -447,19 +410,14 @@ model = dict(
             debug=False),
 
         test_cfg=dict(
+            # NMS ranks by classification score only (no IoU head).
             use_rotate_nms=True,
             nms_across_levels=False,
             nms_thr=0.01,
             score_thr=0.05,
             min_bbox_size=0,
             nms_pre=1000,
-            max_num=200,
-            # 'cls': NMS uses cls score only; filter_teacher_predictions
-            #        applies IoU weighting afterward via hybrid_w_iou.
-            # 'hybrid': NMS already blends cls+IoU — boxes with high IoU but
-            #           lower cls survive; may improve pseudo-label diversity.
-            score_type='cls',          # 'cls' | 'iou' | 'hybrid'
-            score_weights=dict(iou=0.0, cls=1.0))))
+            max_num=200)))
 
 # Runtime configs
 # Hooks
@@ -475,20 +433,17 @@ custom_hooks = [
         update_at_epochs=(0,),  # always refresh before epoch 0 starts
         ps_batch_size=8,
         ps_num_workers=6,
-        # Per-scene keep-fraction: keep top 60% by CLS score per scene, then a
-        # FIXED absolute CLS floor of 0.40 as a guard. iou_weight=0 → cls-only
-        # ranking (this checkpoint has an IoU head, but we use cls for consistency
-        # with CenterPoint; IoU head still trains via the MT detector).
-        # cls_thr=0.40 replaces the old adaptive cls_percentile (now 0/off): the
-        #   percentile floor was pro-cyclical — it slid down as the teacher
-        #   degraded, scooping in the FP flood that drove the collapse. A fixed
-        #   floor is self-limiting. min_pts=10 drops sparse phantom FPs.
+        # Per-scene keep-fraction: keep top 70% by CLS score per scene, then a
+        # FIXED absolute CLS floor of 0.40 as a guard (cls-only ranking;
+        # this architecture has no RoI-IoU head).
+        # cls_thr=0.40 replaces the old adaptive cls_percentile (now 0/off):
+        # min_pts=10 drops sparse phantom FPs.
         # Ordering: fraction-first, floor-as-guard (the hook's only mode).
         # coverage_gate_drop=0.10 → skip store update if coverage drops >10%.
         keep_frac=0.6,
         iou_weight=0,
         iou_thr=0.0,
-        cls_thr=0.40,
+        cls_thr=0.35,
         cls_percentile=0,
         hybrid_thr=0.0,
         coverage_gate_drop=0.10,
@@ -505,7 +460,7 @@ custom_hooks = [
         # against the persistent memory bank; matched boxes keep the higher
         # score + reset counter, disappeared boxes age out (ignore@2, remove@3),
         # new boxes are added. enabled=False ⇒ write the filtered store as-is.
-        memory_ensemble=dict(enabled=True, iou_thresh=0.1, ignore_thresh=2,
+        memory_ensemble=dict(enabled=False, iou_thresh=0.1, ignore_thresh=2,
                              rm_thresh=3, weighted=False),
         # ── Ground-snap ───────────────────────────────────────────────────────────────
         # Snap each box bottom to the local ground estimated from its own footprint
@@ -516,7 +471,7 @@ custom_hooks = [
 ]
 
 # Scheduler and optimizer config
-train_cfg = dict(type='EpochBasedTrainLoop', max_epochs=7, val_interval=2)
+train_cfg = dict(type='EpochBasedTrainLoop', max_epochs=10, val_interval=1)
 
 # Gradient accumulation with 8 steps to achieve effective batch size of 32 (8 x 4)
 optim_wrapper = dict(type='AmpOptimWrapper',
@@ -526,10 +481,10 @@ optim_wrapper = dict(type='AmpOptimWrapper',
                      clip_grad=dict(max_norm=35, norm_type=2))
 
 # Override schedule-2x's MultiStepLR (milestones at epochs 20 & 23 — never fires in
-# a 7-epoch run, so LR would stay at 1e-4 flat).  Short warmup + cosine decay mirrors
-# the CenterPoint Stage-1 fix that resolved the collapse (T_max=7 for this run length).
+# a 10-epoch run, so LR would stay at 1e-4 flat).  Short warmup + cosine decay mirrors
+# the CenterPoint Stage-1 fix that resolved the collapse (T_max=10 = run length).
 param_scheduler = [
     dict(type='LinearLR', start_factor=0.1, by_epoch=False, begin=0, end=500),
-    dict(type='CosineAnnealingLR', begin=0, T_max=7, end=7,
+    dict(type='CosineAnnealingLR', begin=0, T_max=10, end=10,
          by_epoch=True, eta_min=1e-6),
 ]
